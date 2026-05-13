@@ -16,7 +16,6 @@
  *   - Adapter errors NEVER carry credentials or presigned URL signature
  *     parameters.
  */
-import { Buffer } from 'node:buffer';
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
@@ -407,14 +406,10 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
 /**
  * Convenience factory — used by the future provider resolver in STORAGE-5
  * and by integration tests that need a real client against MinIO.
- *
- * `Buffer` import retained so future code paths that need to base64-encode
- * provider responses don't have to re-import it.
  */
 export function createS3StorageProviderAdapter(
   config: ProviderAdapterConfig,
   deps?: S3StorageProviderAdapterDeps,
 ): S3StorageProviderAdapter {
-  void Buffer; // intentional: keep `Buffer` referenced for future use.
   return new S3StorageProviderAdapter(config, deps);
 }
