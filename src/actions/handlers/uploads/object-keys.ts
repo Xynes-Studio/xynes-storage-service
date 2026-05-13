@@ -28,6 +28,37 @@ const KEY_MAX_BYTES = 1024;
 const FILENAME_MAX_SEGMENT_BYTES = 200; // Leaves comfortable headroom.
 
 /**
+ * Permissive UUID-shape regex (accepts v1/v4/v5 and any 8-4-4-4-12 hex
+ * grouping). We deliberately do NOT pin to v4 specifically because future
+ * id sources might use v7 or another variant; the property we care about
+ * here is "exactly 32 hex chars with the standard dashes — no path
+ * separators, no `..`, no NUL bytes, no slashes". Case-insensitive.
+ */
+const UUID_SHAPE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+
+/**
+ * Thrown when `deriveProviderObjectKey` is called with an id that does not
+ * match the documented UUID shape. The error message is deliberately
+ * generic — it does NOT echo the offending input back so a hostile caller
+ * cannot use it as an oracle.
+ *
+ * Defense-in-depth: `internal.route.ts` already UUID-validates
+ * `X-Workspace-Id`, and the upload handlers mint `objectId` via
+ * `crypto.randomUUID()`. This guard ensures the function is safe to call
+ * from any future caller without relying on upstream validation.
+ */
+export class ObjectKeyDerivationError extends Error {
+  public readonly code = 'INVALID_OBJECT_KEY_INPUT';
+  public readonly statusHint = 400 as const;
+
+  constructor(field: 'workspaceId' | 'objectId') {
+    // Intentionally generic — does NOT include the offending value.
+    super(`Object-key derivation input "${field}" must be a UUID`);
+    this.name = 'ObjectKeyDerivationError';
+  }
+}
+
+/**
  * Strip path separators, ASCII control chars, and provider-reserved
  * chars. Keeps alphanumerics, dot, dash, underscore. Anything else
  * collapses to `_`. Multiple consecutive `_` collapse to one. We
@@ -75,6 +106,12 @@ export interface DeriveObjectKeyInput {
 }
 
 export function deriveProviderObjectKey(input: DeriveObjectKeyInput): string {
+  if (typeof input.workspaceId !== 'string' || !UUID_SHAPE.test(input.workspaceId)) {
+    throw new ObjectKeyDerivationError('workspaceId');
+  }
+  if (typeof input.objectId !== 'string' || !UUID_SHAPE.test(input.objectId)) {
+    throw new ObjectKeyDerivationError('objectId');
+  }
   const safe = sanitiseFilenameSegment(input.filename);
   const candidate = `workspaces/${input.workspaceId}/objects/${input.objectId}/${safe}`;
   if (Buffer.byteLength(candidate, 'utf8') <= KEY_MAX_BYTES) {
