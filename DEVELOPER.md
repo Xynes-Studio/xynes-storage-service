@@ -1,10 +1,12 @@
 # Xynes Storage Service — Developer Guide
 
-> **Status: STORAGE-1 (architecture & docs only).**
-> This document is **forward-looking**. The runtime, route handlers, tests,
-> Docker image, and CI workflows land in **STORAGE-4**. Until then, this
-> repository holds only the contract documentation that downstream stories
-> build against.
+> **Status: STORAGE-4 (service runtime + provider adapter landed 2026-05-13).**
+> The Bun/Hono runtime, the S3-compatible provider adapter (R2 + MinIO +
+> generic), the action-layer scaffold, and the actor surface are in place.
+> The `POST /internal/storage-actions` route accepts gateway traffic and
+> dispatches via an action registry that is **empty by default** — every
+> action key surfaces as `400 UNKNOWN_ACTION` until STORAGE-5+ registers
+> handlers. Docker compose wiring + MinIO container land with STORAGE-12.
 >
 > When a section is marked `[planned — STORAGE-N]`, the contract is fixed but
 > the implementation lives in story STORAGE-N.
@@ -235,51 +237,173 @@ allow `*` origins for upload or download URLs.
 Upload sessions expire quickly by default (concrete TTL set in STORAGE-5).
 Abandoned multipart uploads are aborted by a cleanup job (STORAGE-9).
 
-## Environment `[planned — STORAGE-2/3]`
+## Provider Adapter (STORAGE-4)
 
-Concrete env keys land with the compose + gateway wiring in STORAGE-2/3. The
-following names are **reserved**:
+The S3-compatible provider adapter is the single seam between
+storage-service and any object-storage backend. **One class, one code
+path** — R2, Backblaze B2, iDrive e2, AWS S3, MinIO, and any future BYOS
+bucket are configuration differences, not code differences.
+
+### Adapter contract
+
+```ts
+import {
+  S3StorageProviderAdapter,
+  type ProviderAdapterConfig,
+} from './infra/providers';
+
+const adapter = new S3StorageProviderAdapter({
+  providerKind: 'r2',
+  endpoint: 'https://<ACCOUNT_ID>.r2.cloudflarestorage.com',
+  region: 'auto',
+  bucket: 'xynes-r2-prod',
+  accessKeyId: resolved.accessKeyId,
+  secretAccessKey: resolved.secretAccessKey,
+});
+
+const upload = await adapter.createSingleUploadUrl({
+  objectKey: 'workspaces/abc/files/photo.png',
+  contentType: 'image/png',
+  contentLength: 1024,
+});
+// upload.url is a presigned PUT URL the browser uses directly.
+```
+
+### What the adapter enforces
+
+| Invariant | Enforced by |
+|---|---|
+| Always SigV4 (AWS SDK v3 default) | SDK default; no `signatureVersion` override |
+| NEVER emits `x-amz-tagging` on PUT / Copy | adapter code (B2 portability) |
+| NEVER uses browser POST forms (always PUT presign) | adapter code |
+| Multipart parts ∈ `[1, 10000]`, ETag required, no duplicates | adapter code |
+| Presigned URLs signed against S3 endpoint host only | SDK default + matrix test guard |
+| Presign expiry ∈ `[30 s, 7 days]` (SigV4 hard cap) | adapter code |
+| Errors NEVER carry credentials / signature parameters | `runWithRedactedError` wrapper |
+| Object keys ≤ 1024 bytes, no leading `/` | adapter code (portable across all 5 providers) |
+| SSE-KMS NEVER set | adapter code (R2 / B2 / iDrive e2 don't support it) |
+| CORS XML validated against B2's tightest limits | `validateCorsConfig` |
+
+### Per-provider configuration cheatsheet
+
+| Provider | `endpoint` | `region` | `forcePathStyle` |
+|---|---|---|---|
+| **Cloudflare R2** | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` | `auto` | `false` |
+| **Backblaze B2** | `https://s3.<region>.backblazeb2.com` | real region (e.g. `us-east-005`) | `false` |
+| **iDrive e2** | per-account console URL (only after region enablement) | real region | `false` |
+| **AWS S3** | `https://s3.<region>.amazonaws.com` | real region | `false` |
+| **MinIO (local dev)** | `http://minio:9000` | `us-east-1` by convention | `true` |
+
+The adapter **never** derives `endpoint` / `region` / `forcePathStyle` from
+`providerKind`. `providerKind` is the discriminator for the per-provider
+quirks table in plan §3 and for the rollout checklist; it does NOT control
+SDK behaviour.
+
+### Testing the adapter
+
+Tests use the `S3StorageProviderAdapterDeps` DI seam to inject fake
+`S3Client` + fake `getSignedUrl` so no real provider is ever contacted:
+
+```ts
+const fakeClient = { send: async () => ({ UploadId: 'mp-1' }) };
+const adapter = new S3StorageProviderAdapter(config, {
+  createClient: () => fakeClient as never,
+  presign: async () => 'https://fake-endpoint.example/key?X-Amz-Signature=…',
+});
+```
+
+The matrix test (`tests/providers/multi-provider-matrix.test.ts`)
+instantiates the adapter against fake R2, B2, iDrive e2, AWS S3, and MinIO
+configurations and asserts identical request construction modulo the
+provider quirks. Add new providers (e.g. Tigris) by adding a new entry to
+the `PROVIDER_MATRIX` fixture — no adapter code change required.
+
+## Environment
+
+Concrete env keys for the storage-service runtime and the per-provider
+provisioning surface. The hosted provider values feed
+`platform.workspace_storage_providers` rows when a workspace is provisioned —
+they are NOT consumed directly by the adapter, which reads its config from
+the DB row (with `credential_ref` resolving against the secret manager).
+
+**Source of truth for provisioning values:**
+`xynes-infra/docs/plans/2026-05-13-storage-provider-env-values-worksheet.md`.
+
+**Source of truth for per-provider quirks (regions, endpoint shape,
+`x-amz-tagging`, CORS limits, etc.):**
+`xynes-infra/docs/plans/2026-05-10-universal-object-storage-file-upload-api.md` §3.
+
+### Runtime env (service process)
 
 | Env var                          | Purpose                                          |
 | -------------------------------- | ------------------------------------------------ |
-| `PORT`                           | Service HTTP port. **Reserved: `4204`** (next free after accounts-service `4203`; current allocation 4100 gateway, 4201 doc, 4202 cms-core, 4203 accounts, 4300 authz, 4400 telemetry). Operator confirms in STORAGE-2/3. |
-| `DATABASE_URL`                   | Postgres connection string. Shared platform DB.  |
-| `INTERNAL_SERVICE_TOKEN`         | Shared with gateway for `X-Internal-Service-Token` verification. |
-| `STORAGE_PROVIDER_DEFAULT`       | `r2` for hosted, `local` for dev (MinIO).        |
-| `R2_ACCOUNT_ID`                  | Cloudflare R2 account ID.                        |
-| `R2_ACCESS_KEY_ID_REF`           | **Reference** to a secret manager entry, NOT the raw key. |
-| `R2_SECRET_ACCESS_KEY_REF`       | **Reference** to a secret manager entry, NOT the raw secret. |
-| `R2_BUCKET_DEFAULT`              | Default bucket name.                             |
-| `STORAGE_MULTIPART_THRESHOLD_BYTES` | Default `104857600` (100 MB) per AWS guidance. |
+| `PORT`                           | Service HTTP port. **Reserved: `4204`** (current allocation 4100 gateway, 4201 doc, 4202 cms-core, 4203 accounts, 4204 storage, 4300 authz, 4400 telemetry). |
+| `INTERNAL_AUTH_MODE`             | `hybrid` (default) accepts legacy static token + future JWT; `jwt` requires JWT only. |
+| `INTERNAL_SERVICE_TOKEN`         | Shared with `xynes-gateway` for `X-Internal-Service-Token` verification (legacy path). |
+| `STORAGE_MULTIPART_THRESHOLD_BYTES` | Default `104857600` (100 MiB) per AWS guidance. |
+| `DATABASE_URL`                   | Postgres connection string. Shared platform DB. Used by STORAGE-5+ when repositories land. |
 
-The pattern of storing **references** (env aliases) rather than raw
-credentials matches the workspace-admin-integrations contract for
-`platform.workspace_storage_providers`.
+### Provisioning env (capture during worksheet)
 
-## Out of scope for STORAGE-1
+These values are **inputs to the worksheet**, which records the non-secret
+fields (`endpoint`, `region`, `bucket`, `forcePathStyle`, `credential_ref`)
+into `platform.workspace_storage_providers`. The raw `accessKeyId` and
+`secretAccessKey` go to the secret manager only — the adapter resolves them
+via `credential_ref` at request time.
 
-| Concern                                 | Owning story |
-| --------------------------------------- | ------------ |
-| Bun/Hono service scaffold (`src/`, `tests/`, `Dockerfile`, `package.json`) | STORAGE-4 |
-| Postgres schema (`platform.storage_*` tables) | STORAGE-2 |
-| Compose + `.env.dev` entries            | STORAGE-2 / STORAGE-3 |
-| Gateway service-key allowlist + dynamic route seeds | STORAGE-3 |
-| Authz permission catalog rows           | STORAGE-3 |
-| api-docs entry under `Xynes-Studio/xynes-api-docs` | STORAGE-3 |
-| Provider adapter implementations (R2 + local MinIO) | STORAGE-4 |
-| Upload session create/complete/abort handlers | STORAGE-5 |
-| Object metadata, signed reads, delete, usage | STORAGE-6 |
-| Async processing queue + workers        | STORAGE-7 |
-| Image/video/document processing profiles | STORAGE-8 |
-| Security, privacy, abuse controls       | STORAGE-9 |
-| CMS Console storage client              | STORAGE-10 |
-| CMS content editor upload UX            | STORAGE-11 |
-| Local smoke + rollout checklist         | STORAGE-12 |
+| Env var family   | Provider               | Notes |
+| ---------------- | ---------------------- | ----- |
+| `R2_*`           | Cloudflare R2 (default hosted) | `R2_ACCOUNT_ID` (32 hex), `R2_BUCKET`, `R2_REGION=auto`, `R2_STORAGE_CLASS=STANDARD\|STANDARD_IA`, `R2_CREDENTIAL_REF=secret://xynes/storage/r2-<env>` |
+| `MINIO_*`        | MinIO (opt-in ad-hoc local; NOT auto-provisioned) | Operator-spun via `docker run quay.io/minio/minio`. `MINIO_ENDPOINT=http://localhost:9000` (or `http://minio:9000` if you run it in the compose network), `MINIO_FORCE_PATH_STYLE=true`, `MINIO_CREDENTIAL_REF=secret://xynes/storage/minio-local`. STORAGE-4/5/6 unit tests do not require this — they use fakes. |
+| `B2_*`           | Backblaze B2 (deferred) | Real region required, NOT `auto`. Adapter NEVER emits `x-amz-tagging`; SigV4 only. |
+| `E2_*`           | iDrive e2 (deferred)    | Real region + region-enablement gate. CORS format is JSON, not XML — adapter serialises per provider. |
+
+> **No live provider is required for STORAGE-4/5/6 development.** Every
+> adapter test injects a fake `S3Client` + fake `getSignedUrl` via the
+> `S3StorageProviderAdapterDeps` DI seam. The MinIO entry above is opt-in
+> for operators who want to exercise the adapter end-to-end against a real
+> S3-compatible target locally — there is no canonical `services.minio` in
+> `docker-compose.dev.yml`.
+
+**Security rules** (mirrors the worksheet §0):
+
+- Raw access keys / secret keys NEVER touch `.env*` files or commit history
+  beyond the explicit `replace_me_*` placeholders in `.env.example`.
+- `credential_ref` is an **opaque pointer** to the secret manager
+  (e.g. `secret://xynes/storage/r2-dev`) — safe to commit, never resolves
+  to the raw key at parse time.
+- If a raw key ever appears in this file, `.env*`, chat, or commit history,
+  rotate it at the provider and re-record the secret-manager pointer.
+
+Full provisioning worksheet (R2 / MinIO / B2 / iDrive e2 step-by-step):
+`xynes-infra/docs/plans/2026-05-13-storage-provider-env-values-worksheet.md`.
+
+## Story status
+
+| Concern | Owning story | Status |
+| --- | --- | --- |
+| Bun/Hono service scaffold (`src/`, `tests/`, `Dockerfile`, `package.json`) | STORAGE-4 | ✅ Landed 2026-05-13 |
+| Provider adapter implementations (R2 + local MinIO + generic) | STORAGE-4 | ✅ Landed 2026-05-13 |
+| Postgres schema (`platform.storage_*` tables) | STORAGE-2 | ✅ Landed 2026-05-13 |
+| Authz permission catalog rows | STORAGE-3 | ✅ Landed 2026-05-13 |
+| Gateway service-key allowlist + dynamic route seeds | STORAGE-3 | ✅ Landed 2026-05-13 |
+| Compose + `.env.dev` entries | STORAGE-2 / STORAGE-3 | Partial (env keys in place; compose + MinIO container with STORAGE-12) |
+| api-docs entry under `Xynes-Studio/xynes-api-docs` | STORAGE-3 | Open |
+| Upload session create/complete/abort handlers | STORAGE-5 | Open |
+| Object metadata, signed reads, delete, usage | STORAGE-6 | Open |
+| Async processing queue + workers | STORAGE-7 | Open |
+| Image/video/document processing profiles | STORAGE-8 | Open |
+| Security, privacy, abuse controls | STORAGE-9 | Open |
+| CMS Console storage client | STORAGE-10 | Open |
+| CMS content editor upload UX | STORAGE-11 | Open |
+| Local smoke + rollout checklist | STORAGE-12 | Open |
 
 ## References
 
 - Source plan (authoritative):
   `xynes-infra/docs/plans/2026-05-10-universal-object-storage-file-upload-api.md`
+- Provider env-values worksheet (capture R2 / MinIO / B2 / iDrive e2 here):
+  `xynes-infra/docs/plans/2026-05-13-storage-provider-env-values-worksheet.md`
 - Architecture epic:
   `xynes-infra/infra/architecture/epics/universal-object-storage.md`
 - PFU-1 actor contract reference: `xynes-accounts-service/src/routes/internal.route.ts`,
