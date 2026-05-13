@@ -2,10 +2,12 @@
 
 Platform-level workspace object storage and file upload service for the Xynes ERP.
 
-> **Status:** STORAGE-1 — Architecture & docs phase. **No runtime code yet.**
-> The runnable Bun/Hono service skeleton, provider adapters, and tests land in
-> STORAGE-4. Until then, this repo holds only the architecture contract,
-> developer guide, and API contract that downstream stories will build against.
+> **Status:** STORAGE-4 landed 2026-05-13.
+> Bun/Hono runtime + S3-compatible provider adapter (R2 / B2 / iDrive e2 /
+> AWS S3 / MinIO / `s3_generic`) + actor surface + 155 / 155 tests.
+> The `POST /internal/storage-actions` route is wired but the action
+> registry is **empty by default** — every action key returns
+> `400 UNKNOWN_ACTION` until STORAGE-5+ registers handlers.
 
 ## Scope
 

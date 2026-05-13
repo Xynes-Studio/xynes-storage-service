@@ -85,9 +85,10 @@ Source plan §7–§8 carries the authoritative table.
 
 | Item                                                       | MVP scope    |
 | ---------------------------------------------------------- | ------------ |
-| Cloudflare R2 (Standard) adapter                           | **In**       |
-| Local MinIO / S3-compatible adapter for dev                | **In**       |
-| Backblaze B2, Tigris, AWS S3, Supabase, customer buckets   | Deferred     |
+| Cloudflare R2 (Standard) adapter — default hosted provider | **In**       |
+| MinIO / S3-compatible config support via the same adapter class | **In** (opt-in ad-hoc; not auto-provisioned) |
+| Backblaze B2, iDrive e2 — config-only via same adapter | **In** (config-compatible; live wiring deferred) |
+| Tigris, AWS S3, Supabase, customer (BYOS) buckets          | Deferred     |
 | Direct browser-to-provider uploads                         | **In**       |
 | Async post-upload processing (scan, image variants, video poster) | **In** |
 | `cms_media` purpose for CMS authoring                      | **In**       |
@@ -107,6 +108,7 @@ Source plan §7–§8 carries the authoritative table.
 ## References
 
 - Source plan: `xynes-infra/docs/plans/2026-05-10-universal-object-storage-file-upload-api.md`
+- Provider env-values worksheet: `xynes-infra/docs/plans/2026-05-13-storage-provider-env-values-worksheet.md`
 - Epic: `xynes-infra/infra/architecture/epics/universal-object-storage.md`
 - Sibling epic for posture parity:
   `xynes-infra/infra/architecture/epics/workspace-admin-integrations.md`
