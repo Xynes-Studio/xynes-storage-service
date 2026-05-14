@@ -1,20 +1,25 @@
 # Xynes Storage Service — Developer Guide
 
-> **Status: STORAGE-9 (security, privacy, and abuse controls landed 2026-05-14).**
-> STORAGE-5 (upload session lifecycle) landed 2026-05-13. STORAGE-6
-> (object metadata, signed reads, delete, and usage handlers) landed
-> 2026-05-14. STORAGE-7 (async processing queue + worker contract) landed
-> 2026-05-14. STORAGE-8 (image / video / document processing profiles)
-> landed 2026-05-14. STORAGE-9 adds the storage-service-side log
-> redaction mirror (`src/infra/redaction.ts` wired into
-> `src/infra/logger.ts`), the per-provider CORS serialiser
-> (`src/infra/providers/cors-serialiser.ts` — XML for R2 / B2 / AWS S3 /
-> MinIO / `s3_generic`, JSON for iDrive e2; output re-validated against
-> B2's 100 KB binding constraint), and the abandoned upload session
-> cleanup job (`src/infra/cleanup/abandoned-uploads.ts` — provider
-> `AbortMultipartUpload` with `NoSuchUpload`-style swallow, deterministic
-> `runOnce()` for tests, polling `start()` / `stop()` for prod). Docker
-> compose wiring + MinIO container + live smoke harness in STORAGE-12.
+> **Status: STORAGE-12 (local smoke, docs, and rollout checklist landed 2026-05-14).**
+> STORAGE-9 (security, privacy, and abuse controls) landed 2026-05-14.
+> STORAGE-12 wires the storage-service container into
+> `xynes-infra/docker-compose.dev.yml`, ships a provider-parameterised
+> live smoke harness (`xynes-infra/scripts/smoke-universal-storage.sh`)
+> defaulted to `STORAGE_SMOKE_PROVIDER=r2` (with opt-in `minio` / `b2` /
+> `idrive_e2` support — MinIO is operator-ad-hoc, NOT bundled in compose),
+> a cleanup script (`xynes-infra/scripts/cleanup-universal-storage.sh`)
+> for stale pending sessions, the provider-parameterised rollout checklist
+> at `xynes-infra/docs/runbooks/universal-storage-rollout-checklist.md`,
+> and a static validator at
+> `xynes-infra/scripts/test/smoke-universal-storage.test.sh` wired into
+> `scripts/test/run.sh`. Earlier stories: STORAGE-5/6/7/8/9 in this repo,
+> STORAGE-10 (CMS Console storage client) + STORAGE-11 (CMS editor upload
+> UX + Lumia DS `objectId` support) in the frontend repos. Live runtime
+> hook-up of the STORAGE-5/6/7 repository contracts against Drizzle +
+> `platform.workspace_storage_providers` (i.e. the "registerActions"
+> follow-up story) is **out of scope for STORAGE-12** — the harness +
+> docs ship now so the rollout gate is documented and exercisable the
+> moment that wiring lands.
 
 ## TL;DR
 
@@ -933,6 +938,73 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-7 | ✅ Landed 2026-05-14 |
 | STORAGE-8 | ✅ Landed 2026-05-14 |
 | STORAGE-9 | ✅ Landed 2026-05-14 |
-| STORAGE-10 | Deferred |
-| STORAGE-11 | Deferred |
-| STORAGE-12 | Deferred |
+| STORAGE-10 | ✅ Landed 2026-05-14 (CMS Console — `xynes-cms-console-web`) |
+| STORAGE-11 | ✅ Landed 2026-05-14 (CMS editor + Lumia DS) |
+| STORAGE-12 | ✅ Landed 2026-05-14 |
+
+## Local Smoke + Rollout Checklist (STORAGE-12)
+
+STORAGE-12 ships the rollout gate for Universal Object Storage. It is
+**provider-parameterised** — the same harness runs against R2 (default),
+Backblaze B2, iDrive e2, AWS S3, or operator-ad-hoc MinIO.
+
+### Docker compose wiring
+
+`xynes-infra/docker-compose.dev.yml` now declares the `storage-service`
+container. The gateway depends on it so the stack boots cleanly. The
+container reads `PORT` (default `4204`), `DATABASE_URL`,
+`INTERNAL_SERVICE_TOKEN`, and `INTERNAL_AUTH_MODE` from the env file
+(`.env.dev` by default, `.env.dev.local` for local Supabase mode).
+`STORAGE_SERVICE_URL=http://storage-service:4204` is the gateway-side
+proxy target.
+
+**MinIO is NOT bundled.** `docker-compose.dev.yml` does not include a
+MinIO service; operators who want to exercise the adapter end-to-end
+without R2 credentials must spin MinIO up ad-hoc on their host. See the
+rollout checklist for the one-time `docker run quay.io/minio/minio`
+recipe.
+
+### Smoke harness
+
+| Script | Purpose |
+|---|---|
+| `xynes-infra/scripts/smoke-universal-storage.sh` | Live smoke battery. Defaults to routing + redaction only; `--full` opts in to the upload→complete→read flow (which requires the follow-up "registerActions" infra story). |
+| `xynes-infra/scripts/cleanup-universal-storage.sh` | Aborts stale `pending` upload sessions and soft-deletes smoke-fixture objects via the gateway. Safe `--dry-run` mode. |
+| `xynes-infra/scripts/test/smoke-universal-storage.test.sh` | Static validator. Asserts the smoke harness's `--help` output, fail-fast envelope, action-key + redaction coverage, compose wiring, env-file port consistency, and rollout-checklist coverage. Wired into `scripts/test/run.sh`. |
+
+The smoke harness's redaction sweep (Z.1 + Z.2) re-runs the STORAGE-9
+contract live: `docker compose logs storage-service --since <smoke-start>`
+AND `docker compose logs gateway --since <smoke-start>` must contain
+zero matches for `X-Amz-Signature`, `X-Amz-Credential`,
+`X-Amz-Security-Token`, `X-Amz-Date`, `X-Amz-Expires`,
+`X-Amz-SignedHeaders`, `xynes_live_<hex>`, `AKIA[A-Z0-9]+`, or
+`$argon2[id]?$`. If any pattern appears, **the redaction promise is
+broken** — STOP and file a bug.
+
+### Provider-parameterised rollout checklist
+
+`xynes-infra/docs/runbooks/universal-storage-rollout-checklist.md`
+documents the full per-provider rollout sequence (onboarding gate, bucket
+creation, lifecycle policy, CORS, credential reference, health check,
+malware scanner, worker concurrency, redaction verification, SigV4
+verification, `x-amz-tagging` absence verification). One block; runnable
+against any MVP-ready provider. iDrive e2 carries the only provider-
+specific onboarding gate (region MUST be enabled before bucket creation).
+
+### What STORAGE-12 deliberately does NOT include
+
+- **Production wiring of the STORAGE-5/6/7 repository contracts against
+  Drizzle.** The smoke harness's `--full` mode will return
+  `400 UNKNOWN_ACTION` until that follow-up infra story registers handlers
+  in `src/index.ts`. STORAGE-12 ships the gate; the wiring is the next
+  story.
+- **A canonical MinIO compose service.** Plan §STORAGE-12 deliberately
+  scopes MinIO as opt-in ad-hoc. If a future operator needs a permanent
+  local-dev MinIO, that's a small follow-up.
+- **Real bucket provisioning.** This service runs against
+  per-workspace `platform.workspace_storage_providers` rows. Workspaces
+  are provisioned per the rollout checklist; STORAGE-12 itself does not
+  create any buckets.
+- **CMS body validation that rejects nodes carrying provider config.**
+  STORAGE-11's `stripTransientImageUrls` is the first line of defense;
+  a future CMS Core validator is the second. Not part of STORAGE-12.
