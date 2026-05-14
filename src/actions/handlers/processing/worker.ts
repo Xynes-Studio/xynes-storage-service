@@ -101,21 +101,21 @@ export class ProcessingWorker {
       // Workspaces that have spare per-workspace slots — those are the
       // only ones we'll accept claims for. We can't pre-filter at the
       // repo layer without first knowing what's queued, so we accept the
-      // claim and skip-with-requeue if the workspace is at capacity.
+      // claim and release on the cap path if the workspace is at
+      // capacity. `releaseClaimedJob` MUST NOT count as an attempt — a
+      // flow-controlled job is not a job that has been tried.
       const next = await this.deps.queue.claimNextQueuedJob({ now: this.now() });
       if (!next) break;
       const current = perWorkspaceCount.get(next.workspaceId) ?? 0;
       if (current >= this.maxPerWorkspace) {
-        // Per-workspace cap hit — release the claim by marking the job
-        // back to queued with a tiny backoff so another worker (or this
-        // worker on the next pass) picks it up.
+        // Per-workspace cap hit — release the claim with a tiny backoff
+        // so another worker (or this worker on the next pass) picks it
+        // up. The release path leaves `attempts` untouched.
         stats = { ...stats, skipped: stats.skipped + 1 };
-        await this.deps.queue.markFailed({
+        await this.deps.queue.releaseClaimedJob({
           jobId: next.id,
-          errorCode: 'PER_WORKSPACE_CAP',
-          terminal: false,
-          now: this.now(),
           nextScheduledAt: new Date(this.now().getTime() + 1_000),
+          now: this.now(),
         });
         continue;
       }
@@ -227,8 +227,14 @@ export class ProcessingWorker {
     errorCode: string,
     retryable: boolean,
   ): Promise<'retried' | 'failed'> {
-    const attemptsSoFar = job.attempts + 1;
-    const canRetry = retryable && attemptsSoFar < this.maxAttempts;
+    // `job.attempts` is the count of attempts BEFORE this one. The
+    // current attempt is the (job.attempts + 1)-th. We retry if there is
+    // room for at least one more attempt after this one fails — i.e. the
+    // current attempt count (`job.attempts + 1`) is strictly less than
+    // `maxAttempts`. At equality, this is the last attempt and a failure
+    // is terminal.
+    const currentAttemptNumber = job.attempts + 1;
+    const canRetry = retryable && currentAttemptNumber < this.maxAttempts;
     if (canRetry) {
       const nextScheduledAt = new Date(this.now().getTime() + this.backoffSeconds * 1000);
       await this.deps.queue.markFailed({

@@ -365,14 +365,20 @@ describe('ProcessingWorker — concurrency limits', () => {
       now: () => new Date('2026-05-14T01:00:10.000Z'),
     });
     const stats = await worker.runOnce();
-    // Only 1 from this workspace runs; the other 2 should be skip+requeue
+    // Only 1 from this workspace runs; the other 2 are flow-controlled
+    // and released back to queued WITHOUT being charged an attempt
+    // (PER_WORKSPACE_CAP is not a job failure).
     expect(stats.attempted).toBe(1);
     expect(stats.skipped).toBe(2);
-    // Skipped ones are still in queued state with PER_WORKSPACE_CAP errorCode
     const j2 = queue.getRow('j-2');
     const j3 = queue.getRow('j-3');
-    expect([j2?.errorCode, j3?.errorCode]).toContain('PER_WORKSPACE_CAP');
+    // Released claims are back to 'queued', attempts untouched (still 0),
+    // and have a tiny backoff (~1s) so a subsequent pass picks them up.
     expect([j2?.status, j3?.status]).toEqual(['queued', 'queued']);
+    expect([j2?.attempts, j3?.attempts]).toEqual([0, 0]);
+    // Released jobs do NOT carry a PER_WORKSPACE_CAP errorCode — they
+    // were never attempted, so there's nothing to surface.
+    expect([j2?.errorCode, j3?.errorCode]).toEqual([null, null]);
   });
 });
 
@@ -410,6 +416,121 @@ describe('ProcessingWorker — polling loop', () => {
     await new Promise((r) => setTimeout(r, 40));
     worker.stop();
     expect(queue.claimNextCount).toBeGreaterThan(0);
+  });
+});
+
+describe('ProcessingWorker — attempts contract', () => {
+  test('runs exactly maxAttempts times before dead-lettering (retryable runner)', async () => {
+    const queue = new FakeProcessingQueue();
+    const status = new FakeObjectStatus();
+    const o = seedObject({ status: 'processing' });
+    status.seed(o);
+    queue.bindObjectToWorkspace(o.id, o.workspaceId);
+    queue.seed({
+      id: 'j-cap',
+      objectId: o.id,
+      jobType: 'scan_validation',
+      required: true,
+      status: 'queued',
+      attempts: 0,
+      maxAttempts: 3,
+    });
+    let runnerCallCount = 0;
+    const failing: JobRunner = async () => {
+      runnerCallCount += 1;
+      return { errorCode: 'RUNNER_FAILED', retryable: true };
+    };
+
+    // Pass 1: attempt 1, retry.
+    // We advance the clock past the backoff between passes so the job
+    // becomes re-claimable.
+    let nowMs = Date.parse('2026-05-14T03:00:00.000Z');
+    const worker = new ProcessingWorker({
+      queue,
+      status,
+      findObject: makeFindObject(status),
+      runners: { scan_validation: failing },
+      maxAttempts: 3,
+      retryBackoffSeconds: 60,
+      now: () => new Date(nowMs),
+    });
+
+    await worker.runOnce();
+    expect(runnerCallCount).toBe(1);
+    expect(queue.getRow('j-cap')?.attempts).toBe(1);
+    expect(queue.getRow('j-cap')?.status).toBe('queued');
+
+    nowMs += 70_000;
+    await worker.runOnce();
+    expect(runnerCallCount).toBe(2);
+    expect(queue.getRow('j-cap')?.attempts).toBe(2);
+    expect(queue.getRow('j-cap')?.status).toBe('queued');
+
+    nowMs += 70_000;
+    await worker.runOnce();
+    expect(runnerCallCount).toBe(3); // exactly maxAttempts
+    expect(queue.getRow('j-cap')?.attempts).toBe(3);
+    expect(queue.getRow('j-cap')?.status).toBe('failed'); // dead-lettered
+    expect(queue.getRow('j-cap')?.errorCode).toBe('RUNNER_FAILED');
+    // Required job dead-lettered -> parent flips to failed.
+    expect(status.objects.get(o.id)?.status).toBe('failed');
+
+    // A 4th pass MUST NOT run the runner — the job is terminal.
+    nowMs += 70_000;
+    await worker.runOnce();
+    expect(runnerCallCount).toBe(3);
+  });
+
+  test('per-workspace cap releases without burning attempts (flow-control invariant)', async () => {
+    const queue = new FakeProcessingQueue();
+    const status = new FakeObjectStatus();
+    const o = seedObject({ status: 'processing' });
+    status.seed(o);
+    queue.bindObjectToWorkspace(o.id, o.workspaceId);
+    // 2 jobs same workspace; cap = 1. The 2nd job will be claimed and
+    // released repeatedly across passes — it MUST NOT accumulate
+    // attempts.
+    queue.seed({
+      id: 'j-runs',
+      objectId: o.id,
+      jobType: 'scan_validation',
+      required: true,
+      maxAttempts: 3,
+    });
+    queue.seed({
+      id: 'j-capped',
+      objectId: o.id,
+      jobType: 'video_probe',
+      required: true,
+      maxAttempts: 3,
+      scheduledAt: new Date('2026-05-14T01:00:01.000Z'),
+    });
+    let nowMs = Date.parse('2026-05-14T01:00:10.000Z');
+    const successRunner: JobRunner = async () => ({});
+    const worker = new ProcessingWorker({
+      queue,
+      status,
+      findObject: makeFindObject(status),
+      runners: {
+        scan_validation: successRunner,
+        video_probe: successRunner,
+      },
+      maxConcurrent: 4,
+      maxConcurrentPerWorkspace: 1,
+      now: () => new Date(nowMs),
+    });
+    await worker.runOnce();
+    // j-runs succeeded; j-capped released back to queued, untouched.
+    expect(queue.getRow('j-runs')?.status).toBe('succeeded');
+    expect(queue.getRow('j-capped')?.status).toBe('queued');
+    expect(queue.getRow('j-capped')?.attempts).toBe(0);
+
+    // Advance past the 1s flow-control backoff and run again.
+    nowMs += 2_000;
+    await worker.runOnce();
+    // j-capped now runs (cap is free since j-runs is succeeded).
+    expect(queue.getRow('j-capped')?.status).toBe('succeeded');
+    expect(queue.getRow('j-capped')?.attempts).toBe(1);
   });
 });
 

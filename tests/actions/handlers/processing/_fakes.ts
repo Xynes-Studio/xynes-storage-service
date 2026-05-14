@@ -167,10 +167,12 @@ export class FakeProcessingQueue implements ProcessingJobQueueRepository {
       .sort((a, b) => a.scheduledAt.getTime() - b.scheduledAt.getTime());
     const next = due[0];
     if (!next) return null;
+    // Contract: claim flips status -> 'running' but does NOT bump
+    // `attempts`. The worker is the sole authority for the attempts
+    // counter (via markSucceeded / markFailed).
     const claimedRow: QueueRow = {
       ...next,
       status: 'running',
-      attempts: next.attempts + 1,
       updatedAt: input.now,
     };
     this.rows.set(claimedRow.id, claimedRow);
@@ -190,10 +192,12 @@ export class FakeProcessingQueue implements ProcessingJobQueueRepository {
     this.markSucceededCount += 1;
     const r = this.rows.get(input.jobId);
     if (!r) return null;
+    // Contract: success bumps attempts (one completed attempt).
     const updated: QueueRow = {
       ...r,
       status: 'succeeded',
       errorCode: null,
+      attempts: r.attempts + 1,
       updatedAt: input.now,
     };
     this.rows.set(updated.id, updated);
@@ -204,20 +208,40 @@ export class FakeProcessingQueue implements ProcessingJobQueueRepository {
     this.markFailedCalls.push(input);
     const r = this.rows.get(input.jobId);
     if (!r) return null;
+    // Contract: both branches bump attempts (a runner-driven failure is
+    // a completed attempt).
     const updated: QueueRow = input.terminal
       ? {
           ...r,
           status: 'failed',
           errorCode: input.errorCode,
+          attempts: r.attempts + 1,
           updatedAt: input.now,
         }
       : {
           ...r,
           status: 'queued',
           errorCode: input.errorCode,
+          attempts: r.attempts + 1,
           scheduledAt: input.nextScheduledAt ?? new Date(input.now.getTime() + 1000),
           updatedAt: input.now,
         };
+    this.rows.set(updated.id, updated);
+    return stripPayload(updated);
+  }
+
+  async releaseClaimedJob(input: { jobId: string; nextScheduledAt: Date; now: Date }) {
+    const r = this.rows.get(input.jobId);
+    if (!r) return null;
+    if (r.status !== 'running') return null;
+    // Contract: release does NOT bump attempts — the job was flow-
+    // controlled, not attempted.
+    const updated: QueueRow = {
+      ...r,
+      status: 'queued',
+      scheduledAt: input.nextScheduledAt,
+      updatedAt: input.now,
+    };
     this.rows.set(updated.id, updated);
     return stripPayload(updated);
   }

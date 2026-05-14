@@ -105,7 +105,19 @@ export interface ClaimedJob {
   readonly jobType: ProcessingJobType;
   readonly required: boolean;
   readonly payload: Readonly<Record<string, unknown>>;
+  /**
+   * Count of attempts ALREADY recorded for this job BEFORE the current
+   * claim. `attempts === 0` means this is the very first attempt. The
+   * worker bumps the counter via `markSucceeded` / `markFailed` —
+   * `claimNextQueuedJob` MUST NOT increment it.
+   */
   readonly attempts: number;
+  /**
+   * Hard cap on the total number of attempts the worker is allowed to
+   * make (including the current one). Once `attempts + 1 >= maxAttempts`
+   * AND the runner has failed, the worker marks the job terminally
+   * failed and dead-letters it.
+   */
   readonly maxAttempts: number;
 }
 
@@ -114,9 +126,10 @@ export interface MarkJobFailedInput {
   readonly errorCode: string;
   readonly now: Date;
   /**
-   * When true the queue repo MUST update `status = 'failed'` (terminal).
-   * When false the queue repo MUST update `status = 'queued'`,
-   * increment `attempts`, and stamp `scheduledAt = now + backoff`.
+   * When true the queue repo MUST update `status = 'failed'`
+   * (terminal) and bump `attempts`. When false the queue repo MUST
+   * update `status = 'queued'`, bump `attempts`, and stamp
+   * `scheduledAt = nextScheduledAt`.
    */
   readonly terminal: boolean;
   /** Required when `terminal = false`. */
@@ -149,6 +162,11 @@ export interface ProcessingJobQueueRepository {
    * MUST be safe under concurrent workers (Postgres:
    * `SELECT … FOR UPDATE SKIP LOCKED`).
    *
+   * Implementations MUST NOT bump `attempts` here — the worker is the
+   * sole authority for the attempts counter. A claim that is later
+   * released via `releaseClaimedJob` (per-workspace-cap path) MUST NOT
+   * be counted as an attempt.
+   *
    * Returns `null` when no due jobs are available.
    */
   claimNextQueuedJob(input: {
@@ -162,14 +180,29 @@ export interface ProcessingJobQueueRepository {
     workspaceAllowlist?: ReadonlyArray<string>;
   }): Promise<ClaimedJob | null>;
 
-  /** Mark a running job `succeeded`. */
+  /** Mark a running job `succeeded`. MUST bump `attempts`. */
   markSucceeded(input: { jobId: string; now: Date }): Promise<StorageProcessingJobRecord | null>;
 
   /**
    * Mark a running job either `failed` (terminal) or back to `queued`
    * with a backoff (retry). The decision lives at the worker layer.
+   * Implementations MUST bump `attempts` in both branches — both
+   * branches represent a completed attempt by the runner.
    */
   markFailed(input: MarkJobFailedInput): Promise<StorageProcessingJobRecord | null>;
+
+  /**
+   * Release a previously-claimed job WITHOUT counting it as an attempt.
+   * Used by the worker's per-workspace-cap flow-control path. Flips
+   * status back to `queued`, stamps `scheduledAt = nextScheduledAt`,
+   * and leaves `attempts` untouched. Returns the updated row or `null`
+   * when the job is not in `running` state.
+   */
+  releaseClaimedJob(input: {
+    jobId: string;
+    nextScheduledAt: Date;
+    now: Date;
+  }): Promise<StorageProcessingJobRecord | null>;
 
   /**
    * Requeue terminally-failed jobs for an object — used by the retry
