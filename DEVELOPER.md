@@ -977,8 +977,11 @@ contract live: `docker compose logs storage-service --since <smoke-start>`
 AND `docker compose logs gateway --since <smoke-start>` must contain
 zero matches for `X-Amz-Signature`, `X-Amz-Credential`,
 `X-Amz-Security-Token`, `X-Amz-Date`, `X-Amz-Expires`,
-`X-Amz-SignedHeaders`, `xynes_live_<hex>`, `AKIA[A-Z0-9]+`, or
-`$argon2[id]?$`. If any pattern appears, **the redaction promise is
+`X-Amz-SignedHeaders`, `xynes_live_<hex>`, `AKIA[A-Z0-9]+`, or the
+literal Argon2 marker `$argon2` (which prefixes `$argon2id$…`,
+`$argon2i$…`, and `$argon2d$…` hashes — the smoke matches it via
+`grep -E '\$argon2'` so the leading `$` is a literal dollar, not an
+end-of-line anchor). If any pattern appears, **the redaction promise is
 broken** — STOP and file a bug.
 
 ### Provider-parameterised rollout checklist
