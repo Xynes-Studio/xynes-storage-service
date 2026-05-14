@@ -1,21 +1,23 @@
 # Xynes Storage Service — Developer Guide
 
-> **Status: STORAGE-7 (async processing queue + worker contract landed 2026-05-14).**
+> **Status: STORAGE-8 (image / video / document processing profiles landed 2026-05-14).**
 > STORAGE-5 (upload session lifecycle) landed 2026-05-13. STORAGE-6
 > (object metadata, signed reads, delete, and usage handlers) landed
-> 2026-05-14. STORAGE-7 adds the deterministic job planner, the queue
-> repository contract, the polling worker engine with global +
-> per-workspace concurrency caps, the aggregate-status reducer, and the
-> `platform.storage.objects.process.retry` action handler. The complete
-> handler is wired to invoke the queue via an opaque `enqueueProcessing`
-> callback — `processingJobs` is no longer `[]` when STORAGE-7 is wired
-> in production. Handlers and worker remain fully DI-driven against
-> `ProcessingJobQueueRepository`, `StorageObjectStatusRepository`, the
-> per-jobType `JobRunner` registry, and the prior STORAGE-5/6 contracts —
-> production wiring (Drizzle + secret-manager-backed provider resolver +
-> live runners) lands as follow-up infra + STORAGE-8 stories.
-> Storage-service-side log redaction lands in STORAGE-9; Docker compose
-> wiring + MinIO container in STORAGE-12.
+> 2026-05-14. STORAGE-7 (async processing queue + worker contract) landed
+> 2026-05-14. STORAGE-8 adds the runner factories for `scan_validation`,
+> `image_optimize`, `video_probe`, `video_thumbnail`, `video_transcode`,
+> and `document_preview`, plus the named quality profiles
+> (`balanced` / `high_quality` / `storage_saver`), hard policy caps,
+> DI ports for image / video / document processors + malware scanner,
+> and a `createRunnerRegistry(deps)` factory that maps every STORAGE-7
+> `ProcessingJobType` to a real runner — no more "RUNNER_MISSING" in
+> production. Runners are fully DI-driven against `ProviderObjectIO`,
+> `StorageVariantWriter`, `ImageProcessor`, `VideoProcessor`,
+> `DocumentProcessor`, and `MalwareScanner`. Production wiring (sharp /
+> ffmpeg / libreoffice native bindings or remote sidecars + Drizzle
+> variant writer) lands as a follow-up infra story; tests inject
+> in-memory fakes. Storage-service-side log redaction lands in
+> STORAGE-9; Docker compose wiring + MinIO container in STORAGE-12.
 
 ## TL;DR
 
@@ -739,6 +741,62 @@ unit tests register handlers against in-memory fakes. The
 `registerProcessingActionHandlers` function is exported so production
 wiring is a one-liner once the Drizzle implementations land.
 
+### Image, Video, and Document Processing Profiles (STORAGE-8)
+
+Source layout under `src/actions/handlers/processing/runners/`:
+
+| File | Purpose |
+|---|---|
+| `errors.ts` | Closed-set runner error codes (`PROFILE_GUARD_REJECTED`, `OVER_MAX_BYTES`, `OVER_MAX_DIMENSIONS`, `OVER_MAX_DURATION`, `UNSUPPORTED_FORMAT`, `MALWARE_DETECTED`, `SCANNER_INCONCLUSIVE`, `PROCESSOR_FAILED`) plus `RunnerInputError` (non-retryable) and `RunnerExecutionError` (retryable) classes. |
+| `profiles.ts` | Named quality profiles (`balanced`, `high_quality`, `storage_saver`) for image + video; per-family hard caps (`MAX_IMAGE_BYTES=50MiB`, `MAX_VIDEO_BYTES=2GiB`, `MAX_DOCUMENT_BYTES=100MiB`, `MAX_IMAGE_DIMENSION=16384`, `MAX_VIDEO_DIMENSION=4096`, `MAX_VIDEO_DURATION_SECONDS=3600`); safe document MIME allowlist. |
+| `ports.ts` | DI port contracts: `ProviderObjectIO`, `StorageVariantWriter`, `ImageProcessor`, `VideoProcessor`, `DocumentProcessor`, `MalwareScanner`. Plus `noopMalwareScanner` for local dev. |
+| `variant-keys.ts` | `deriveVariantObjectKey({...})` — variant keys land under `<parent-dir>/variants/<role>.<ext>`. Asserts non-collision with the parent key. |
+| `runner-utils.ts` | `runRunnerWithErrorMapping(fn)` — translates `RunnerInputError` / `RunnerExecutionError` into `JobRunResult` shapes the worker understands; re-throws unexpected errors so the STORAGE-7 worker layer applies its `RUNNER_THREW` redaction. |
+| `scan-validation.ts` | `createScanValidationRunner({providerIO, scanner})`. REQUIRED. Enforces per-family hard byte cap, then scans via injected `MalwareScanner`. Verdicts: `clean` → success; `infected` → `MALWARE_DETECTED` non-retryable; `unknown` → `SCANNER_INCONCLUSIVE` retryable. |
+| `image.ts` | `createImageOptimizeRunner({providerIO, processor, variants})`. Non-required. Reads payload `qualityProfile` (defaults to `balanced`), enforces hard byte + dimension caps, then renders every variant for the active profile and writes each under a derivative key (never overwriting the original). |
+| `video.ts` | `createVideoProbeRunner`, `createVideoThumbnailRunner`, `createVideoTranscodeRunner`. Probe is REQUIRED — duration + dimension caps live here so thumbnail / transcode never burn worker time on over-cap inputs. Transcode writes H.264/AAC MP4 ONLY (per STORAGE-8 acceptance criteria). |
+| `document.ts` | `createDocumentPreviewRunner({providerIO, processor, variants})`. Non-required. Defense-in-depth allowlist re-check on top of the STORAGE-7 planner. Preview is always image/png or image/jpeg — never the original document format. |
+| `registry.ts` | `createRunnerRegistry(deps)` returns `Partial<Record<ProcessingJobType, JobRunner>>` for `ProcessingWorker.runners`. Every job type the STORAGE-7 planner can emit has a runner. |
+| `index.ts` | Barrel re-exports. |
+
+#### Security invariants enforced by tests
+
+- Runners NEVER receive the raw `StorageProviderAdapter` — only the narrow `ProviderObjectIO` port (read + write only). They cannot mint signed URLs or initiate multipart uploads, which scopes their blast radius.
+- Runners NEVER overwrite the original `providerObjectKey`. The variant-key deriver asserts non-collision; every provider write uses `ifAbsent: true`.
+- Runners NEVER embed raw provider / library / processor error text into surfaced error codes. Closed-set codes only.
+- The scan/validation runner refuses to coerce a `unknown` verdict to "best-effort clean" — transient scanner outages retry, not pass.
+- EXIF stripping (including GPS) is the `ImageProcessor` port's contractual responsibility — documented invariant on `renderVariant`.
+
+#### Production wiring example
+
+```ts
+import { ProcessingWorker, createRunnerRegistry } from './actions/handlers/processing';
+import { sharpImageProcessor } from './infra/processors/sharp-image';   // future infra story
+import { ffmpegVideoProcessor } from './infra/processors/ffmpeg-video'; // future infra story
+import { libreofficeDocumentProcessor } from './infra/processors/libreoffice-document';
+import { drizzleVariantWriter } from './infra/db/drizzle-variant-writer';
+import { adapterToProviderIO } from './infra/providers/adapter-to-provider-io';
+import { clamavScanner } from './infra/scanners/clamav';
+
+const runners = createRunnerRegistry({
+  providerIO: adapterToProviderIO(workspaceProviderAdapter),
+  variants: drizzleVariantWriter,
+  scanner: clamavScanner,
+  image: sharpImageProcessor,
+  video: ffmpegVideoProcessor,
+  document: libreofficeDocumentProcessor,
+});
+
+const worker = new ProcessingWorker({ queue, status, findObject, runners });
+worker.start();
+```
+
+For STORAGE-8 the action registry remains empty in `src/index.ts` —
+the unit tests register handlers and runners against in-memory fakes.
+The `createRunnerRegistry` factory is exported so production wiring
+is a one-liner once sharp / ffmpeg / libreoffice bindings (or remote
+sidecars) plus the Drizzle variant writer land.
+
 ### Story status
 
 | Story | Status |
@@ -750,7 +808,7 @@ wiring is a one-liner once the Drizzle implementations land.
 | STORAGE-5 | ✅ Landed 2026-05-13 |
 | STORAGE-6 | ✅ Landed 2026-05-14 |
 | STORAGE-7 | ✅ Landed 2026-05-14 |
-| STORAGE-8 | Deferred |
+| STORAGE-8 | ✅ Landed 2026-05-14 |
 | STORAGE-9 | Deferred |
 | STORAGE-10 | Deferred |
 | STORAGE-11 | Deferred |
