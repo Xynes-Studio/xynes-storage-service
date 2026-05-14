@@ -1,15 +1,15 @@
 # Xynes Storage Service — Developer Guide
 
-> **Status: STORAGE-4 (service runtime + provider adapter landed 2026-05-13).**
-> The Bun/Hono runtime, the S3-compatible provider adapter (R2 + MinIO +
-> generic), the action-layer scaffold, and the actor surface are in place.
-> The `POST /internal/storage-actions` route accepts gateway traffic and
-> dispatches via an action registry that is **empty by default** — every
-> action key surfaces as `400 UNKNOWN_ACTION` until STORAGE-5+ registers
-> handlers. Docker compose wiring + MinIO container land with STORAGE-12.
->
-> When a section is marked `[planned — STORAGE-N]`, the contract is fixed but
-> the implementation lives in story STORAGE-N.
+> **Status: STORAGE-5 (upload session lifecycle handlers landed 2026-05-13).**
+> The `platform.storage.objects.upload` action key now routes through a
+> single dispatcher that branches on a payload-level `operation`
+> discriminator (`create` | `complete` | `abort`). Handlers are fully
+> DI-driven against `StorageObjectRepository`, `UploadSessionRepository`,
+> and `StorageProviderResolver` interfaces — production wiring (Drizzle +
+> the live R2 adapter) lands as a follow-up infra story.
+> Object metadata reads, signed downloads, deletes, and usage aggregates
+> ship in STORAGE-6; async processing jobs in STORAGE-7. Docker compose
+> wiring + MinIO container land with STORAGE-12.
 
 ## TL;DR
 
@@ -318,98 +318,136 @@ configurations and asserts identical request construction modulo the
 provider quirks. Add new providers (e.g. Tigris) by adding a new entry to
 the `PROVIDER_MATRIX` fixture — no adapter code change required.
 
-## Environment
+## Upload Session Lifecycle (STORAGE-5)
 
-Concrete env keys for the storage-service runtime and the per-provider
-provisioning surface. The hosted provider values feed
-`platform.workspace_storage_providers` rows when a workspace is provisioned —
-they are NOT consumed directly by the adapter, which reads its config from
-the DB row (with `credential_ref` resolving against the secret manager).
+The `platform.storage.objects.upload` action key is the single entry point
+for upload-session lifecycle operations. The gateway funnels three routes
+to this key:
 
-**Source of truth for provisioning values:**
-`xynes-infra/docs/plans/2026-05-13-storage-provider-env-values-worksheet.md`.
+- `POST /workspaces/:workspaceId/storage/uploads`
+- `POST /workspaces/:workspaceId/storage/uploads/:uploadId/complete`
+- `POST /workspaces/:workspaceId/storage/uploads/:uploadId/abort`
 
-**Source of truth for per-provider quirks (regions, endpoint shape,
-`x-amz-tagging`, CORS limits, etc.):**
-`xynes-infra/docs/plans/2026-05-10-universal-object-storage-file-upload-api.md` §3.
+The storage-service distinguishes the three with a payload-level
+`operation` discriminator: `'create' | 'complete' | 'abort'`. Each
+operation is enforced by a strict Zod schema.
 
-### Runtime env (service process)
+### Source layout
 
-| Env var                          | Purpose                                          |
-| -------------------------------- | ------------------------------------------------ |
-| `PORT`                           | Service HTTP port. **Reserved: `4204`** (current allocation 4100 gateway, 4201 doc, 4202 cms-core, 4203 accounts, 4204 storage, 4300 authz, 4400 telemetry). |
-| `INTERNAL_AUTH_MODE`             | `hybrid` (default) accepts legacy static token + future JWT; `jwt` requires JWT only. |
-| `INTERNAL_SERVICE_TOKEN`         | Shared with `xynes-gateway` for `X-Internal-Service-Token` verification (legacy path). |
-| `STORAGE_MULTIPART_THRESHOLD_BYTES` | Default `104857600` (100 MiB) per AWS guidance. |
-| `DATABASE_URL`                   | Postgres connection string. Shared platform DB. Used by STORAGE-5+ when repositories land. |
+```
+src/actions/handlers/uploads/
+  schemas.ts        # Strict Zod schemas for the three operations.
+  types.ts          # DTO + repository + resolver interfaces (DI).
+  object-keys.ts    # Unguessable provider-key derivation.
+  responses.ts      # Public DTO builders (documented-fields-only).
+  create.ts         # Create-session handler factory.
+  complete.ts       # Complete-session handler factory.
+  abort.ts          # Abort-session handler factory.
+  index.ts          # Dispatcher + `registerUploadActionHandlers(deps)`.
+```
 
-### Provisioning env (capture during worksheet)
+### Handler dependencies
 
-These values are **inputs to the worksheet**, which records the non-secret
-fields (`endpoint`, `region`, `bucket`, `forcePathStyle`, `credential_ref`)
-into `platform.workspace_storage_providers`. The raw `accessKeyId` and
-`secretAccessKey` go to the secret manager only — the adapter resolves them
-via `credential_ref` at request time.
+Each handler factory takes a single `UploadHandlerDependencies` object:
 
-| Env var family   | Provider               | Notes |
-| ---------------- | ---------------------- | ----- |
-| `R2_*`           | Cloudflare R2 (default hosted) | `R2_ACCOUNT_ID` (32 hex), `R2_BUCKET`, `R2_REGION=auto`, `R2_STORAGE_CLASS=STANDARD\|STANDARD_IA`, `R2_CREDENTIAL_REF=secret://xynes/storage/r2-<env>` |
-| `MINIO_*`        | MinIO (opt-in ad-hoc local; NOT auto-provisioned) | Operator-spun via `docker run quay.io/minio/minio`. `MINIO_ENDPOINT=http://localhost:9000` (or `http://minio:9000` if you run it in the compose network), `MINIO_FORCE_PATH_STYLE=true`, `MINIO_CREDENTIAL_REF=secret://xynes/storage/minio-local`. STORAGE-4/5/6 unit tests do not require this — they use fakes. |
-| `B2_*`           | Backblaze B2 (deferred) | Real region required, NOT `auto`. Adapter NEVER emits `x-amz-tagging`; SigV4 only. |
-| `E2_*`           | iDrive e2 (deferred)    | Real region + region-enablement gate. CORS format is JSON, not XML — adapter serialises per provider. |
+```ts
+interface UploadHandlerDependencies {
+  readonly objects: StorageObjectRepository;
+  readonly sessions: UploadSessionRepository;
+  readonly providers: StorageProviderResolver;
+  readonly now?: () => Date;
+  readonly idFactory?: () => string;
+  readonly sessionTtlSeconds?: number;       // [60, 86400], default 900.
+  readonly multipartThresholdBytes?: number; // Default 100 MiB.
+}
+```
 
-> **No live provider is required for STORAGE-4/5/6 development.** Every
-> adapter test injects a fake `S3Client` + fake `getSignedUrl` via the
-> `S3StorageProviderAdapterDeps` DI seam. The MinIO entry above is opt-in
-> for operators who want to exercise the adapter end-to-end against a real
-> S3-compatible target locally — there is no canonical `services.minio` in
-> `docker-compose.dev.yml`.
+- `StorageObjectRepository` and `UploadSessionRepository` are repository
+  interfaces; production wiring (Drizzle against `platform.storage_*`)
+  lands as a follow-up infra story when DB access lands in
+  storage-service. Tests inject in-memory fakes.
+- `StorageProviderResolver` resolves the workspace's default provider via
+  `platform.workspace_storage_providers` and returns an instantiated
+  `StorageProviderAdapter` (the STORAGE-4 adapter class).
 
-**Security rules** (mirrors the worksheet §0):
+### Security invariants enforced by the handlers
 
-- Raw access keys / secret keys NEVER touch `.env*` files or commit history
-  beyond the explicit `replace_me_*` placeholders in `.env.example`.
-- `credential_ref` is an **opaque pointer** to the secret manager
-  (e.g. `secret://xynes/storage/r2-dev`) — safe to commit, never resolves
-  to the raw key at parse time.
-- If a raw key ever appears in this file, `.env*`, chat, or commit history,
-  rotate it at the provider and re-record the secret-manager pointer.
+- **Strict schema validation.** Each payload is parsed with `.strict()`;
+  unknown fields are rejected with `400 VALIDATION_ERROR` BEFORE the
+  handler touches the DB or the provider.
+- **Cross-workspace denial == not-found envelope.** Looking up a session
+  that exists but belongs to a different workspace returns the same
+  `ValidationError("Upload session not found")` as a truly-unknown
+  session id. Hostile callers cannot probe other workspaces' session
+  ids.
+- **Workspace-scoped object keys.** Provider object keys follow the
+  layout `workspaces/<workspaceId>/objects/<objectId>/<safeFilename>`.
+  The `objectId` is a UUID v4 minted at create-session time (128 bits of
+  entropy), and the workspace UUID prefix prevents cross-workspace
+  enumeration at the bucket layout level. The `safeFilename` segment
+  strips path separators, ASCII control chars, and provider-reserved
+  chars; total key length is bounded to 1024 bytes (AWS S3 limit).
+- **Atomic create-with-session.** The repository contract requires that
+  the object row + upload-session row insert together. If the session
+  insert fails AFTER the create handler minted a multipart upload on the
+  provider, the handler issues a best-effort `AbortMultipartUpload`
+  before re-throwing the ORIGINAL DB error — preventing orphan provider
+  multipart uploads from accumulating on rollback.
+- **Conditional state transitions.** `markCompletedIfPending` and
+  `markAbortedIfPending` are conditional UPDATEs that match only
+  `status = 'pending'` (and, for complete, only when `expires_at` is in
+  the future). Race losers are resolved by re-reading the row and
+  surfacing either an idempotent success (if the row reached the same
+  terminal state) or a state-conflict envelope.
+- **Idempotent terminal states.** Calling `complete` on an already-
+  completed session, or `abort` on an already-aborted/expired session,
+  returns the current state envelope WITHOUT re-touching the provider
+  or the DB. This makes retries from the browser safe.
+- **`createdBy` audit posture matches CMS-API-KEY-ACTOR-1 Story C.**
+  Uploads performed by an `api_key` actor leave
+  `storage_objects.created_by = NULL`. Uploads performed by a `user`
+  actor populate it with the user UUID. Out-of-MVP-preset operations
+  (e.g. `process.retry`, `usage.read`) gate on `requireUserActor` in
+  later stories.
+- **Provider abort is best-effort on `NoSuchUpload`.** The abort handler
+  swallows `ProviderAdapterError` from `abortMultipartUpload` so a
+  provider-side already-aborted multipart (the documented STORAGE-9
+  cleanup-job behaviour) still flips the local DB row to `aborted`. A
+  non-`ProviderAdapterError` (programming bug, network failure) is
+  re-thrown.
 
-Full provisioning worksheet (R2 / MinIO / B2 / iDrive e2 step-by-step):
-`xynes-infra/docs/plans/2026-05-13-storage-provider-env-values-worksheet.md`.
+### Response shape contract — documented fields only
 
-## Story status
+Every handler returns a DTO shaped by `responses.ts`. The DTO is a strict
+allowlist — `provider_kind`, `endpoint`, `region`, `bucket`,
+`provider_object_key`, `provider_id`, `provider_upload_id`,
+`credential_ref`, `accessKeyId`, `secretAccessKey`, and presigned URL
+signature parameters do NOT appear as standalone fields. The signed
+`uploadUrl` / `parts[].url` are opaque bearer tokens the caller sends
+verbatim to the provider; their contents are not parsed by the caller.
 
-| Concern | Owning story | Status |
-| --- | --- | --- |
-| Bun/Hono service scaffold (`src/`, `tests/`, `Dockerfile`, `package.json`) | STORAGE-4 | ✅ Landed 2026-05-13 |
-| Provider adapter implementations (R2 + local MinIO + generic) | STORAGE-4 | ✅ Landed 2026-05-13 |
-| Postgres schema (`platform.storage_*` tables) | STORAGE-2 | ✅ Landed 2026-05-13 |
-| Authz permission catalog rows | STORAGE-3 | ✅ Landed 2026-05-13 |
-| Gateway service-key allowlist + dynamic route seeds | STORAGE-3 | ✅ Landed 2026-05-13 |
-| Compose + `.env.dev` entries | STORAGE-2 / STORAGE-3 | Partial (env keys in place; compose + MinIO container with STORAGE-12) |
-| api-docs entry under `Xynes-Studio/xynes-api-docs` | STORAGE-3 | Open |
-| Upload session create/complete/abort handlers | STORAGE-5 | Open |
-| Object metadata, signed reads, delete, usage | STORAGE-6 | Open |
-| Async processing queue + workers | STORAGE-7 | Open |
-| Image/video/document processing profiles | STORAGE-8 | Open |
-| Security, privacy, abuse controls | STORAGE-9 | Open |
-| CMS Console storage client | STORAGE-10 | Open |
-| CMS content editor upload UX | STORAGE-11 | Open |
-| Local smoke + rollout checklist | STORAGE-12 | Open |
+Redaction is tested by:
 
-## References
+1. Per-field allowlist assertions on every response shape.
+2. Whole-response `JSON.stringify` regex sweeps that fail if any
+   forbidden field name appears anywhere in the payload.
 
-- Source plan (authoritative):
-  `xynes-infra/docs/plans/2026-05-10-universal-object-storage-file-upload-api.md`
-- Provider env-values worksheet (capture R2 / MinIO / B2 / iDrive e2 here):
-  `xynes-infra/docs/plans/2026-05-13-storage-provider-env-values-worksheet.md`
-- Architecture epic:
-  `xynes-infra/infra/architecture/epics/universal-object-storage.md`
-- PFU-1 actor contract reference: `xynes-accounts-service/src/routes/internal.route.ts`,
-  `xynes-accounts-service/src/actions/{types,guards,errors}.ts`.
-- CMS-API-KEY-ACTOR-1 actor short-circuit reference:
-  `xynes-cms-core/src/middleware/authz-check.ts`,
-  `xynes-cms-core/src/middleware/actor-guards.ts`.
-- Workspace-admin-integrations epic (sibling platform-level epic):
-  `xynes-infra/infra/architecture/epics/workspace-admin-integrations.md`.
+### Wiring handlers into the action registry
+
+Production code wires the handlers with concrete repository
+implementations:
+
+```ts
+// src/index.ts (planned wiring; lands when DB access does):
+import { registerUploadActionHandlers } from './actions/handlers/uploads';
+registerUploadActionHandlers({
+  objects: new DrizzleStorageObjectRepository(db),
+  sessions: new DrizzleUploadSessionRepository(db),
+  providers: new DefaultStorageProviderResolver(db, secretManager),
+});
+```
+
+For STORAGE-5 the registry is still empty in `src/index.ts` — the unit
+tests register handlers against in-memory fakes. The `registerUploadActionHandlers`
+function is exported so production wiring is a one-liner.
+```
