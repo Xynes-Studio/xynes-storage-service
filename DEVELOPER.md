@@ -1,15 +1,17 @@
 # Xynes Storage Service — Developer Guide
 
-> **Status: STORAGE-5 (upload session lifecycle handlers landed 2026-05-13).**
-> The `platform.storage.objects.upload` action key now routes through a
-> single dispatcher that branches on a payload-level `operation`
-> discriminator (`create` | `complete` | `abort`). Handlers are fully
-> DI-driven against `StorageObjectRepository`, `UploadSessionRepository`,
-> and `StorageProviderResolver` interfaces — production wiring (Drizzle +
-> the live R2 adapter) lands as a follow-up infra story.
-> Object metadata reads, signed downloads, deletes, and usage aggregates
-> ship in STORAGE-6; async processing jobs in STORAGE-7. Docker compose
-> wiring + MinIO container land with STORAGE-12.
+> **Status: STORAGE-6 (object metadata, signed reads, delete, and usage handlers landed 2026-05-14).**
+> STORAGE-5 (upload session lifecycle) landed 2026-05-13. STORAGE-6 adds the
+> `platform.storage.objects.read` (`list` / `get` / `download_url`),
+> `platform.storage.objects.delete`, and `platform.storage.usage.read`
+> action keys. Handlers remain fully DI-driven against
+> `ExtendedStorageObjectRepository`, `StorageVariantRepository`,
+> `StorageProcessingJobRepository`, `StorageUsageRepository`, and
+> `ExtendedStorageProviderResolver` interfaces — production wiring
+> (Drizzle + the live R2 adapter) lands as a follow-up infra story.
+> Async processing jobs land in STORAGE-7; storage-service-side log
+> redaction in STORAGE-9; Docker compose wiring + MinIO container in
+> STORAGE-12.
 
 ## TL;DR
 
@@ -450,4 +452,134 @@ registerUploadActionHandlers({
 For STORAGE-5 the registry is still empty in `src/index.ts` — the unit
 tests register handlers against in-memory fakes. The `registerUploadActionHandlers`
 function is exported so production wiring is a one-liner.
+
+## Object Metadata, Signed Reads, Delete, and Usage (STORAGE-6)
+
+STORAGE-6 adds three action keys (registered together via
+`registerObjectActionHandlers(deps)`):
+
+| Action key                            | Operations (payload `operation` discriminator) | Gateway routes                                                          |
+| ------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------- |
+| `platform.storage.objects.read`       | `list` / `get` / `download_url`                | `GET /storage/objects`, `GET /storage/objects/:objectId`, `POST /storage/objects/:objectId/download-url` |
+| `platform.storage.objects.delete`     | `delete`                                       | `DELETE /storage/objects/:objectId`                                     |
+| `platform.storage.usage.read`         | `usage`                                        | (deferred per STORAGE-3 plan §8 "future preset keys")                   |
+
+### Source layout
+
 ```
+src/actions/handlers/objects/
+  schemas.ts        # Strict Zod schemas + the MIME->family classifier.
+  cursor.ts         # Opaque base64url-JSON keyset cursor codec.
+  types.ts          # Extended repositories + resolver + DTO records.
+  responses.ts      # Public DTO builders (documented-fields-only).
+  list.ts           # `platform.storage.objects.read` → `list`.
+  get.ts            # `platform.storage.objects.read` → `get`.
+  download-url.ts   # `platform.storage.objects.read` → `download_url`.
+  delete.ts         # `platform.storage.objects.delete` → `delete`.
+  usage.ts          # `platform.storage.usage.read` → `usage`.
+  index.ts          # Dispatchers + `registerObjectActionHandlers(deps)`.
+```
+
+### Handler dependencies
+
+```ts
+interface ObjectsHandlerDependencies {
+  readonly objects: ExtendedStorageObjectRepository;   // find / list / soft-delete
+  readonly variants: StorageVariantRepository;          // list variants per object
+  readonly jobs: StorageProcessingJobRepository;        // list processing jobs per object
+  readonly usage: StorageUsageRepository;               // read pre-aggregated daily rows
+  readonly providers: ExtendedStorageProviderResolver;  // resolveDefault + resolveByProviderId
+  readonly now?: () => Date;
+  readonly defaultDownloadTtlSeconds?: number;          // [30, 3600], default 900.
+  readonly defaultListLimit?: number;                   // default 50, max 200.
+}
+```
+
+Tests inject in-memory fakes (`tests/actions/handlers/objects/_fakes.ts`).
+Production wiring (Drizzle repositories + secret-manager-backed provider
+resolver) lands as a follow-up infra story.
+
+### Security invariants enforced by the STORAGE-6 handlers
+
+- **Workspace ownership is enforced at the repository layer.** Every
+  query is scoped to `ctx.workspaceId`; the handler never accepts a
+  workspaceId on the payload. Cross-workspace probes always return the
+  "Object not found" envelope.
+- **Soft-delete is the canonical delete contract.** The row flips to
+  `status = 'deleted'` and `deleted_at` is stamped; the row is preserved
+  for audit. List endpoints filter out `deleted` rows defensively even
+  if the repo returned them. Get / download-url against a `deleted`
+  object returns the same "Object not found" envelope as a never-existed
+  object — soft-deletion is indistinguishable from never-existed on the
+  wire.
+- **Download URLs are signed against the object's recorded `providerId`,
+  not the workspace default.** This ensures that an object created on
+  Provider A still resolves correctly after the workspace flips its
+  default to Provider B. The resolver miss surfaces as `403 ForbiddenError`
+  with a deliberately generic message that does NOT leak provider config.
+- **Download-URL response is exactly `{ objectId, url, expiresAt }`.**
+  No other field. The `url` embeds the SigV4 signature opaquely; the
+  caller treats it as a bearer token.
+- **Soft-delete is best-effort against the provider.**
+  `ProviderAdapterError` from `deleteObject` is swallowed (the local DB
+  row is the source of truth; the cleanup job reconciles orphans later).
+  A non-`ProviderAdapterError` is re-thrown but only AFTER the DB row
+  has flipped — the local soft-delete is the authoritative record.
+- **Download-URL filename input is CRLF / quote-stripped.**
+  `downloadFilename` is rejected by the schema if it contains CR/LF or
+  `"` characters — defense-in-depth on top of the STORAGE-4 adapter's
+  own header-injection guard.
+- **List filters are enum-bounded.** `purpose` is snake_case, `status`
+  is an explicit allowlist (`deleted` is excluded), `contentTypeFamily`
+  is an enum. A hostile caller cannot inject regex-like or unbounded
+  values.
+- **Opaque keyset cursor.** The list response carries an opaque
+  base64url-encoded JSON cursor. Decoding validates the inner shape
+  (ISO-8601 timestamp + UUID) and rejects malformed inputs with
+  `400 VALIDATION_ERROR`. The cursor deliberately does NOT carry the
+  workspace id — workspace scoping happens at the repo layer.
+- **Usage data is read from pre-aggregated rows.** The
+  `StorageUsageRepository` contract requires the repo to read from
+  `platform.storage_usage_daily` only; it MUST NOT scan
+  `storage_objects` at request time. The handler caps the date range to
+  366 days so a hostile caller cannot ask for years of daily data.
+- **Per-provider rows are collapsed before the wire.** The usage
+  response builder sums egress + ops across providers for the same date
+  and takes the max stored bytes; `providerKind` never appears in the
+  response.
+
+### Response shape contract — documented fields only
+
+Same posture as STORAGE-5: every DTO is an explicit allowlist. The
+following fields are tested ABSENT (per-field allowlist + whole-response
+`JSON.stringify` regex sweeps for every provider variant — R2 / B2 /
+iDrive e2 / AWS S3 / MinIO):
+
+- `provider_kind` / `providerKind`
+- `providerId`
+- `providerObjectKey` / `provider_object_key`
+- `credential_ref` / `credentialRef`
+- `endpoint` / `region` / `bucket`
+- `accessKeyId` / `secretAccessKey`
+- presigned-URL signature parameters
+
+### Wiring handlers into the action registry
+
+Production code wires the three action keys with concrete repositories:
+
+```ts
+// src/index.ts (planned wiring; lands when DB access does):
+import { registerObjectActionHandlers } from './actions/handlers/objects';
+registerObjectActionHandlers({
+  objects: new DrizzleExtendedStorageObjectRepository(db),
+  variants: new DrizzleStorageVariantRepository(db),
+  jobs: new DrizzleStorageProcessingJobRepository(db),
+  usage: new DrizzleStorageUsageRepository(db),
+  providers: new DefaultStorageProviderResolver(db, secretManager),
+});
+```
+
+For STORAGE-6 the registry is still empty in `src/index.ts` — the unit
+tests register handlers against in-memory fakes. The
+`registerObjectActionHandlers` function is exported so production wiring
+is a one-liner once the Drizzle implementations land.
