@@ -1,17 +1,21 @@
 # Xynes Storage Service — Developer Guide
 
-> **Status: STORAGE-6 (object metadata, signed reads, delete, and usage handlers landed 2026-05-14).**
-> STORAGE-5 (upload session lifecycle) landed 2026-05-13. STORAGE-6 adds the
-> `platform.storage.objects.read` (`list` / `get` / `download_url`),
-> `platform.storage.objects.delete`, and `platform.storage.usage.read`
-> action keys. Handlers remain fully DI-driven against
-> `ExtendedStorageObjectRepository`, `StorageVariantRepository`,
-> `StorageProcessingJobRepository`, `StorageUsageRepository`, and
-> `ExtendedStorageProviderResolver` interfaces — production wiring
-> (Drizzle + the live R2 adapter) lands as a follow-up infra story.
-> Async processing jobs land in STORAGE-7; storage-service-side log
-> redaction in STORAGE-9; Docker compose wiring + MinIO container in
-> STORAGE-12.
+> **Status: STORAGE-7 (async processing queue + worker contract landed 2026-05-14).**
+> STORAGE-5 (upload session lifecycle) landed 2026-05-13. STORAGE-6
+> (object metadata, signed reads, delete, and usage handlers) landed
+> 2026-05-14. STORAGE-7 adds the deterministic job planner, the queue
+> repository contract, the polling worker engine with global +
+> per-workspace concurrency caps, the aggregate-status reducer, and the
+> `platform.storage.objects.process.retry` action handler. The complete
+> handler is wired to invoke the queue via an opaque `enqueueProcessing`
+> callback — `processingJobs` is no longer `[]` when STORAGE-7 is wired
+> in production. Handlers and worker remain fully DI-driven against
+> `ProcessingJobQueueRepository`, `StorageObjectStatusRepository`, the
+> per-jobType `JobRunner` registry, and the prior STORAGE-5/6 contracts —
+> production wiring (Drizzle + secret-manager-backed provider resolver +
+> live runners) lands as follow-up infra + STORAGE-8 stories.
+> Storage-service-side log redaction lands in STORAGE-9; Docker compose
+> wiring + MinIO container in STORAGE-12.
 
 ## TL;DR
 
@@ -583,3 +587,171 @@ For STORAGE-6 the registry is still empty in `src/index.ts` — the unit
 tests register handlers against in-memory fakes. The
 `registerObjectActionHandlers` function is exported so production wiring
 is a one-liner once the Drizzle implementations land.
+
+## Async Processing Queue + Worker (STORAGE-7)
+
+STORAGE-7 introduces the async processing path that runs AFTER an upload
+completes. The path is decomposed into four pure, DI-friendly modules:
+
+1. **Planner** (`src/actions/handlers/processing/planner.ts`) — pure
+   function that maps `(contentType, compressionRequested, status)` to a
+   deterministic `ProcessingJobPlan[]`. Side-effect-free. Yields
+   `scan_validation` for every upload (required), `image_optimize` for
+   compression-enabled images (non-required), `video_probe` (required) +
+   `video_thumbnail` + `video_transcode` (non-required) for compression-
+   enabled videos, `document_preview` for the safe document MIME
+   allowlist (non-required). Audio / archives / text / unknown content
+   get scan-only.
+2. **Aggregator** (`src/actions/handlers/processing/aggregator.ts`) —
+   pure function from a job-list to the parent object's aggregate
+   `ObjectStatus`. `processing` while ≥1 required job is queued/running;
+   `failed` when ≥1 required job is terminally failed; `ready` when all
+   required jobs are succeeded (or non-blocking terminal). Non-required
+   jobs NEVER block `ready` and NEVER flip the parent to `failed`.
+3. **Enqueue helper** (`src/actions/handlers/processing/enqueue.ts`) —
+   runs the planner, inserts the job batch via the queue repo, flips the
+   parent object to `processing`. Used by the upload-complete handler
+   via the optional `enqueueProcessing` callback hook on
+   `UploadHandlerDependencies`.
+4. **Worker engine** (`src/actions/handlers/processing/worker.ts`) —
+   polling loop that claims `queued` jobs atomically, dispatches them
+   via the per-`jobType` `JobRunner` registry, applies retry / dead-
+   letter logic, and updates the parent aggregate after each terminal
+   transition.
+
+### Action key
+
+- `platform.storage.objects.process.retry` — discriminator
+  `{ operation: 'retry', objectId: <UUID> }`. Requeues every
+  terminally-failed job for the object, then recomputes + applies the
+  aggregate status. Cross-workspace probes and soft-deleted objects
+  return the same `"Object not found"` envelope as truly-unknown ids.
+
+### Worker concurrency model
+
+- **Global cap** (`maxConcurrent`, default `4`) — bounds how many jobs
+  the worker drives in parallel per `runOnce()` pass.
+- **Per-workspace cap** (`maxConcurrentPerWorkspace`, default `2`) — a
+  single workspace cannot starve siblings. Claims beyond the cap are
+  released back to `queued` with a 1 s backoff and `errorCode =
+  PER_WORKSPACE_CAP` so another pass (or another worker) can pick them
+  up.
+- **Atomic claim contract** — production Drizzle implementations of
+  `claimNextQueuedJob` MUST use `SELECT … FOR UPDATE SKIP LOCKED` (or
+  equivalent) so two workers cannot claim the same row.
+
+### Retry policy
+
+- **Max attempts** (`maxAttempts`, default `3`, including the first).
+- **Retryable failure < maxAttempts** → requeue with `now +
+  retryBackoffSeconds` (default `60 s`), increment `attempts`.
+- **Retryable failure at maxAttempts** → terminal `failed` (dead-
+  lettered).
+- **Non-retryable failure** → terminal `failed` immediately.
+- **`RunnerNotImplementedError`** (no runner registered for the job
+  type) → required jobs go terminal `failed` (`RUNNER_MISSING`); non-
+  required jobs retry-then-dead-letter so a missing best-effort runner
+  doesn't ruin an otherwise-good upload.
+- **Parent object `deleted` / missing** → cancel the job
+  (`OBJECT_NOT_AVAILABLE`, terminal) without touching the aggregate.
+
+### Security invariants
+
+- **No provider config / credential leakage in job payloads**. The
+  planner emits ONLY `{ contentType, byteSize? }`. The job runner
+  resolves the provider via the resolver at run-time using the parent
+  object's recorded `providerId` (NOT the job payload). Tests assert
+  the serialised payload never contains `provider*` / `endpoint` /
+  `region` / `bucket` / `accessKey` / `secretAccess` / `credential` /
+  `providerObjectKey` substrings.
+- **Opaque `errorCode` strings only.** The worker NEVER bubbles up raw
+  runner exception messages — those are caught and replaced with
+  closed-set codes (`RUNNER_THREW`, `RUNNER_MISSING`, `RUNNER_FAILED`,
+  `OBJECT_NOT_AVAILABLE`, `PER_WORKSPACE_CAP`, or whatever the runner
+  returns in `result.errorCode`). Runner implementations are responsible
+  for redacting provider-side details BEFORE returning.
+- **Workspace ownership at every step.** The retry handler enforces
+  workspace ownership on the object lookup AND every queue call. The
+  worker's repo contract requires `claimNextQueuedJob` to return the
+  workspace id so the worker can ALWAYS pass it back on every
+  subsequent call (no cross-workspace state leak through job id alone).
+- **Response shape allowlist.** The retry handler returns ONLY
+  `PublicProcessingJob` + `PublicStorageObject` DTOs — no
+  `providerObjectKey`, `providerId`, `provider_kind`, `endpoint`,
+  `region`, `bucket`, `credential_ref`, `accessKeyId`, or
+  `secretAccessKey` fields appear in the response. Verified by a
+  whole-response `JSON.stringify` regex sweep test.
+
+### Wiring the queue into upload-complete
+
+The STORAGE-5 upload-complete handler now accepts an optional
+`enqueueProcessing: (input) => Promise<readonly unknown[]>` callback on
+`UploadHandlerDependencies`. When set, the complete handler invokes the
+callback AFTER markUploaded and forwards the returned job DTOs to the
+`processingJobs` field of the response. When unset (STORAGE-5 default),
+`processingJobs` is `[]` (the prior behaviour). A thrown callback is
+SWALLOWED — the upload-complete success is not undone. Example:
+
+```ts
+import { createCompleteUploadHandler } from './actions/handlers/uploads/complete';
+import { enqueueProcessingForObject } from './actions/handlers/processing/enqueue';
+import { ProcessingWorker, registerProcessingActionHandlers } from './actions/handlers/processing';
+
+const handler = createCompleteUploadHandler({
+  objects: drizzleObjectRepo,
+  sessions: drizzleSessionRepo,
+  providers: liveProviderResolver,
+  enqueueProcessing: async ({ objectId, workspaceId }) => {
+    const object = await drizzleObjectRepo.findByIdForWorkspace({ objectId, workspaceId });
+    if (!object) return [];
+    const result = await enqueueProcessingForObject(
+      { queue: drizzleQueueRepo, status: drizzleStatusRepo },
+      object,
+    );
+    return result.jobs;
+  },
+});
+
+// Worker boot
+const worker = new ProcessingWorker({
+  queue: drizzleQueueRepo,
+  status: drizzleStatusRepo,
+  findObject: ({ objectId, workspaceId }) =>
+    drizzleObjectRepo.findByIdForWorkspace({ objectId, workspaceId }),
+  runners: {
+    scan_validation: liveScanRunner, // STORAGE-8 or no-op-scanner in local dev
+    image_optimize: liveImageRunner,
+    // ...etc
+  },
+});
+worker.start(1000);
+
+// Retry action handler
+registerProcessingActionHandlers({
+  queue: drizzleQueueRepo,
+  status: drizzleStatusRepo,
+  objects: { findByIdForWorkspace: drizzleObjectRepo.findByIdForWorkspace.bind(drizzleObjectRepo) },
+});
+```
+
+For STORAGE-7 the action registry remains empty in `src/index.ts` — the
+unit tests register handlers against in-memory fakes. The
+`registerProcessingActionHandlers` function is exported so production
+wiring is a one-liner once the Drizzle implementations land.
+
+### Story status
+
+| Story | Status |
+|---|---|
+| STORAGE-1 | ✅ Landed 2026-05-13 |
+| STORAGE-2 | ✅ Landed 2026-05-13 |
+| STORAGE-3 | ✅ Landed 2026-05-13 |
+| STORAGE-4 | ✅ Landed 2026-05-13 |
+| STORAGE-5 | ✅ Landed 2026-05-13 |
+| STORAGE-6 | ✅ Landed 2026-05-14 |
+| STORAGE-7 | ✅ Landed 2026-05-14 |
+| STORAGE-8 | Deferred |
+| STORAGE-9 | Deferred |
+| STORAGE-10 | Deferred |
+| STORAGE-11 | Deferred |
+| STORAGE-12 | Deferred |
