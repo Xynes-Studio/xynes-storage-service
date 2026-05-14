@@ -147,6 +147,7 @@ export function makeJob(input: {
   status?: StorageProcessingJobRecord['status'];
   attempts?: number;
   errorCode?: string | null;
+  required?: boolean;
 }): StorageProcessingJobRecord {
   const now = new Date('2026-05-13T01:30:00.000Z');
   return {
@@ -156,6 +157,7 @@ export function makeJob(input: {
     status: input.status ?? 'queued',
     attempts: input.attempts ?? 0,
     errorCode: input.errorCode ?? null,
+    required: input.required ?? false,
     scheduledAt: now,
     createdAt: now,
     updatedAt: now,

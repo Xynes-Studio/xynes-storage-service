@@ -161,10 +161,28 @@ export function createCompleteUploadHandler(deps: UploadHandlerDependencies) {
       throw new ValidationError('Upload session is in an inconsistent state');
     }
 
+    // STORAGE-7: enqueue async processing jobs. The callback is optional
+    // — when unset (STORAGE-5 default), `processingJobs` stays empty.
+    // Failures inside the callback MUST NOT undo the upload-complete
+    // success — the upload itself is durable at this point.
+    let processingJobs: ReadonlyArray<unknown> = [];
+    if (deps.enqueueProcessing) {
+      try {
+        processingJobs = await deps.enqueueProcessing({
+          objectId: updatedObject.id,
+          workspaceId: ctx.workspaceId,
+        });
+      } catch {
+        // Swallow — the worker scheduler will pick up the unprocessed
+        // object on its next pass.
+        processingJobs = [];
+      }
+    }
+
     return {
       object: toPublicObject(updatedObject),
       session: toPublicSession(updatedSession),
-      processingJobs: [], // STORAGE-7 fills this in.
+      processingJobs,
     };
   };
 }

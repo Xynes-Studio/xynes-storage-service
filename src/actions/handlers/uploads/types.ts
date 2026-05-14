@@ -186,6 +186,25 @@ export interface StorageProviderResolver {
 
 // ── Aggregated dependency type ─────────────────────────────────────────────
 
+/**
+ * STORAGE-7 — opaque enqueue callback wired by the service composition
+ * root after STORAGE-7's queue + status repositories are constructed.
+ *
+ * The complete handler calls this AFTER the session has been atomically
+ * flipped to `completed` and the object row has been flipped to
+ * `uploaded`. The callback returns the list of just-enqueued public
+ * processing-job DTOs (or `[]` when STORAGE-7 is not wired) so the
+ * upload-complete response can surface them to the caller.
+ *
+ * STORAGE-5 tests omit this callback entirely; the complete handler
+ * defaults to returning `processingJobs: []`. This preserves STORAGE-5's
+ * test posture byte-for-byte.
+ */
+export type EnqueueProcessingCallback = (input: {
+  objectId: string;
+  workspaceId: string;
+}) => Promise<ReadonlyArray<unknown>>;
+
 export interface UploadHandlerDependencies {
   readonly objects: StorageObjectRepository;
   readonly sessions: UploadSessionRepository;
@@ -198,4 +217,17 @@ export interface UploadHandlerDependencies {
   readonly sessionTtlSeconds?: number;
   /** Defaults to 100 MB (matches AWS guidance and `ServiceConfig`). */
   readonly multipartThresholdBytes?: number;
+  /**
+   * STORAGE-7 hook. When set, the complete handler calls this after the
+   * object/session state transition lands and forwards the returned
+   * job DTOs to the response. When absent, the complete handler returns
+   * `processingJobs: []` (the STORAGE-5 default).
+   *
+   * The callback MUST be defensive: failures inside it MUST NOT bubble
+   * up and undo the upload-complete success — the worker can be retried
+   * by the scheduled-publisher loop. The complete handler treats a
+   * thrown callback as "no jobs enqueued" and logs nothing the caller
+   * can see (defense-in-depth on top of the logger redaction).
+   */
+  readonly enqueueProcessing?: EnqueueProcessingCallback;
 }

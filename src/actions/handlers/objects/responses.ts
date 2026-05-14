@@ -61,6 +61,7 @@ export interface PublicProcessingJob {
   readonly status: string;
   readonly attempts: number;
   readonly errorCode: string | null;
+  readonly required: boolean;
   readonly scheduledAt: string;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -74,6 +75,7 @@ export function toPublicProcessingJob(row: StorageProcessingJobRecord): PublicPr
     status: row.status,
     attempts: row.attempts,
     errorCode: row.errorCode,
+    required: row.required,
     scheduledAt: row.scheduledAt.toISOString(),
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),

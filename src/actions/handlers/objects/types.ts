@@ -64,6 +64,19 @@ export interface StorageProcessingJobRecord {
   readonly scheduledAt: Date;
   readonly createdAt: Date;
   readonly updatedAt: Date;
+  /**
+   * Added by STORAGE-7. Required jobs (e.g. scan/validation, video probe)
+   * gate the parent object's aggregate status — a terminal failure on a
+   * required job flips the parent to `failed`. Non-required jobs
+   * (best-effort variants — thumbnails, transcodes, document previews)
+   * never block `ready` and never flip the parent to `failed`.
+   *
+   * Production repositories that persist this column MUST default it to
+   * `true` at the DB layer (fail-closed posture) so a non-migrated row
+   * surfaces as required. The TS type is intentionally non-optional so
+   * every caller has to make a deliberate decision per job.
+   */
+  readonly required: boolean;
 }
 
 // ── Usage aggregates (`platform.storage_usage_daily`) ──────────────────────
