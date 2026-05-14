@@ -1,0 +1,35 @@
+# Code owners for xynes-storage-service.
+# Lines later in this file override earlier lines. Last match wins.
+# See: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
+
+# Catch-all — every change defaults to the repo owner.
+*                                @archan96
+
+# High-sensitivity surfaces — keep ownership explicit even if a future
+# catch-all changes. Provider adapter + security middleware land here so a
+# new contributor cannot silently bypass review on credential / signing paths.
+/src/infra/providers/            @archan96
+/src/middleware/                 @archan96
+/src/routes/                     @archan96
+/src/actions/guards.ts           @archan96
+/src/actions/errors.ts           @archan96
+
+# Build, lint, CI, repo policy.
+/.github/                        @archan96
+/.eslintrc.cjs                   @archan96
+/.prettierrc                     @archan96
+/tsconfig.json                   @archan96
+/package.json                    @archan96
+/bun.lock                        @archan96
+/Dockerfile                      @archan96
+
+# Tests are owned by the same owner as the code they cover until we have
+# additional maintainers. Override on a per-folder basis later.
+/tests/                          @archan96
+
+# Docs.
+/README.md                       @archan96
+/DEVELOPER.md                    @archan96
+/CONTRIBUTING.md                 @archan96
+/SECURITY.md                     @archan96
+/docs/                           @archan96
