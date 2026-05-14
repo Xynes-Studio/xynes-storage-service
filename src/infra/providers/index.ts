@@ -1,6 +1,7 @@
 export * from './types';
 export * from './errors';
 export * from './cors-validator';
+export * from './cors-serialiser';
 export {
   S3StorageProviderAdapter,
   createS3StorageProviderAdapter,

@@ -1,23 +1,20 @@
 # Xynes Storage Service — Developer Guide
 
-> **Status: STORAGE-8 (image / video / document processing profiles landed 2026-05-14).**
+> **Status: STORAGE-9 (security, privacy, and abuse controls landed 2026-05-14).**
 > STORAGE-5 (upload session lifecycle) landed 2026-05-13. STORAGE-6
 > (object metadata, signed reads, delete, and usage handlers) landed
 > 2026-05-14. STORAGE-7 (async processing queue + worker contract) landed
-> 2026-05-14. STORAGE-8 adds the runner factories for `scan_validation`,
-> `image_optimize`, `video_probe`, `video_thumbnail`, `video_transcode`,
-> and `document_preview`, plus the named quality profiles
-> (`balanced` / `high_quality` / `storage_saver`), hard policy caps,
-> DI ports for image / video / document processors + malware scanner,
-> and a `createRunnerRegistry(deps)` factory that maps every STORAGE-7
-> `ProcessingJobType` to a real runner — no more "RUNNER_MISSING" in
-> production. Runners are fully DI-driven against `ProviderObjectIO`,
-> `StorageVariantWriter`, `ImageProcessor`, `VideoProcessor`,
-> `DocumentProcessor`, and `MalwareScanner`. Production wiring (sharp /
-> ffmpeg / libreoffice native bindings or remote sidecars + Drizzle
-> variant writer) lands as a follow-up infra story; tests inject
-> in-memory fakes. Storage-service-side log redaction lands in
-> STORAGE-9; Docker compose wiring + MinIO container in STORAGE-12.
+> 2026-05-14. STORAGE-8 (image / video / document processing profiles)
+> landed 2026-05-14. STORAGE-9 adds the storage-service-side log
+> redaction mirror (`src/infra/redaction.ts` wired into
+> `src/infra/logger.ts`), the per-provider CORS serialiser
+> (`src/infra/providers/cors-serialiser.ts` — XML for R2 / B2 / AWS S3 /
+> MinIO / `s3_generic`, JSON for iDrive e2; output re-validated against
+> B2's 100 KB binding constraint), and the abandoned upload session
+> cleanup job (`src/infra/cleanup/abandoned-uploads.ts` — provider
+> `AbortMultipartUpload` with `NoSuchUpload`-style swallow, deterministic
+> `runOnce()` for tests, polling `start()` / `stop()` for prod). Docker
+> compose wiring + MinIO container + live smoke harness in STORAGE-12.
 
 ## TL;DR
 
@@ -207,9 +204,10 @@ predictable pattern (mirrors `xynes-accounts-service` and `xynes-cms-core`).
 
 ### Forbidden fields (storage-service must never write these to logs, responses, or DB columns)
 
-The list below is the canonical set that `xynes-gateway` redaction must
-recognise once storage-service starts emitting requests through it (lands
-with STORAGE-9). All field names match regardless of case or `_`/`-` style.
+The list below is the canonical set the storage-service-side redactor
+(`src/infra/redaction.ts`, landed with STORAGE-9) and the gateway-side
+redaction (Task 5 / Task 6) both recognise. All field names match
+regardless of case or `_`/`-` style.
 
 | Field name family               | Reason                                  |
 | ------------------------------- | --------------------------------------- |
@@ -235,15 +233,31 @@ Storage-service must:
   written to logs**).
 - Never echo these in error envelopes.
 
-### CORS — `[planned — STORAGE-9]`
+### CORS — `[STORAGE-9 — landed 2026-05-14]`
 
 CORS is limited to approved Xynes app origins. Storage-service does **not**
-allow `*` origins for upload or download URLs.
+allow `*` origins for upload or download URLs. The normalised internal
+`CorsConfig` shape (`src/infra/providers/cors-validator.ts`) is serialised
+per provider by `src/infra/providers/cors-serialiser.ts`:
 
-### Upload session expiry — `[planned — STORAGE-5]`
+- XML for R2 / Backblaze B2 / AWS S3 / MinIO / `s3_generic`.
+- JSON for iDrive e2 (per-bucket "Bucket CORS" tab).
+
+Both formats re-validate against B2's binding constraint (≤ 100 KB
+serialised payload, `MaxAgeSeconds ∈ [0, 86400]`, non-empty
+`AllowedOrigin`) so the same input is acceptable on every provider
+without per-caller branching.
+
+### Upload session expiry — `[STORAGE-5 + STORAGE-9 — both landed]`
 
 Upload sessions expire quickly by default (concrete TTL set in STORAGE-5).
-Abandoned multipart uploads are aborted by a cleanup job (STORAGE-9).
+Abandoned multipart uploads are aborted by the
+`AbandonedUploadCleanup` worker
+(`src/infra/cleanup/abandoned-uploads.ts`, STORAGE-9). The worker calls
+provider `AbortMultipartUpload` against the recorded `provider_kind`
+and treats `NoSuchUpload` / `ProviderAdapterError` as success (provider
+already cleaned up). Non-adapter errors defer the session for next
+cycle so a transient infra failure does not strand the local row.
 
 ## Provider Adapter (STORAGE-4)
 
@@ -797,6 +811,115 @@ The `createRunnerRegistry` factory is exported so production wiring
 is a one-liner once sharp / ffmpeg / libreoffice bindings (or remote
 sidecars) plus the Drizzle variant writer land.
 
+## Security, Privacy, and Abuse Controls (STORAGE-9)
+
+STORAGE-9 lands three storage-service-side defense-in-depth modules
+that the gateway-level Task 5 telemetry redaction + Task 6 snippet
+redaction already cover, plus the per-provider CORS push contract and
+the abandoned-upload cleanup job:
+
+### Storage-side log redaction (`src/infra/redaction.ts`)
+
+Mirrors the gateway's three-tier field-name strategy and extends it
+to cover SigV4 presigned URL signature parameters + storage provider
+credential surfaces. Every `logger.info` / `.warn` / `.error` /
+`.debug` call routes through this module before the JSON line is
+emitted, so a handler that mistakenly passes a `secretAccessKey` /
+`credentialRef` / `r2Token` / raw `xynes_live_<hex>` API key as a
+log field gets the value replaced with `[REDACTED]` automatically.
+
+Field-name match tiers:
+- **Loose substring** — `authorization`, `cookie`, `set-cookie`,
+  `password`, `token`, `secret`, `x-internal-service-token`,
+  `x-amz-signature`, `x-amz-credential`, `x-amz-security-token`,
+  `x-amz-date`, `x-amz-expires`, `x-amz-signedheaders`.
+- **Anchored exact** — `apiKey`, `api_key`, `api-key`, `x-xs-api-key`,
+  `rawKey`, `raw_key`, `keyHash`, `key_hash`, `accessKeyId`,
+  `access_key_id`, `secretAccessKey`, `secret_access_key`,
+  `credentialRef`, `credential_ref`, `r2Token`, `r2_token`.
+- **Compound `apikey` substring** — covers `x-api-key`,
+  `workspaceApiKey`, etc., safelisted by the `Id` / `Prefix` suffix
+  so public audit handles (`apiKeyId`, `keyPrefix`) stay readable.
+
+Free-text scrubbing (applied to every string field + log message):
+`Bearer <token>`, quoted authorization / cookie / x-xs-api-key /
+x-amz-signature headers, raw `xynes_live_<hex>` API keys, Argon2
+hashes (`$argon2id$...`), and SigV4 presigned URL signature query
+parameters (`X-Amz-Signature=...`, `X-Amz-Credential=...`,
+`X-Amz-Security-Token=...`, `X-Amz-Date=...`, `X-Amz-Expires=...`,
+`X-Amz-SignedHeaders=...`).
+
+The redactor preserves storage-specific audit handles that operators
+need: `objectId`, `workspaceId`, `requestId`, `actionKey`,
+`actorType`, `routeId`, `providerId` (UUID), `providerKind`,
+`uploadId`, `sessionId`, `jobId`, `variantId`, `role`, `status`,
+`filename`, `contentType`, `byteSize`.
+
+### Per-provider CORS serialiser (`src/infra/providers/cors-serialiser.ts`)
+
+Accepts the normalised internal `CorsConfig` from
+`cors-validator.ts` and emits the wire format each provider expects:
+
+- **R2 / Backblaze B2 / AWS S3 / MinIO / `s3_generic`**: AWS S3 CORS
+  XML (`<CORSConfiguration>...<CORSRule>...`).
+- **iDrive e2**: JSON matching the per-bucket "Bucket CORS" tab in
+  the e2 console — `{ "CORSRules": [{ "AllowedOrigins": [...],
+  "AllowedMethods": [...], ... }] }`.
+
+The serialiser runs shape validation BEFORE serialisation, then
+re-validates the byte length AGAINST B2's binding constraint (100 KB
+payload cap) so the same input is acceptable on every provider
+without per-caller branching. XML output escapes reserved chars (`<`,
+`>`, `&`, `"`, `'`) in origins and headers. The output NEVER carries
+provider credentials (it can't — the function takes a normalised
+`CorsConfig` only — but a regression test guards that invariant).
+
+`wireFormatForProvider(providerKind)` returns `'json'` for
+`idrive_e2` and `'xml'` for everything else.
+
+### Abandoned upload cleanup (`src/infra/cleanup/abandoned-uploads.ts`)
+
+`AbandonedUploadCleanup` is the storage-service equivalent of
+STORAGE-7's `ProcessingWorker` — a DI-driven background worker with
+a deterministic `runOnce()` for tests and a `start(intervalMs)` /
+`stop()` polling loop for production. Each pass:
+
+1. `listExpiredPending({ now, limit })` against the cleanup-specific
+   repository contract (`AbandonedUploadSessionRepository`).
+2. For each pending session past its `expires_at`:
+   - If multipart with a `providerUploadId`: resolve the provider for
+     the session's OWN workspace (cross-workspace isolation
+     guaranteed by per-session resolution), call
+     `abortMultipartUpload`. **`ProviderAdapterError` is SWALLOWED`
+     (`NoSuchUpload` / already-aborted multiparts are treated as
+     success — same posture as the per-request abort path in
+     `abort.ts`). **Non-adapter errors DEFER the session** — the
+     local row stays `pending` and we retry next cycle.
+   - Mark the session `expired` via
+     `markExpiredIfPending({ sessionId, workspaceId, now })`. A
+     conditional-update miss (raced to `completed` / `aborted` /
+     `expired`) is logged and counted as `raced`, not an error.
+3. Return `{ scanned, expired, deferred, raced }` so callers can
+   observe progress without trusting log scraping.
+
+Polling loop swallows `runOnce` errors so a transient DB or provider
+outage does NOT kill the cleanup process. The composition root
+(`src/index.ts` follow-up) wires the cleanup against the Drizzle
+session repo + the production provider resolver:
+
+```ts
+const cleanup = new AbandonedUploadCleanup({
+  sessions: drizzleAbandonedSessionsRepo,
+  objects: drizzleObjectRepo,
+  providers: postgresWorkspaceStorageProviderResolver,
+});
+cleanup.start(); // default 60 s interval
+```
+
+For STORAGE-9 the action registry remains empty in `src/index.ts` —
+production wiring lands with the follow-up infra story that ships
+the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
+
 ### Story status
 
 | Story | Status |
@@ -809,7 +932,7 @@ sidecars) plus the Drizzle variant writer land.
 | STORAGE-6 | ✅ Landed 2026-05-14 |
 | STORAGE-7 | ✅ Landed 2026-05-14 |
 | STORAGE-8 | ✅ Landed 2026-05-14 |
-| STORAGE-9 | Deferred |
+| STORAGE-9 | ✅ Landed 2026-05-14 |
 | STORAGE-10 | Deferred |
 | STORAGE-11 | Deferred |
 | STORAGE-12 | Deferred |
