@@ -543,3 +543,178 @@ describe('S3StorageProviderAdapter — error redaction (defense-in-depth)', () =
     }
   });
 });
+
+// ── STORAGE-FU-5 server-side I/O methods ──────────────────────────────────
+
+describe('S3StorageProviderAdapter — STORAGE-FU-5 getObjectBytes', () => {
+  test('issues a GetObjectCommand against the bucket + key', async () => {
+    const sample = new Uint8Array([1, 2, 3, 4]);
+    const { adapter, sentCommands } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        Body: {
+          transformToByteArray: async () => sample,
+        },
+      },
+    });
+    const bytes = await adapter.getObjectBytes({ objectKey: 'a.bin' });
+    expect(bytes).toEqual(sample);
+    expect(sentCommands[0]?.name).toBe('GetObjectCommand');
+    expect(sentCommands[0]?.input).toMatchObject({
+      Bucket: 'xynes-r2-test',
+      Key: 'a.bin',
+    });
+  });
+
+  test('falls back to arrayBuffer() when transformToByteArray is unavailable', async () => {
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        Body: {
+          arrayBuffer: async () => new Uint8Array([9, 9]).buffer,
+        },
+      },
+    });
+    const bytes = await adapter.getObjectBytes({ objectKey: 'a.bin' });
+    expect(bytes).toEqual(new Uint8Array([9, 9]));
+  });
+
+  test('returns empty Uint8Array when Body is null', async () => {
+    const { adapter } = makeAdapter(R2_CONFIG, { sendResult: { Body: null } });
+    const bytes = await adapter.getObjectBytes({ objectKey: 'a.bin' });
+    expect(bytes.byteLength).toBe(0);
+  });
+
+  test('throws PROVIDER_OPERATION_FAILED with redacted message on unsupported body shape', async () => {
+    const { adapter } = makeAdapter(R2_CONFIG, { sendResult: { Body: {} } });
+    try {
+      await adapter.getObjectBytes({ objectKey: 'a.bin' });
+      throw new Error('expected adapter to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProviderAdapterError);
+      expect((err as ProviderAdapterError).code).toBe('PROVIDER_OPERATION_FAILED');
+    }
+  });
+
+  test('rejects invalid object keys (leading slash) BEFORE issuing a command', async () => {
+    const { adapter, sentCommands } = makeAdapter(R2_CONFIG);
+    await expect(adapter.getObjectBytes({ objectKey: '/leading-slash' })).rejects.toThrow(
+      ProviderAdapterError,
+    );
+    expect(sentCommands.length).toBe(0);
+  });
+
+  test('s3 send() failure does NOT leak access key in error message', async () => {
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendError: Object.assign(new Error('credentials AKIA-LEAK-9999 expired'), {
+        name: 'InvalidAccessKeyId',
+      }),
+    });
+    try {
+      await adapter.getObjectBytes({ objectKey: 'a.bin' });
+      throw new Error('expected adapter to throw');
+    } catch (err) {
+      expect((err as Error).message).not.toContain('AKIA-LEAK-9999');
+    }
+  });
+});
+
+describe('S3StorageProviderAdapter — STORAGE-FU-5 putObjectBytes', () => {
+  test('issues a PutObjectCommand with expected Bucket / Key / ContentType / ContentLength', async () => {
+    const body = new Uint8Array([10, 20, 30]);
+    const { adapter, sentCommands } = makeAdapter(R2_CONFIG);
+    const r = await adapter.putObjectBytes({
+      objectKey: 'variants/preview.jpg',
+      body,
+      contentType: 'image/jpeg',
+    });
+    expect(r.byteSize).toBe(3);
+    expect(sentCommands[0]?.name).toBe('PutObjectCommand');
+    expect(sentCommands[0]?.input).toMatchObject({
+      Bucket: 'xynes-r2-test',
+      Key: 'variants/preview.jpg',
+      ContentType: 'image/jpeg',
+      ContentLength: 3,
+    });
+  });
+
+  test('forwards ifAbsent=true as If-None-Match: * (S3 conditional write)', async () => {
+    const body = new Uint8Array([1]);
+    const { adapter, sentCommands } = makeAdapter(R2_CONFIG);
+    await adapter.putObjectBytes({
+      objectKey: 'variants/preview.jpg',
+      body,
+      contentType: 'image/jpeg',
+      ifAbsent: true,
+    });
+    expect((sentCommands[0]?.input as Record<string, unknown>).IfNoneMatch).toBe('*');
+  });
+
+  test('omits IfNoneMatch when ifAbsent is unset (default behaviour)', async () => {
+    const body = new Uint8Array([1]);
+    const { adapter, sentCommands } = makeAdapter(R2_CONFIG);
+    await adapter.putObjectBytes({
+      objectKey: 'variants/preview.jpg',
+      body,
+      contentType: 'image/jpeg',
+    });
+    expect((sentCommands[0]?.input as Record<string, unknown>).IfNoneMatch).toBeUndefined();
+  });
+
+  test('NEVER sets Tagging — STORAGE-4 portability invariant', async () => {
+    const body = new Uint8Array([1]);
+    const { adapter, sentCommands } = makeAdapter(R2_CONFIG);
+    await adapter.putObjectBytes({
+      objectKey: 'variants/preview.jpg',
+      body,
+      contentType: 'image/jpeg',
+      ifAbsent: true,
+    });
+    expect((sentCommands[0]?.input as Record<string, unknown>).Tagging).toBeUndefined();
+  });
+
+  test('rejects non-Uint8Array body with PROVIDER_CONFIG_INVALID', async () => {
+    const { adapter, sentCommands } = makeAdapter(R2_CONFIG);
+    await expect(
+      adapter.putObjectBytes({
+        objectKey: 'a.bin',
+        // Force-cast a Buffer-like into Uint8Array — Bun/Node may treat
+        // Buffer as Uint8Array, so use a plain ArrayBuffer to force the
+        // rejection.
+        body: new ArrayBuffer(8) as unknown as Uint8Array,
+        contentType: 'application/octet-stream',
+      }),
+    ).rejects.toThrow(ProviderAdapterError);
+    expect(sentCommands.length).toBe(0);
+  });
+
+  test('rejects invalid object keys BEFORE issuing a command', async () => {
+    const body = new Uint8Array([1]);
+    const { adapter, sentCommands } = makeAdapter(R2_CONFIG);
+    await expect(
+      adapter.putObjectBytes({
+        objectKey: '/leading-slash',
+        body,
+        contentType: 'image/jpeg',
+      }),
+    ).rejects.toThrow(ProviderAdapterError);
+    expect(sentCommands.length).toBe(0);
+  });
+
+  test('s3 send() failure does NOT leak secret key in error message', async () => {
+    const body = new Uint8Array([1]);
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendError: Object.assign(new Error('signature mismatch v3rys3cretValueWasHere-LEAKED'), {
+        name: 'SignatureDoesNotMatch',
+      }),
+    });
+    try {
+      await adapter.putObjectBytes({
+        objectKey: 'a.bin',
+        body,
+        contentType: 'application/octet-stream',
+      });
+      throw new Error('expected adapter to throw');
+    } catch (err) {
+      expect((err as Error).message).not.toContain('v3rys3cretValueWasHere-LEAKED');
+    }
+  });
+});

@@ -53,7 +53,11 @@ export function createScanValidationRunner(deps: ScanValidationRunnerDependencie
       // 2) Pull bytes for the scanner. Provider failures are retryable.
       let bytes: Uint8Array;
       try {
-        bytes = await deps.providerIO.readObject({ objectKey: object.providerObjectKey });
+        bytes = await deps.providerIO.readObject({
+          objectKey: object.providerObjectKey,
+          workspaceId: object.workspaceId,
+          providerId: object.providerId,
+        });
       } catch {
         throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });
       }

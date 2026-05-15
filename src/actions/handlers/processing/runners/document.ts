@@ -44,7 +44,11 @@ export function createDocumentPreviewRunner(deps: DocumentPreviewRunnerDependenc
 
       let bytes: Uint8Array;
       try {
-        bytes = await deps.providerIO.readObject({ objectKey: object.providerObjectKey });
+        bytes = await deps.providerIO.readObject({
+          objectKey: object.providerObjectKey,
+          workspaceId: object.workspaceId,
+          providerId: object.providerId,
+        });
       } catch {
         throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });
       }
@@ -72,6 +76,8 @@ export function createDocumentPreviewRunner(deps: DocumentPreviewRunnerDependenc
           body: render.bytes,
           contentType: render.contentType,
           ifAbsent: true,
+          workspaceId: object.workspaceId,
+          providerId: object.providerId,
         });
       } catch {
         throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });

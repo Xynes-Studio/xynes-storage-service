@@ -40,12 +40,15 @@ import {
   type CreateSingleUploadUrlOptions,
   type DeleteObjectOptions,
   type DownloadUrl,
+  type GetObjectBytesOptions,
   type HeadObjectOptions,
   type HeadObjectResult,
   type MultipartPartUrl,
   type MultipartUploadHandle,
   type ProviderAdapterConfig,
   type ProviderKind,
+  type PutObjectBytesOptions,
+  type PutObjectBytesResult,
   type SignMultipartPartOptions,
   type SingleUploadUrl,
   type StorageProviderAdapter,
@@ -401,6 +404,49 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
     });
     await runWithRedactedError(() => this.client.send(command));
   }
+
+  // ── STORAGE-FU-5: server-side I/O for processing runners ─────────────────
+
+  async getObjectBytes(opts: GetObjectBytesOptions): Promise<Uint8Array> {
+    validateObjectKey(opts.objectKey);
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: opts.objectKey,
+    });
+    const response = await runWithRedactedError(() => this.client.send(command));
+    return readSdkStreamAsBytes(response.Body);
+  }
+
+  async putObjectBytes(opts: PutObjectBytesOptions): Promise<PutObjectBytesResult> {
+    validateObjectKey(opts.objectKey);
+    if (!(opts.body instanceof Uint8Array)) {
+      throw new ProviderAdapterError(
+        'PROVIDER_CONFIG_INVALID',
+        'putObjectBytes body must be a Uint8Array',
+      );
+    }
+    const commandInput: ConstructorParameters<typeof PutObjectCommand>[0] = {
+      Bucket: this.bucket,
+      Key: opts.objectKey,
+      Body: opts.body,
+      ContentType: opts.contentType,
+      ContentLength: opts.body.byteLength,
+      // Storage class is applied where supported; providers that don't
+      // support tiering silently drop it.
+      StorageClass: this.storageClass as never,
+      // STORAGE-4 invariant: NEVER set `Tagging` here. R2 accepts it
+      // but B2 rejects it, so we keep the adapter portable.
+    };
+    if (opts.ifAbsent === true) {
+      // S3 v4 conditional write — providers that honour `If-None-Match: *`
+      // refuse if the object already exists. Defense in depth on top of
+      // the runner's `deriveVariantObjectKey` non-collision check.
+      (commandInput as unknown as Record<string, unknown>).IfNoneMatch = '*';
+    }
+    const command = new PutObjectCommand(commandInput);
+    await runWithRedactedError(() => this.client.send(command));
+    return { byteSize: opts.body.byteLength };
+  }
 }
 
 /**
@@ -412,4 +458,28 @@ export function createS3StorageProviderAdapter(
   deps?: S3StorageProviderAdapterDeps,
 ): S3StorageProviderAdapter {
   return new S3StorageProviderAdapter(config, deps);
+}
+
+/**
+ * Convert an AWS SDK v3 response Body into a `Uint8Array`. The SDK
+ * uses `transformToByteArray` in modern releases; older releases
+ * return a Web `ReadableStream` or a Node `Readable`. We collect
+ * whichever variant we get without depending on Node-specific APIs.
+ */
+async function readSdkStreamAsBytes(body: unknown): Promise<Uint8Array> {
+  if (body == null) return new Uint8Array();
+  const candidate = body as {
+    transformToByteArray?: () => Promise<Uint8Array>;
+    arrayBuffer?: () => Promise<ArrayBuffer>;
+  };
+  if (typeof candidate.transformToByteArray === 'function') {
+    return candidate.transformToByteArray();
+  }
+  if (typeof candidate.arrayBuffer === 'function') {
+    return new Uint8Array(await candidate.arrayBuffer());
+  }
+  throw new ProviderAdapterError(
+    'PROVIDER_OPERATION_FAILED',
+    'Storage provider returned an unsupported response body shape',
+  );
 }

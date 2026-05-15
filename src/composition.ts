@@ -26,14 +26,15 @@
  *      wiring.
  *
  * Non-responsibilities (deliberately deferred):
- *   - STORAGE-FU-5: production runners (sharp / ffmpeg / libreoffice /
- *     clamav). This composition root wires `runners: {}` — every job
- *     type that lacks a runner surfaces as `RUNNER_MISSING` (closed-set
- *     code from STORAGE-7) so the worker's retry-then-dead-letter logic
- *     handles it cleanly. Non-required jobs (variants) dead-letter
- *     without flipping the parent to `failed`; required jobs (scan,
- *     video probe) eventually flip the parent — exactly the contract
- *     STORAGE-7 promised for "no runner registered yet".
+ *   - STORAGE-FU-5 PRODUCTION ADAPTERS: the composition wires the
+ *     STORAGE-FU-5 runner registry (provider IO + variant writer +
+ *     stub-mode processors by default). The PRODUCTION sharp / ffmpeg
+ *     / libreoffice / clamav adapters are deliberate follow-up infra
+ *     stories — until they land, `STORAGE_PROCESSOR_MODE=live`
+ *     selects the safe-fail `Production*ProcessorStub`s which throw
+ *     `UNSUPPORTED_FORMAT` per the STORAGE-7 closed-set runner error
+ *     code, so misconfigured production sees deterministic failures.
+ *     Tests can still pass `options.runners` to override the registry.
  *   - STORAGE-FU-6: worker `start()` invocations + graceful shutdown.
  *
  * Composition root MUST fail fast on startup if `DATABASE_URL` is unset
@@ -74,6 +75,13 @@ import {
   STORAGE_CLEANUP_DEFAULT_POLL_INTERVAL_MS,
 } from './infra/cleanup/abandoned-uploads';
 import { EnvSecretManagerClient, type SecretManagerClient } from './infra/providers/secret-manager';
+import {
+  createRunnerDependencies,
+  createS3ProviderObjectIO,
+  PostgresStorageVariantWriter,
+  resolveProcessorMode,
+  type ProcessorMode,
+} from './infra/processors';
 import { toPublicProcessingJob } from './actions/handlers/objects/responses';
 import { logger } from './infra/logger';
 import type { JobRunner, ProcessingJobType } from './actions/handlers/processing';
@@ -113,10 +121,13 @@ export interface BuildCompositionOptions {
    */
   readonly secrets?: SecretManagerClient;
   /**
-   * Optional runner registry override (STORAGE-FU-5). When omitted, the
-   * worker runs with `runners: {}` — every job type lacking a runner
-   * dead-letters with `RUNNER_MISSING` per STORAGE-7 §"Job runner
-   * contract".
+   * Optional runner registry override (STORAGE-FU-5 test seam). When
+   * omitted, the composition wires `createRunnerDependencies` against
+   * a `createS3ProviderObjectIO` + `PostgresStorageVariantWriter` +
+   * mode-selected stub/production processors. When supplied (tests +
+   * STORAGE-FU-4 baseline tests that exercise pre-STORAGE-FU-5
+   * posture), the override is honoured byte-for-byte and STORAGE-FU-5
+   * wiring is skipped.
    */
   readonly runners?: Readonly<Partial<Record<ProcessingJobType, JobRunner>>>;
   /**
@@ -214,6 +225,30 @@ export function buildComposition(options: BuildCompositionOptions = {}): Composi
     objects: extendedObjectRepo,
   });
 
+  // STORAGE-FU-5: build the production runner registry. The processor
+  // mode (`stub` vs `live`) is resolved from `STORAGE_PROCESSOR_MODE`
+  // env (default `stub` outside production, `live` inside). When the
+  // caller supplies an explicit `runners` override (tests, STORAGE-FU-4
+  // baseline posture) we honour it and skip the production wiring.
+  let resolvedRunners = options.runners;
+  let processorMode: ProcessorMode | 'override' = 'override';
+  if (!resolvedRunners) {
+    const providerIO = createS3ProviderObjectIO({ providers: providerResolver });
+    const variantWriter = new PostgresStorageVariantWriter({ db: db.db });
+    const runnerDeps = createRunnerDependencies({
+      providerIO,
+      variants: variantWriter,
+      env,
+    });
+    resolvedRunners = runnerDeps.registry;
+    processorMode = runnerDeps.mode;
+  } else if (env.STORAGE_PROCESSOR_MODE !== undefined) {
+    // Diagnostic: even when an override is supplied, surface the
+    // resolved mode the env would have chosen — useful for the
+    // ready-event log.
+    processorMode = resolveProcessorMode(env);
+  }
+
   // STORAGE-FU-6 will call `worker.start()` / `cleanup.start()`. We
   // construct them here so the composition graph is complete and the
   // ready-event log accurately reflects what the service is wired to do.
@@ -221,7 +256,7 @@ export function buildComposition(options: BuildCompositionOptions = {}): Composi
     queue: queueRepo,
     status: objectStatusRepo,
     findObject: (input) => extendedObjectRepo.findByIdForWorkspace(input),
-    runners: options.runners ?? {},
+    runners: resolvedRunners,
   });
 
   const cleanup = new AbandonedUploadCleanup({
@@ -232,11 +267,12 @@ export function buildComposition(options: BuildCompositionOptions = {}): Composi
 
   // STORAGE-9 invariant: the ready entry deliberately stays narrow — no
   // provider config, no `DATABASE_URL`, no `credentialRef`, no log of
-  // env values. The action-key list is the only payload.
+  // env values. The action-key list + processor mode are the only payload.
   logger.info('storage.service.ready', {
     event: 'storage.service.ready',
     actionKeys: REGISTERED_ACTION_KEYS,
     cleanupPollIntervalMs: STORAGE_CLEANUP_DEFAULT_POLL_INTERVAL_MS,
+    processorMode,
   });
 
   return {
