@@ -82,6 +82,18 @@ describe('parseSecretRef', () => {
     expect(() => parseSecretRef('secret://a:b')).toThrow(SecretManagerError);
   });
 
+  test('rejects underscores in the path (PR-11 Codex P2: keeps env mapping injective)', () => {
+    // `_` is deliberately forbidden so it cannot collide with the
+    // `secretPathToEnvPrefix` encoding (where `/` → `__` and `-` → `_`).
+    expect(() => parseSecretRef('secret://a_b')).toThrow(SecretManagerError);
+    expect(() => parseSecretRef('secret://storage/r2_dev')).toThrow(SecretManagerError);
+    try {
+      parseSecretRef('secret://a_b');
+    } catch (err) {
+      expect((err as SecretManagerError).code).toBe('URI_INVALID');
+    }
+  });
+
   test('every URI_INVALID error carries the URI_INVALID code', () => {
     try {
       parseSecretRef('http://no');
@@ -102,10 +114,18 @@ describe('parseSecretRef', () => {
 });
 
 describe('secretPathToEnvPrefix', () => {
-  test('uppercases and converts / + - to _', () => {
-    expect(secretPathToEnvPrefix('storage/r2/dev')).toBe('STORAGE_CREDENTIAL_STORAGE_R2_DEV');
+  test('encodes / as double underscore and - as single underscore (injective mapping)', () => {
+    // PR-11 Codex P2: distinct credential refs MUST NOT collide.
+    expect(secretPathToEnvPrefix('storage/r2/dev')).toBe('STORAGE_CREDENTIAL_STORAGE__R2__DEV');
+    expect(secretPathToEnvPrefix('storage/r2-dev')).toBe('STORAGE_CREDENTIAL_STORAGE__R2_DEV');
     expect(secretPathToEnvPrefix('a-b-c')).toBe('STORAGE_CREDENTIAL_A_B_C');
     expect(secretPathToEnvPrefix('r2')).toBe('STORAGE_CREDENTIAL_R2');
+  });
+
+  test('PR-11 Codex P2 collision regression: storage/r2/dev and storage/r2-dev produce DIFFERENT prefixes', () => {
+    const segmentNested = secretPathToEnvPrefix('storage/r2/dev');
+    const hyphenated = secretPathToEnvPrefix('storage/r2-dev');
+    expect(segmentNested).not.toBe(hyphenated);
   });
 
   test('produces deterministic output (pure function)', () => {

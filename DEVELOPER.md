@@ -1268,7 +1268,8 @@ every handler factory.
   `BACKEND_UNAVAILABLE`, `MATERIAL_INVALID`, `URI_INVALID`),
   `parseSecretRef` (strict `secret://<path>` URI parser),
   `secretPathToEnvPrefix` (pure `secret://storage/r2/dev` →
-  `STORAGE_CREDENTIAL_STORAGE_R2_DEV` mapping), and the local-dev
+  `STORAGE_CREDENTIAL_STORAGE__R2__DEV` injective mapping — see
+  "Secret-manager interface" below), and the local-dev
   `EnvSecretManagerClient`.
 - `src/infra/db/repositories/provider-resolver.ts` —
   `PostgresExtendedStorageProviderResolver` and its DI types.
@@ -1299,17 +1300,28 @@ implementation maps the URI to a secret-manager backend.
 Local-dev (`EnvSecretManagerClient`):
 
 ```
-secret://storage/r2/dev
-  → STORAGE_CREDENTIAL_STORAGE_R2_DEV_ACCESS_KEY_ID
-  → STORAGE_CREDENTIAL_STORAGE_R2_DEV_SECRET_ACCESS_KEY
+secret://storage/r2/dev   →  STORAGE_CREDENTIAL_STORAGE__R2__DEV_ACCESS_KEY_ID
+                              STORAGE_CREDENTIAL_STORAGE__R2__DEV_SECRET_ACCESS_KEY
+secret://storage/r2-dev   →  STORAGE_CREDENTIAL_STORAGE__R2_DEV_ACCESS_KEY_ID
+                              STORAGE_CREDENTIAL_STORAGE__R2_DEV_SECRET_ACCESS_KEY
 ```
+
+The encoding is **injective by construction** so two distinct
+`credential_ref` values can never collapse to the same env block (PR-11
+Codex P2 review):
+
+- `/` (path segment separator) → `__` (double underscore)
+- `-` (within-segment hyphen)  → `_`  (single underscore)
+- `_` is NOT a legal path character — `parseSecretRef` rejects it so
+  no third producer of `_` exists in the output.
 
 Strict URI rules (defense-in-depth — DB constraints already require
 non-blank, but `parseSecretRef` rejects every malformed input BEFORE
 the backend is contacted):
 
 - Must start with `secret://`. No `http://`, `https://`, `file://`, `ftp://`.
-- Path 1..256 chars, lowercase letters / digits / `-` / `_` / `/`.
+- Path 1..256 chars, lowercase letters / digits / `-` / `/` only.
+- Underscores are rejected (keeps the env-prefix mapping injective).
 - No leading `/`, no `..`, no query, no fragment.
 
 Hosted environments wire a different `SecretManagerClient` (AWS Secrets

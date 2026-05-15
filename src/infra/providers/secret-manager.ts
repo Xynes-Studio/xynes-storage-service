@@ -99,7 +99,14 @@ export interface SecretManagerClient {
  *   - Must start with the literal `secret://`.
  *   - Path after the prefix MUST be non-empty.
  *   - No URL query string, no fragment, no `..`, no leading slash.
- *   - Allowed chars: lowercase letters, digits, `-`, `_`, `/`.
+ *   - Allowed chars: lowercase letters, digits, `-`, `/`.
+ *     Underscores are DELIBERATELY forbidden so the
+ *     `secretPathToEnvPrefix` mapping below stays injective — `/` maps
+ *     to a double underscore and `-` maps to a single underscore. If
+ *     `_` were a legal path char, `r2_dev` (path) and `r2-dev` (path)
+ *     would collapse to the same env prefix and route a hostile caller
+ *     to the wrong credential block. See the PR-11 Codex P2 review for
+ *     the original collision report.
  *   - Path length 1..256 chars.
  */
 export function parseSecretRef(credentialRef: string): string {
@@ -136,7 +143,7 @@ export function parseSecretRef(credentialRef: string): string {
       'credential_ref must not contain query or fragment components',
     );
   }
-  if (!/^[a-z0-9_/-]+$/.test(path)) {
+  if (!/^[a-z0-9/-]+$/.test(path)) {
     throw new SecretManagerError(
       'URI_INVALID',
       'credential_ref path contains forbidden characters',
@@ -146,15 +153,31 @@ export function parseSecretRef(credentialRef: string): string {
 }
 
 /**
- * Maps a `secret://` path to an env-var prefix:
- *   `secret://storage/r2/dev`  →  `STORAGE_CREDENTIAL_STORAGE_R2_DEV`
+ * Maps a `secret://` path to an env-var prefix using an INJECTIVE
+ * encoding so two distinct credential refs can NEVER collide on the
+ * same env block:
  *
- * Slashes and dashes become underscores; case is uppercased.
+ *   `secret://storage/r2/dev`   →  `STORAGE_CREDENTIAL_STORAGE__R2__DEV`
+ *   `secret://storage/r2-dev`   →  `STORAGE_CREDENTIAL_STORAGE__R2_DEV`
+ *   `secret://r2`               →  `STORAGE_CREDENTIAL_R2`
+ *
+ * Encoding rules:
+ *   - `/` (path segment separator) → `__` (double underscore)
+ *   - `-` (within-segment hyphen)  → `_`  (single underscore)
+ *   - `_` is NOT a legal path char (rejected by `parseSecretRef`), so
+ *     no third producer of `_` exists in the output. The mapping is
+ *     therefore injective by construction.
+ *
+ * The PR-11 Codex P2 review flagged a previous version that mapped
+ * BOTH `/` and `-` to a single `_`, allowing
+ * `secret://storage/r2-dev` and `secret://storage/r2/dev` to collapse
+ * to the same env var and silently route operations to unintended
+ * accounts.
  *
  * Pure function so tests can assert the mapping without touching env.
  */
 export function secretPathToEnvPrefix(path: string): string {
-  const sanitised = path.replace(/[/-]/g, '_').toUpperCase();
+  const sanitised = path.replace(/\//g, '__').replace(/-/g, '_').toUpperCase();
   return `STORAGE_CREDENTIAL_${sanitised}`;
 }
 

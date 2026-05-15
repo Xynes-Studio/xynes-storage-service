@@ -227,12 +227,13 @@ describeIf('PostgresExtendedStorageProviderResolver (integration)', () => {
     if (!ctx.current) return;
     const fixture = await seedWorkspaceFixture(ctx.current.db);
     try {
-      // Seed fixture uses `secret://storage-fu2/r2` so the env-prefix is
-      // `STORAGE_CREDENTIAL_STORAGE_FU2_R2_*`.
+      // Seed fixture uses `secret://storage-fu2/r2`. Under the
+      // injective encoding (`/` → `__`, `-` → `_`) this maps to the
+      // env prefix `STORAGE_CREDENTIAL_STORAGE_FU2__R2_*`.
       const envClient = new EnvSecretManagerClient({
         env: {
-          STORAGE_CREDENTIAL_STORAGE_FU2_R2_ACCESS_KEY_ID: 'AKIA-FIXTURE-INTEGRATION',
-          STORAGE_CREDENTIAL_STORAGE_FU2_R2_SECRET_ACCESS_KEY: 'fixture-secret-integration',
+          STORAGE_CREDENTIAL_STORAGE_FU2__R2_ACCESS_KEY_ID: 'AKIA-FIXTURE-INTEGRATION',
+          STORAGE_CREDENTIAL_STORAGE_FU2__R2_SECRET_ACCESS_KEY: 'fixture-secret-integration',
         },
       });
       const captures: ProviderAdapterConfig[] = [];
