@@ -15,8 +15,8 @@
  *   - STORAGE-9 — `AbandonedUploadSessionRepository`
  *
  * Provider resolver (`StorageProviderResolver` /
- * `ExtendedStorageProviderResolver`) is OUT OF SCOPE for STORAGE-FU-2;
- * it lands in STORAGE-FU-3 alongside the secret-manager interface.
+ * `ExtendedStorageProviderResolver`) lands in STORAGE-FU-3 alongside
+ * the secret-manager interface.
  */
 export {
   PostgresStorageObjectRepository,
@@ -41,3 +41,7 @@ export {
   mapUsageRow,
   type UsageRowWithProviderKind,
 } from './mappers';
+export {
+  PostgresExtendedStorageProviderResolver,
+  type PostgresExtendedStorageProviderResolverDeps,
+} from './provider-resolver';

@@ -943,6 +943,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-12 | ✅ Landed 2026-05-14 |
 | STORAGE-FU-1 | ✅ Landed 2026-05-15 (Drizzle schema mirror + DB client + drift check) |
 | STORAGE-FU-2 | ✅ Landed 2026-05-15 (Postgres repositories) |
+| STORAGE-FU-3 | ✅ Landed 2026-05-15 (Provider resolver + secret-manager interface) |
 
 ## Drizzle Schema Mirror (STORAGE-FU-1)
 
@@ -1235,9 +1236,6 @@ clean up every storage row tree on teardown.
 
 ### Out of scope (deferred to later STORAGE-FU-N stories)
 
-- **`StorageProviderResolver` / `ExtendedStorageProviderResolver` Postgres
-  implementations.** That's STORAGE-FU-3 (provider resolver + secret
-  manager interface). STORAGE-FU-2 ships only repository implementations.
 - **Composition root wiring.** That's STORAGE-FU-4. STORAGE-FU-2 ships
   the implementations; the wiring of `registerUploadActionHandlers` /
   `registerObjectActionHandlers` / `ProcessingWorker.start()` /
@@ -1251,3 +1249,153 @@ clean up every storage row tree on teardown.
 - **Adding a `required boolean` column on `storage_processing_jobs`.**
   Today the repo derives `required` from `jobKind`. Adding the column
   removes the lookup table.
+
+## Provider Resolver + Secret Manager (STORAGE-FU-3)
+
+STORAGE-FU-3 ships the production resolver against
+`platform.workspace_storage_providers` plus a vendor-neutral
+`SecretManagerClient` interface for resolving `credential_ref` to raw
+provider credentials. The resolver implements BOTH the STORAGE-5
+`StorageProviderResolver` (workspace default) and the STORAGE-6
+`ExtendedStorageProviderResolver` (default + by-id) contracts so the
+STORAGE-FU-4 composition root can construct one instance and pass it to
+every handler factory.
+
+### Source layout
+
+- `src/infra/providers/secret-manager.ts` — `SecretManagerClient`
+  interface, closed-set `SecretManagerError` codes (`NOT_FOUND`,
+  `BACKEND_UNAVAILABLE`, `MATERIAL_INVALID`, `URI_INVALID`),
+  `parseSecretRef` (strict `secret://<path>` URI parser),
+  `secretPathToEnvPrefix` (pure `secret://storage/r2/dev` →
+  `STORAGE_CREDENTIAL_STORAGE_R2_DEV` mapping), and the local-dev
+  `EnvSecretManagerClient`.
+- `src/infra/db/repositories/provider-resolver.ts` —
+  `PostgresExtendedStorageProviderResolver` and its DI types.
+
+### Provider-kind mapping (DB → adapter)
+
+The DB `provider_kind` CHECK constraint allows three values (`r2`,
+`minio`, `s3_compatible`); the adapter knows six (`r2`, `b2`,
+`idrive_e2`, `aws_s3`, `s3_generic`, `minio`). The resolver maps:
+
+| DB `provider_kind` | Adapter `ProviderKind` | `forcePathStyle` | Default region |
+|---|---|---|---|
+| `r2`              | `r2`                  | `false`          | `auto`         |
+| `minio`           | `minio`               | `true`           | `us-east-1`    |
+| `s3_compatible`   | `s3_generic`          | `true`           | `us-east-1`    |
+
+Adding a new DB `provider_kind` REQUIRES updating: (1) the canonical
+Supabase migration's CHECK constraint, (2) the Drizzle schema mirror's
+`STORAGE_PROVIDER_KINDS` array, (3) the resolver's three lookup tables,
+(4) STORAGE-FU-1's `db:check` drift test.
+
+### Secret-manager interface
+
+`credential_ref` is a vendor-neutral `secret://<path>` URI. The
+resolver hands it to a `SecretManagerClient` implementation; the
+implementation maps the URI to a secret-manager backend.
+
+Local-dev (`EnvSecretManagerClient`):
+
+```
+secret://storage/r2/dev
+  → STORAGE_CREDENTIAL_STORAGE_R2_DEV_ACCESS_KEY_ID
+  → STORAGE_CREDENTIAL_STORAGE_R2_DEV_SECRET_ACCESS_KEY
+```
+
+Strict URI rules (defense-in-depth — DB constraints already require
+non-blank, but `parseSecretRef` rejects every malformed input BEFORE
+the backend is contacted):
+
+- Must start with `secret://`. No `http://`, `https://`, `file://`, `ftp://`.
+- Path 1..256 chars, lowercase letters / digits / `-` / `_` / `/`.
+- No leading `/`, no `..`, no query, no fragment.
+
+Hosted environments wire a different `SecretManagerClient` (AWS Secrets
+Manager, Doppler, Vault, GCP Secret Manager) in their composition root.
+The resolver does NOT care which backend serves the call — that's
+deliberately a per-environment story per the plan's §6.
+
+### Security invariants (proven by tests)
+
+- **Workspace scoping at the SQL layer.** Every SELECT carries
+  `workspace_id = $ws` as the first WHERE clause. Cross-workspace
+  `resolveByProviderIdForWorkspace` returns `null`, NOT throws (preserves
+  the STORAGE-6 "no enumeration oracle" invariant).
+- **Disabled rows are invisible.** Rows with `status = 'disabled'` are
+  filtered out of both resolve paths.
+- **Credential allowlist.** Only `id`, `provider_kind`, `endpoint`,
+  `region`, `bucket`, `display_name`, `credential_ref` reach the
+  resolver from the row. `credential_ref` is consumed inside the
+  resolver and NEVER returned to the caller. Only `providerKind`,
+  `endpoint`, `region`, `bucket`, `forcePathStyle`, `accessKeyId`,
+  `secretAccessKey` reach the adapter (asserted by `Object.keys` set
+  comparison in the unit suite).
+- **Error redaction.** Every `SecretManagerError` is wrapped in a
+  `ProviderAdapterError` with a generic safe message. The original
+  message text NEVER bleeds through (the closed-set
+  `SecretManagerErrorCode` is the only signal passed to the wrap layer).
+  Custom non-`SecretManagerError` backend errors are wrapped as
+  `PROVIDER_OPERATION_FAILED` with a generic message — a hostile
+  message containing `AKIA-*` / `xynes_live_*` / `X-Amz-Signature=*` is
+  guaranteed not to appear in the final response.
+- **NULL endpoint → safe fallback.** `endpoint` is nullable in the DB
+  schema but the resolver requires a non-blank value; missing or blank
+  endpoint surfaces as `PROVIDER_CONFIG_INVALID` with a generic
+  message (no value echo).
+- **No global default fallback.** A query for workspace A's provider
+  NEVER falls back to a default belonging to workspace B. Each workspace
+  must have its own `platform.workspace_storage_providers` row.
+
+### Production wiring example (STORAGE-FU-4 composition root)
+
+```ts
+import {
+  PostgresExtendedStorageProviderResolver,
+  EnvSecretManagerClient,
+  createStorageDb,
+} from '<storage-service>';
+
+const { db, close } = createStorageDb(process.env.DATABASE_URL!);
+const secrets = new EnvSecretManagerClient(); // or AWS Secrets Manager, etc.
+const providers = new PostgresExtendedStorageProviderResolver(db, secrets);
+
+// Pass `providers` to BOTH registerUploadActionHandlers AND
+// registerObjectActionHandlers — the single class implements both
+// interfaces.
+```
+
+### Tests
+
+- `tests/infra/providers/secret-manager.test.ts` — 22 unit tests
+  covering `parseSecretRef` (every rejection path),
+  `secretPathToEnvPrefix`, and `EnvSecretManagerClient`
+  (success / `NOT_FOUND` / `MATERIAL_INVALID` / partial-config / blank
+  values / `URI_INVALID` / no-leak invariant).
+- `tests/infra/db/repositories/provider-resolver.test.ts` — 26 unit
+  tests against an in-memory fake `StorageDb` covering: both resolve
+  methods (success / null / blank inputs / cross-workspace null),
+  every `SecretManagerErrorCode` mapping, unknown backend error
+  wrapping, the closed-set provider-kind map (including unknown future
+  kind rejection), region default fallback, endpoint NULL/whitespace
+  validation, adapter-builder allowlist (`Object.keys` set comparison),
+  s3-adapter-deps forwarding, and the no-leak invariant against
+  hostile error payloads.
+- `tests/infra/db/repositories/provider-resolver.integration.test.ts`
+  — 10 integration tests against a real Postgres covering workspace
+  scoping (cross-workspace null), `status = 'disabled'` filtering,
+  end-to-end resolution with `EnvSecretManagerClient`, and the
+  orphan-workspace case. Soft-skips when the DB is unreachable so a
+  clean laptop still passes `bun test`.
+
+### Out of scope (deferred to later STORAGE-FU-N stories)
+
+- **Hosted secret-manager implementations.** Each (AWS Secrets Manager,
+  GCP Secret Manager, Doppler, Vault) is a separate per-environment
+  follow-up story per the plan's §6. STORAGE-FU-3 ships the interface
+  and the local-dev env-backed implementation.
+- **Composition root wiring.** That's STORAGE-FU-4.
+- **Provider failover automation.** Plan §13 "out of scope".
+- **BYOS credential rotation UX.** That's the workspace-admin
+  integrations epic, not STORAGE.
