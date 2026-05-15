@@ -5,13 +5,15 @@
  *   - Every closed-set CHECK constraint value in the canonical Supabase
  *     migration is reflected in the matching `*_STATUSES` /
  *     `*_KINDS` / `*_VISIBILITIES` / `*_METHODS` constant exported
- *     from `src/infra/db/schema.ts`.
+ *     from `src/infra/db/schema.ts`. (Skipped on CI single-repo checkout
+ *     where the cross-repo canonical migration file is not reachable;
+ *     `bun run db:check` is the developer-local CI gate for that case.)
  *   - The mirror exports every storage table.
  *   - The schema source file contains NO forbidden raw-credential column
  *     names (defense-in-depth on top of code review).
  */
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   PROCESSING_JOB_STATUSES,
@@ -30,19 +32,43 @@ import {
   workspaceStorageProviders,
 } from '../../../src/infra/db/schema';
 
-const MIGRATION_PATH = resolve(
-  import.meta.dir,
-  '..',
-  '..',
-  '..',
-  '..',
-  'xynes-infra',
-  'supabase',
-  'migrations',
-  '20260513090000_universal_storage_platform_schema.sql',
-);
+// Cross-repo path. In a local meta-folder checkout (`xynes-erp/xynes/*`), the
+// canonical Supabase migration owned by `xynes-infra` lives next to this repo:
+//   xynes/xynes-storage-service/  ← this repo
+//   xynes/xynes-infra/supabase/migrations/...  ← canonical migration
+// In single-repo CI (GitHub Actions / dev container with only one repo checked
+// out), the cross-repo file is not present. The migration-parity tests below
+// gracefully skip in that environment — the mirror-only invariants
+// (closed-set frozen-array tests + schema-source forbidden-column negatives)
+// still run and remain CI gates. The cross-repo parity gate is
+// `bun run db:check`, which developers run locally and which should also be
+// wired into a cross-repo CI workflow as a follow-up.
+const MIGRATION_PATH =
+  process.env.STORAGE_INFRA_MIGRATION_PATH ??
+  resolve(
+    import.meta.dir,
+    '..',
+    '..',
+    '..',
+    '..',
+    'xynes-infra',
+    'supabase',
+    'migrations',
+    '20260513090000_universal_storage_platform_schema.sql',
+  );
 
-const MIGRATION_SQL = readFileSync(MIGRATION_PATH, 'utf-8');
+const MIGRATION_REACHABLE = existsSync(MIGRATION_PATH);
+const MIGRATION_SQL = MIGRATION_REACHABLE ? readFileSync(MIGRATION_PATH, 'utf-8') : '';
+
+if (!MIGRATION_REACHABLE) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[schema.test] canonical migration not reachable at ${MIGRATION_PATH}; ` +
+      `cross-repo parity tests will be skipped. Run \`bun run db:check\` to ` +
+      `enforce drift detection locally, or set STORAGE_INFRA_MIGRATION_PATH ` +
+      `to point at the canonical file in CI.`,
+  );
+}
 
 function parseInValues(raw: string): Set<string> {
   return new Set(
@@ -66,7 +92,13 @@ function asStringSet(values: readonly string[]): Set<string> {
   return new Set<string>(values);
 }
 
-describe('schema mirror — closed-set CHECK parity', () => {
+// `describe.skipIf` evaluates the predicate eagerly at module-load time. When
+// the cross-repo canonical migration is unreachable (single-repo CI), every
+// test inside the skipped describes is reported as skipped — they are
+// re-enabled the moment a developer runs the suite locally in the meta-folder
+// checkout (where the file is reachable) or sets `STORAGE_INFRA_MIGRATION_PATH`
+// in CI to point at a checked-out canonical file.
+describe.skipIf(!MIGRATION_REACHABLE)('schema mirror — closed-set CHECK parity', () => {
   test('STORAGE_PROVIDER_KINDS matches workspace_storage_providers_kind_check', () => {
     const migrationValues = findCheckValues(
       'workspace_storage_providers_kind_check',
@@ -115,6 +147,7 @@ describe('schema mirror — closed-set CHECK parity', () => {
 });
 
 describe('schema mirror — table coverage', () => {
+  // Mirror-only assertion: must always run, even on single-repo CI.
   test('exports all six storage tables', () => {
     expect(workspaceStorageProviders).toBeDefined();
     expect(storageObjects).toBeDefined();
@@ -124,19 +157,23 @@ describe('schema mirror — table coverage', () => {
     expect(storageUsageDaily).toBeDefined();
   });
 
-  test('every required table appears in the canonical migration', () => {
-    const required = [
-      'workspace_storage_providers',
-      'storage_objects',
-      'storage_upload_sessions',
-      'storage_object_variants',
-      'storage_processing_jobs',
-      'storage_usage_daily',
-    ];
-    for (const name of required) {
-      expect(MIGRATION_SQL).toContain(`platform.${name}`);
-    }
-  });
+  // Cross-repo assertion: requires canonical migration file.
+  test.skipIf(!MIGRATION_REACHABLE)(
+    'every required table appears in the canonical migration',
+    () => {
+      const required = [
+        'workspace_storage_providers',
+        'storage_objects',
+        'storage_upload_sessions',
+        'storage_object_variants',
+        'storage_processing_jobs',
+        'storage_usage_daily',
+      ];
+      for (const name of required) {
+        expect(MIGRATION_SQL).toContain(`platform.${name}`);
+      }
+    },
+  );
 });
 
 describe('schema mirror — security invariants', () => {
@@ -170,18 +207,21 @@ describe('schema mirror — security invariants', () => {
     },
   );
 
-  test('canonical migration does not declare forbidden raw-credential columns', () => {
-    for (const forbidden of FORBIDDEN_COLUMN_NAMES) {
-      // Match column declarations `forbidden TYPE` at the start of a line.
-      // Avoid matching the security comment paragraph that LISTS these
-      // forbidden names as banned by checking for a column type after.
-      const declarationPattern = new RegExp(
-        `^\\s+${forbidden}\\s+(text|uuid|bigint|integer|boolean|timestamptz|date)`,
-        'mi',
-      );
-      expect(MIGRATION_SQL).not.toMatch(declarationPattern);
-    }
-  });
+  test.skipIf(!MIGRATION_REACHABLE)(
+    'canonical migration does not declare forbidden raw-credential columns',
+    () => {
+      for (const forbidden of FORBIDDEN_COLUMN_NAMES) {
+        // Match column declarations `forbidden TYPE` at the start of a line.
+        // Avoid matching the security comment paragraph that LISTS these
+        // forbidden names as banned by checking for a column type after.
+        const declarationPattern = new RegExp(
+          `^\\s+${forbidden}\\s+(text|uuid|bigint|integer|boolean|timestamptz|date)`,
+          'mi',
+        );
+        expect(MIGRATION_SQL).not.toMatch(declarationPattern);
+      }
+    },
+  );
 
   test('credential_ref is the only credential column declared', () => {
     expect(SCHEMA_SOURCE).toContain('credentialRef');
