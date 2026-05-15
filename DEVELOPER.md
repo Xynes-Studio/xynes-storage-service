@@ -944,6 +944,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-1 | ✅ Landed 2026-05-15 (Drizzle schema mirror + DB client + drift check) |
 | STORAGE-FU-2 | ✅ Landed 2026-05-15 (Postgres repositories) |
 | STORAGE-FU-3 | ✅ Landed 2026-05-15 (Provider resolver + secret-manager interface) |
+| STORAGE-FU-4 | ✅ Landed 2026-05-15 (Composition root — handler registration + ready event) |
 
 ## Drizzle Schema Mirror (STORAGE-FU-1)
 
@@ -1268,7 +1269,8 @@ every handler factory.
   `BACKEND_UNAVAILABLE`, `MATERIAL_INVALID`, `URI_INVALID`),
   `parseSecretRef` (strict `secret://<path>` URI parser),
   `secretPathToEnvPrefix` (pure `secret://storage/r2/dev` →
-  `STORAGE_CREDENTIAL_STORAGE__R2__DEV` injective mapping — see
+  `STORAGE_CREDENTIAL_STORAGE__R2__DEV_ACCESS_KEY_ID`
+  `STORAGE_CREDENTIAL_STORAGE__R2__DEV_SECRET_ACCESS_KEY` injective mapping — see
   "Secret-manager interface" below), and the local-dev
   `EnvSecretManagerClient`.
 - `src/infra/db/repositories/provider-resolver.ts` —
@@ -1411,3 +1413,120 @@ const providers = new PostgresExtendedStorageProviderResolver(db, secrets);
 - **Provider failover automation.** Plan §13 "out of scope".
 - **BYOS credential rotation UX.** That's the workspace-admin
   integrations epic, not STORAGE.
+
+## Composition Root (STORAGE-FU-4)
+
+### What it does
+
+`src/composition.ts` is the runtime composition root for
+`xynes-storage-service`. It is invoked exactly once at startup, before
+the HTTP server begins accepting traffic, by `src/index.ts`.
+
+Responsibilities:
+
+1. Construct ONE `StorageDbClient` (STORAGE-FU-1) from `DATABASE_URL`.
+2. Construct every Drizzle-backed repository (STORAGE-FU-2).
+3. Construct the `PostgresExtendedStorageProviderResolver` plus the
+   configured `SecretManagerClient` (STORAGE-FU-3). Today only the
+   local-dev `EnvSecretManagerClient` is supported — hosted backends
+   (AWS Secrets Manager, GCP Secret Manager, Doppler, Vault) land as
+   per-environment follow-up stories.
+4. Register every action handler shipped by STORAGE-5/6/7 on the shared
+   action registry via `registerUploadActionHandlers`,
+   `registerObjectActionHandlers`, and `registerProcessingActionHandlers`.
+5. Emit ONE structured `storage.service.ready` log entry listing the
+   registered action keys. The entry does **NOT** carry provider
+   config, credentials, `DATABASE_URL`, secret-manager URIs, or any
+   other STORAGE-9 redacted surface — the redactor in
+   `src/infra/logger.ts` is a second line of defence; the ready entry
+   deliberately stays narrow.
+6. Construct (but do NOT `start()`) the `ProcessingWorker` and
+   `AbandonedUploadCleanup` instances. Their polling-loop `start()`
+   calls land with STORAGE-FU-6 alongside graceful-shutdown wiring.
+
+### Public API
+
+```ts
+import { buildComposition, REGISTERED_ACTION_KEYS } from './composition';
+
+const composition = buildComposition();
+// composition.db, composition.worker, composition.cleanup are exposed
+// for STORAGE-FU-6 (worker `start()`) + graceful-shutdown wiring.
+await composition.shutdown();
+```
+
+`buildComposition(options)` options:
+
+| Option | Purpose |
+|---|---|
+| `secrets?: SecretManagerClient` | Override the secret-manager backend. Defaults to `EnvSecretManagerClient`. |
+| `runners?: Partial<Record<ProcessingJobType, JobRunner>>` | STORAGE-FU-5 hook — production runners go here. Defaults to `{}` so every job dead-letters with `RUNNER_MISSING`. |
+| `env?: NodeJS.ProcessEnv` | Override `process.env`. |
+| `dbClient?: StorageDbClient` | Inject a pre-built client. When set, composition does NOT own it; `shutdown` will not close it. |
+| `createDb?: (url, env) => StorageDbClient` | Test seam for the owned-DB path. Defaults to `createStorageDb`. |
+
+### Fail-fast posture
+
+`buildComposition` throws when `DATABASE_URL` is missing/blank (via
+`createStorageDb`). The composition root deliberately does NOT catch
+the throw — the service crashes loudly instead of silently serving
+`UNKNOWN_ACTION` envelopes. Matches the gateway's `DATABASE_URL`
+posture.
+
+### Security invariants (proven by tests)
+
+- The `storage.service.ready` log entry's JSON payload is restricted to
+  the allowlist `{ ts, level, service, message, event, actionKeys,
+  cleanupPollIntervalMs }`. Hostile `DATABASE_URL` / env credentials
+  cannot leak through it.
+- The enqueue-processing callback `buildEnqueueProcessingCallback`
+  returns `[]` when the object is missing or soft-deleted in the window
+  between session-complete and the callback firing — the upload-complete
+  success is not undone by an enqueue failure.
+- Returned public DTOs from the enqueue callback never carry
+  `providerObjectKey` / `providerId` / `providerKind` / `endpoint` /
+  `bucket` / `credentialRef`.
+
+### Tests
+
+`tests/composition.test.ts` (21 tests, 79 expects):
+
+- **Fail-fast posture (4 tests)** — throws on undefined / empty /
+  whitespace `DATABASE_URL`; does NOT throw when `dbClient` is injected.
+- **Handler registration (2 tests)** — every key in
+  `REGISTERED_ACTION_KEYS` resolves to a handler; the
+  catalogued-but-unrouted `platform.storage.providers.manage` is NOT
+  registered.
+- **Ready log entry (3 tests)** — exactly one entry; serialized
+  payload does not contain hostile substrings (`AKIA*` / `secret://` /
+  `DATABASE_URL` credentials / provider fields); payload keys are a
+  known allowlist.
+- **Worker + cleanup (2 tests)** — instances exist; `start()` is NOT
+  called automatically.
+- **Shutdown (4 tests)** — closes the owned client; does NOT close an
+  injected client; idempotent; default `createDb` path still uses
+  `createStorageDb` (regression guard).
+- **Runners default (2 tests)** — empty registry by default; custom
+  registry accepted via the `runners` option (STORAGE-FU-5 hook).
+- **HTTP envelope integration (1 test)** — every registered action key
+  reaches a handler through `POST /internal/storage-actions` (no
+  `UNKNOWN_ACTION` for any of the five MVP keys).
+- **`buildEnqueueProcessingCallback` (3 tests)** — returns `[]` when
+  the object is missing; returns `[]` when the object is soft-deleted;
+  returns public processing-job DTOs (allowlist-only) when the object
+  is uploaded.
+
+### Out of scope (deferred to later STORAGE-FU-N stories)
+
+- **Worker `start()` and graceful shutdown.** That's STORAGE-FU-6.
+  `buildComposition` constructs the worker + cleanup instances and
+  exposes them on the returned object; STORAGE-FU-6 wires the
+  polling-loop `start()` and `SIGTERM` / `SIGINT` handlers.
+- **Production runners.** That's STORAGE-FU-5. STORAGE-FU-4 wires
+  `runners: {}` by default — every job type without a runner
+  surfaces as the closed-set `RUNNER_MISSING` code per STORAGE-7
+  contracts (non-required jobs dead-letter without flipping the parent;
+  required jobs flip the parent to `failed` after retry exhaustion).
+- **Hosted secret-manager implementations.** Each is a separate
+  per-environment story; STORAGE-FU-3 ships the interface +
+  `EnvSecretManagerClient` for local dev.
