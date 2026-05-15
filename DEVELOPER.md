@@ -941,6 +941,105 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-10 | ✅ Landed 2026-05-14 (CMS Console — `xynes-cms-console-web`) |
 | STORAGE-11 | ✅ Landed 2026-05-14 (CMS editor + Lumia DS) |
 | STORAGE-12 | ✅ Landed 2026-05-14 |
+| STORAGE-FU-1 | ✅ Landed 2026-05-15 (Drizzle schema mirror + DB client + drift check) |
+
+## Drizzle Schema Mirror (STORAGE-FU-1)
+
+### Schema ownership
+
+The canonical source of truth for every `platform.storage_*` table is
+**`xynes/xynes-infra/supabase/migrations/20260513090000_universal_storage_platform_schema.sql`**.
+That migration is owned by `xynes-infra`. `xynes-storage-service` does
+**NOT** own the schema and does **NOT** ship Drizzle migrations.
+
+`src/infra/db/schema.ts` is a **read-only mirror** that declares the
+canonical columns + closed-set CHECK values so the service can build
+type-safe Drizzle queries on top of them.
+
+If you find yourself reaching for `drizzle-kit generate` or
+`drizzle-kit push` from this repo, **stop**. Schema changes must land in
+the `xynes-infra` Supabase migration first; only then update the mirror
+here.
+
+### Closed-set type unions
+
+Every `CHECK status IN (...)` constraint in the canonical migration is
+mirrored as a `readonly` tuple constant + `type` union:
+
+| Constant | Type | Source CHECK |
+|---|---|---|
+| `STORAGE_PROVIDER_KINDS` | `StorageProviderKind` | `workspace_storage_providers_kind_check` |
+| `STORAGE_PROVIDER_STATUSES` | `StorageProviderStatus` | `workspace_storage_providers_status_check` |
+| `STORAGE_OBJECT_STATUSES` | `StorageObjectStatus` | `storage_objects_status_check` |
+| `STORAGE_OBJECT_VISIBILITIES` | `StorageObjectVisibility` | `storage_objects_visibility_check` |
+| `UPLOAD_SESSION_METHODS` | `UploadSessionMethod` | `storage_upload_sessions_method_check` |
+| `UPLOAD_SESSION_STATUSES` | `UploadSessionStatus` | `storage_upload_sessions_status_check` |
+| `STORAGE_VARIANT_STATUSES` | `StorageVariantStatus` | `storage_object_variants_status_check` |
+| `PROCESSING_JOB_STATUSES` | `ProcessingJobStatus` | `storage_processing_jobs_status_check` |
+
+The Drizzle text columns are branded via `.$type<...>()` so callers
+cannot accidentally write an out-of-set value (e.g. `status: 'archived'`
+against a `storage_objects` row fails to compile).
+
+### DB client factory
+
+```ts
+import { createStorageDb } from './infra/db';
+
+const { db, close } = createStorageDb(process.env.DATABASE_URL);
+// inject `db` into every repository constructor; no module-level singleton.
+// composition root (STORAGE-FU-4) owns the lifetime + the `close` call on shutdown.
+```
+
+The factory:
+
+- **Throws on startup** if `DATABASE_URL` is missing/blank. Composition
+  root must let this bubble up so the service fails fast.
+- Collapses to **one connection** when `NODE_ENV=test` so integration
+  tests do not deadlock.
+- Honours `STORAGE_DRIZZLE_LOG=1` for opt-in query logging. Off by
+  default. STORAGE-9 redaction rules run at log-emit time inside
+  `infra/logger.ts`; this client never has to know about provider
+  credentials.
+
+### Drift detection
+
+```bash
+bun run db:check
+```
+
+`scripts/db-check.ts` is a **static** drift check (no DB required). It:
+
+1. Reads the canonical migration (override via `STORAGE_INFRA_MIGRATION_PATH`).
+2. Asserts every required table exists in the migration.
+3. Asserts every closed-set type constant in the mirror matches the
+   migration's `CHECK status IN (...)` allowlist.
+4. Asserts the migration does **not** introduce any forbidden raw-credential
+   column (`provider_credentials`, `raw_key`, `secret_access_key`, `r2_token`,
+   `signed_url`, `presigned_url`, `access_key_id`).
+
+Exit 0 means the mirror is in sync. Exit 1 prints every diff and is the
+CI gate.
+
+### Security invariants
+
+- **No raw provider credential columns.** `credential_ref` is the only
+  column that touches credentials; it stores a reference (secret-manager
+  key / env alias). Forbidden column names are blocked at three layers:
+  1. The canonical migration itself (rejected at code review).
+  2. The schema mirror (asserted by `tests/infra/db/schema.test.ts`).
+  3. `bun run db:check` (CI gate against migration drift).
+- The mirror declares minimal `platform.workspaces` + `identity.users`
+  Drizzle handles for FK type-safety only. We never read or write those
+  tables from this service.
+
+### Out of scope
+
+STORAGE-FU-1 ships **only** the schema mirror, DB client factory, and
+drift check. It does **not** ship repository implementations — those
+land with STORAGE-FU-2 (`PostgresStorageObjectRepository` etc.). The
+composition root (`src/index.ts`) is not wired in this story; production
+action handlers continue to be unregistered until STORAGE-FU-4 lands.
 
 ## Local Smoke + Rollout Checklist (STORAGE-12)
 
