@@ -13,6 +13,7 @@ import {
   PostgresStorageProcessingJobRepository,
   PostgresProcessingJobQueueRepository,
   PostgresStorageUsageRepository,
+  DuplicateActiveJobError,
 } from '../../../../src/infra/db/repositories/variant-job-usage-repository';
 import type { IntegrationDb } from './_db';
 
@@ -210,6 +211,356 @@ describeIf('PostgresProcessingJobQueueRepository.enqueueBatch + listForObject', 
     expect(out.length).toBe(0);
   });
 });
+
+describeIf(
+  'PostgresProcessingJobQueueRepository.enqueueBatch — duplicate-job semantics (P1 codex fix)',
+  () => {
+    test('REJECTS a duplicate (objectId, jobType) with an active row (queued)', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        const now = new Date();
+        await queue.enqueueBatch([
+          {
+            id: randomUUID(),
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'scan_validation',
+            required: true,
+            payload: {},
+            scheduledAt: now,
+          },
+        ]);
+        await expect(
+          queue.enqueueBatch([
+            {
+              id: randomUUID(),
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'scan_validation',
+              required: true,
+              payload: {},
+              scheduledAt: now,
+            },
+          ]),
+        ).rejects.toThrow(/DUPLICATE_ACTIVE_JOB|already exists/i);
+        const all = await queue.listForObject({ objectId, workspaceId: fx.workspaceId });
+        const active = all.filter((j) => j.jobType === 'scan_validation' && j.status === 'queued');
+        expect(active.length).toBe(1);
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('REJECTS a duplicate when the existing row is `running`', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        const past = new Date(Date.now() - 1000);
+        await queue.enqueueBatch([
+          {
+            id: randomUUID(),
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'image_optimize',
+            required: false,
+            payload: {},
+            scheduledAt: past,
+          },
+        ]);
+        await queue.claimNextQueuedJob({ now: new Date() });
+        await expect(
+          queue.enqueueBatch([
+            {
+              id: randomUUID(),
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'image_optimize',
+              required: false,
+              payload: {},
+              scheduledAt: new Date(),
+            },
+          ]),
+        ).rejects.toThrow(/DUPLICATE_ACTIVE_JOB|already exists/i);
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('ALLOWS a duplicate when prior row is terminally `failed`', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        await ctx.current.db.execute(sql`
+          INSERT INTO platform.storage_processing_jobs
+            (id, object_id, workspace_id, job_kind, status, attempts,
+             scheduled_at, finished_at, error_code, created_at)
+          VALUES (${randomUUID()}, ${objectId}, ${fx.workspaceId}, 'image_optimize',
+                  'failed', 3, now(), now(), 'PROCESSOR_FAILED', now())
+        `);
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        const inserted = await queue.enqueueBatch([
+          {
+            id: randomUUID(),
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'image_optimize',
+            required: false,
+            payload: {},
+            scheduledAt: new Date(),
+          },
+        ]);
+        expect(inserted.length).toBe(1);
+        expect(inserted[0].status).toBe('queued');
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('ALLOWS a duplicate when prior row is terminally `succeeded`', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        await ctx.current.db.execute(sql`
+          INSERT INTO platform.storage_processing_jobs
+            (id, object_id, workspace_id, job_kind, status, attempts,
+             scheduled_at, finished_at, created_at)
+          VALUES (${randomUUID()}, ${objectId}, ${fx.workspaceId}, 'scan_validation',
+                  'succeeded', 1, now(), now(), now())
+        `);
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        const inserted = await queue.enqueueBatch([
+          {
+            id: randomUUID(),
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'scan_validation',
+            required: true,
+            payload: {},
+            scheduledAt: new Date(),
+          },
+        ]);
+        expect(inserted.length).toBe(1);
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('rejects a multi-pair batch when ONE pair collides; rolls back the rest', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        await queue.enqueueBatch([
+          {
+            id: randomUUID(),
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'scan_validation',
+            required: true,
+            payload: {},
+            scheduledAt: new Date(),
+          },
+        ]);
+        await expect(
+          queue.enqueueBatch([
+            {
+              id: randomUUID(),
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'scan_validation', // collides
+              required: true,
+              payload: {},
+              scheduledAt: new Date(),
+            },
+            {
+              id: randomUUID(),
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'image_optimize', // fresh
+              required: false,
+              payload: {},
+              scheduledAt: new Date(),
+            },
+          ]),
+        ).rejects.toThrow(/DUPLICATE_ACTIVE_JOB|already exists/i);
+        // image_optimize MUST NOT have been inserted (whole-tx rollback).
+        const jobs = await queue.listForObject({ objectId, workspaceId: fx.workspaceId });
+        expect(jobs.filter((j) => j.jobType === 'image_optimize').length).toBe(0);
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('DuplicateActiveJobError carries objectId + jobType + code + statusHint, and does NOT leak provider config', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        await queue.enqueueBatch([
+          {
+            id: randomUUID(),
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'scan_validation',
+            required: true,
+            payload: {},
+            scheduledAt: new Date(),
+          },
+        ]);
+        try {
+          await queue.enqueueBatch([
+            {
+              id: randomUUID(),
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'scan_validation',
+              required: true,
+              payload: {},
+              scheduledAt: new Date(),
+            },
+          ]);
+          throw new Error('expected DuplicateActiveJobError');
+        } catch (err) {
+          const e = err as DuplicateActiveJobError;
+          expect(e.code).toBe('DUPLICATE_ACTIVE_JOB');
+          expect(e.statusHint).toBe(409);
+          expect(e.objectId).toBe(objectId);
+          expect(e.jobType).toBe('scan_validation');
+          const msg = String(e.message);
+          expect(msg).not.toContain('credential');
+          expect(msg).not.toContain('endpoint');
+          expect(msg).not.toContain('region');
+          expect(msg).not.toContain('bucket');
+        }
+      } finally {
+        await fx.cleanup();
+      }
+    });
+  },
+);
+
+describeIf(
+  'PostgresProcessingJobQueueRepository.markSucceeded — clears stale errorCode (P2 codex fix)',
+  () => {
+    test('clears stale errorCode from a previous failed attempt when the retry succeeds', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        const jobId = randomUUID();
+        await queue.enqueueBatch([
+          {
+            id: jobId,
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'image_optimize',
+            required: false,
+            payload: {},
+            scheduledAt: new Date(Date.now() - 1000),
+          },
+        ]);
+        // Attempt 1: claim → fail (retryable).
+        await queue.claimNextQueuedJob({ now: new Date() });
+        await queue.markFailed({
+          jobId,
+          errorCode: 'PROCESSOR_FAILED',
+          now: new Date(),
+          terminal: false,
+          nextScheduledAt: new Date(Date.now() - 500),
+        });
+        // The row is now queued again with a stale errorCode.
+        const afterFail = await queue.listForObject({ objectId, workspaceId: fx.workspaceId });
+        expect(afterFail[0].errorCode).toBe('PROCESSOR_FAILED');
+        // Attempt 2: claim → succeed. markSucceeded MUST clear errorCode.
+        await queue.claimNextQueuedJob({ now: new Date() });
+        const succeeded = await queue.markSucceeded({ jobId, now: new Date() });
+        expect(succeeded!.status).toBe('succeeded');
+        expect(succeeded!.errorCode).toBeNull();
+        // Re-read via listForObject to prove the stale code is gone for downstream readers.
+        const afterSuccess = await queue.listForObject({ objectId, workspaceId: fx.workspaceId });
+        expect(afterSuccess[0].errorCode).toBeNull();
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('markSucceeded leaves errorCode = null when the row never failed', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        const jobId = randomUUID();
+        await queue.enqueueBatch([
+          {
+            id: jobId,
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'scan_validation',
+            required: true,
+            payload: {},
+            scheduledAt: new Date(Date.now() - 1000),
+          },
+        ]);
+        await queue.claimNextQueuedJob({ now: new Date() });
+        const succeeded = await queue.markSucceeded({ jobId, now: new Date() });
+        expect(succeeded!.errorCode).toBeNull();
+      } finally {
+        await fx.cleanup();
+      }
+    });
+  },
+);
 
 describeIf(
   'PostgresProcessingJobQueueRepository.claimNextQueuedJob (FOR UPDATE SKIP LOCKED)',

@@ -25,7 +25,7 @@
  *     provider, but the response builder strips `providerKind` from
  *     the wire DTO (STORAGE-6 invariant).
  */
-import { and, eq, exists, lte, sql } from 'drizzle-orm';
+import { and, eq, exists, inArray, lte, or, sql } from 'drizzle-orm';
 import type { StorageDb } from '../client';
 import {
   storageObjectVariants,
@@ -120,6 +120,36 @@ export class PostgresStorageProcessingJobRepository implements StorageProcessing
 
 // ── PostgresProcessingJobQueueRepository (STORAGE-7) ──────────────────────
 
+/**
+ * Thrown by `enqueueBatch` when a non-terminal (`queued` / `running`)
+ * row already exists for one of the requested `(objectId, jobType)`
+ * pairs. Callers should treat this as an idempotency signal: the prior
+ * enqueue is still in flight, no work is lost, and no new row needs
+ * to be inserted.
+ *
+ * Per the STORAGE-7 contract (`ProcessingJobQueueRepository.enqueueBatch`):
+ * implementations MUST reject duplicate `(objectId, jobType)` pairs
+ * already in the queue UNLESS the existing row is in a terminal state.
+ * `failed` / `succeeded` / `cancelled` rows are intentionally allowed
+ * to be superseded so retries land.
+ *
+ * The error message intentionally surfaces only the first colliding
+ * pair so a hostile caller cannot probe active jobs via trial-and-error
+ * batches.
+ */
+export class DuplicateActiveJobError extends Error {
+  public readonly code = 'DUPLICATE_ACTIVE_JOB';
+  public readonly statusHint = 409 as const;
+  public readonly objectId: string;
+  public readonly jobType: string;
+  constructor(objectId: string, jobType: string) {
+    super(`Active processing job already exists for (${objectId}, ${jobType})`);
+    this.name = 'DuplicateActiveJobError';
+    this.objectId = objectId;
+    this.jobType = jobType;
+  }
+}
+
 export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueRepository {
   constructor(private readonly db: StorageDb) {}
 
@@ -127,28 +157,86 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
     input: ReadonlyArray<EnqueueJobInput>,
   ): Promise<ReadonlyArray<StorageProcessingJobRecord>> {
     if (input.length === 0) return [];
-    // One transaction so all-or-nothing. The repo deliberately does NOT
-    // de-duplicate `(objectId, jobType)` pairs — the planner ensures
-    // uniqueness within a single transition. A duplicate (objectId,
-    // jobType) IS allowed for retries after a previous batch has
-    // already terminally failed; the unique index in STORAGE-2
-    // intentionally does not cover this table for that reason.
-    const inserted = await this.db
-      .insert(storageProcessingJobs)
-      .values(
-        input.map((job) => ({
-          id: job.id,
-          objectId: job.objectId,
-          workspaceId: job.workspaceId,
-          // DB column: job_kind.
-          jobKind: job.jobType,
-          status: 'queued' as const,
-          attempts: 0,
-          scheduledAt: job.scheduledAt,
-        })),
-      )
-      .returning();
-    return inserted.map(mapProcessingJobRow);
+    // One transaction so:
+    //   1. The duplicate-check against currently-active rows
+    //      (`queued` / `running`) is consistent with the insert.
+    //   2. All-or-nothing batch insert.
+    //
+    // STORAGE-7 contract (types.ts:140-144) says:
+    //   "Implementations MUST reject duplicate `(objectId, jobType)`
+    //    pairs already in the queue UNLESS the existing row is in a
+    //    terminal state".
+    //
+    // Why per-row check (not a unique partial index): the canonical
+    // STORAGE-2 migration deliberately does NOT carry a unique index
+    // covering this rule because retries after terminal `failed` /
+    // `succeeded` / `cancelled` rows MUST be allowed. We enforce the
+    // "no duplicate ACTIVE row" rule in-transaction here. Once a
+    // future migration adds an expression index like
+    //   CREATE UNIQUE INDEX ... ON storage_processing_jobs (object_id, job_kind)
+    //   WHERE status IN ('queued','running');
+    // this transaction-level check becomes belt-and-braces.
+    return this.db.transaction(async (tx) => {
+      // Build a uniqueness probe over the requested batch. Drizzle's
+      // `inArray` would collapse the AND on `(object_id IN ..., job_kind
+      // IN ...)` and over-match (it'd reject a row whose pair is NOT
+      // in the batch). So we use one OR-combined clause per requested
+      // pair. The batch is bounded by the planner (≤ 5 entries today
+      // per STORAGE-7) so the WHERE size is trivially small.
+      const pairClauses = input.map((job) =>
+        and(
+          eq(storageProcessingJobs.objectId, job.objectId),
+          eq(storageProcessingJobs.jobKind, job.jobType),
+        ),
+      );
+      const combined = pairClauses.reduce(
+        (acc, clause) => (acc ? or(acc, clause) : clause),
+        undefined as ReturnType<typeof or> | undefined,
+      );
+      if (combined) {
+        const conflicts = await tx
+          .select({
+            objectId: storageProcessingJobs.objectId,
+            jobKind: storageProcessingJobs.jobKind,
+          })
+          .from(storageProcessingJobs)
+          .where(
+            and(
+              combined,
+              // Only active (non-terminal) rows block re-enqueue.
+              // `failed` / `succeeded` / `cancelled` rows are
+              // intentionally allowed to be superseded.
+              inArray(storageProcessingJobs.status, ['queued', 'running']),
+            ),
+          );
+        if (conflicts.length > 0) {
+          const c = conflicts[0];
+          // Closed-set, redacted error code so callers can branch
+          // programmatically. The message intentionally does NOT echo
+          // the full conflict list (would let a hostile caller probe
+          // active jobs by trial-and-error); it surfaces only the
+          // first colliding pair.
+          throw new DuplicateActiveJobError(c.objectId, c.jobKind);
+        }
+      }
+
+      const inserted = await tx
+        .insert(storageProcessingJobs)
+        .values(
+          input.map((job) => ({
+            id: job.id,
+            objectId: job.objectId,
+            workspaceId: job.workspaceId,
+            // DB column: job_kind.
+            jobKind: job.jobType,
+            status: 'queued' as const,
+            attempts: 0,
+            scheduledAt: job.scheduledAt,
+          })),
+        )
+        .returning();
+      return inserted.map(mapProcessingJobRow);
+    });
   }
 
   async listForObject(input: {
@@ -267,6 +355,12 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
       .set({
         status: 'succeeded',
         finishedAt: input.now,
+        // Clear any stale `errorCode` from a prior failed attempt so a
+        // retried-and-succeeded job does not surface a stale failure
+        // code to readers of `listForObject` and the STORAGE-6 GET
+        // response. Without this, downstream status/reporting logic
+        // can mis-classify a successful job as still-errored.
+        errorCode: null,
         attempts: sql`${storageProcessingJobs.attempts} + 1`,
       })
       .where(

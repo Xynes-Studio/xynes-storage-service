@@ -30,6 +30,7 @@ export {
   PostgresStorageProcessingJobRepository,
   PostgresProcessingJobQueueRepository,
   PostgresStorageUsageRepository,
+  DuplicateActiveJobError,
 } from './variant-job-usage-repository';
 export {
   deriveJobRequired,
