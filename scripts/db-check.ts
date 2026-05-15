@@ -107,7 +107,8 @@ const CHECKED_CONSTRAINTS: readonly CheckedConstraint[] = [
   },
   {
     description: 'storage_upload_sessions.upload_method',
-    migrationPattern: /storage_upload_sessions_method_check[\s\S]*?upload_method\s+IN\s+\(([^)]+)\)/,
+    migrationPattern:
+      /storage_upload_sessions_method_check[\s\S]*?upload_method\s+IN\s+\(([^)]+)\)/,
     mirrorValues: UPLOAD_SESSION_METHODS,
   },
   {
