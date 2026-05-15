@@ -3,6 +3,10 @@
  * factory so STORAGE-FU-2 repositories can `import { storageObjects, type
  * StorageDb } from '../../infra/db'` without reaching into module
  * subpaths.
+ *
+ * STORAGE-FU-2 production repositories are exported via the
+ * `./repositories` barrel and re-exported here for the composition root.
  */
 export * from './schema';
 export * from './client';
+export * from './repositories';

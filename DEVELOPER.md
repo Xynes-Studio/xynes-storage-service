@@ -942,6 +942,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-11 | ✅ Landed 2026-05-14 (CMS editor + Lumia DS) |
 | STORAGE-12 | ✅ Landed 2026-05-14 |
 | STORAGE-FU-1 | ✅ Landed 2026-05-15 (Drizzle schema mirror + DB client + drift check) |
+| STORAGE-FU-2 | ✅ Landed 2026-05-15 (Postgres repositories) |
 
 ## Drizzle Schema Mirror (STORAGE-FU-1)
 
@@ -1110,3 +1111,143 @@ specific onboarding gate (region MUST be enabled before bucket creation).
 - **CMS body validation that rejects nodes carrying provider config.**
   STORAGE-11's `stripTransientImageUrls` is the first line of defense;
   a future CMS Core validator is the second. Not part of STORAGE-12.
+## Production Repositories (STORAGE-FU-2)
+
+### What landed
+
+STORAGE-FU-2 ships the Postgres (Drizzle) implementations of every
+repository contract introduced by STORAGE-5 / STORAGE-6 / STORAGE-7 /
+STORAGE-9. The runtime composition root (STORAGE-FU-4) wires these
+implementations into the handler dispatchers; until then `src/index.ts`
+still registers nothing and every action key returns `400 UNKNOWN_ACTION`.
+
+### Source layout
+
+```
+src/infra/db/repositories/
+  ├── index.ts                            # barrel
+  ├── mappers.ts                          # row → DTO mappers (shared)
+  ├── object-and-session-repository.ts    # storage_objects + storage_upload_sessions
+  └── variant-job-usage-repository.ts     # variants + processing jobs + usage daily
+```
+
+### Implementations
+
+| Contract | Class | Owner story |
+| --- | --- | --- |
+| `StorageObjectRepository` | `PostgresStorageObjectRepository` | STORAGE-5 |
+| `UploadSessionRepository` | `PostgresUploadSessionRepository` | STORAGE-5 |
+| `ExtendedStorageObjectRepository` | `PostgresExtendedStorageObjectRepository` | STORAGE-6 |
+| `StorageVariantRepository` | `PostgresStorageVariantRepository` | STORAGE-6 |
+| `StorageProcessingJobRepository` | `PostgresStorageProcessingJobRepository` | STORAGE-6 |
+| `StorageUsageRepository` | `PostgresStorageUsageRepository` | STORAGE-6 |
+| `ProcessingJobQueueRepository` | `PostgresProcessingJobQueueRepository` | STORAGE-7 |
+| `StorageObjectStatusRepository` | `PostgresStorageObjectStatusRepository` | STORAGE-7 |
+| `AbandonedUploadSessionRepository` | `PostgresAbandonedUploadSessionRepository` | STORAGE-9 |
+
+Production usage (STORAGE-FU-4 will do this):
+
+```ts
+import { createStorageDb, PostgresUploadSessionRepository } from './infra/db';
+
+const { db, close } = createStorageDb(process.env.DATABASE_URL);
+const sessions = new PostgresUploadSessionRepository(db);
+// → pass `sessions` into `registerUploadActionHandlers({ sessions, objects, providers })`.
+```
+
+### Invariants enforced (proven by integration tests)
+
+- **Workspace scoping.** Every read / mutate filters on `workspace_id`
+  (or scopes via the parent object for variants which have no workspace
+  column). No repo method allows a caller to read or mutate rows for
+  an unspecified workspace. Cross-workspace probes return `null` /
+  empty without leaking row existence.
+- **Atomic `createObjectWithSession`.** Both inserts run inside one
+  `db.transaction()`. A primary-key collision on the session insert
+  rolls back the object insert — verified by an integration test that
+  reuses a session id deliberately.
+- **Conditional transitions return `null` on race-loss.**
+  `markUploaded` / `markCompletedIfPending` / `markAbortedIfPending` /
+  `markExpiredIfPending` / `softDeleteForWorkspace` /
+  `updateAggregateStatus` all use parameterised `WHERE status = ...`
+  conditional updates and either return the updated row or `null`.
+- **`SELECT … FOR UPDATE SKIP LOCKED` for `claimNextQueuedJob`.**
+  Verified by a `Promise.all` test that issues two concurrent claims
+  against two queued rows and asserts the workers claim different ids.
+  The implementation runs inside one transaction so the row lock spans
+  the SELECT + UPDATE.
+- **`releaseClaimedJob` does NOT bump `attempts`.** Per the STORAGE-7
+  contract, a per-workspace-cap release is not a completed attempt.
+- **Soft-delete excluded from list responses.** STORAGE-6 invariant
+  carried into the repo: `listForWorkspace` filters `status <> 'deleted'`
+  at the SQL layer; the response builder filters again for defense in
+  depth. Soft-deleted rows remain visible to `findByIdForWorkspace`
+  (the delete handler's idempotent path needs them).
+- **No raw SQL with string interpolation.** Every parameter — including
+  the `workspaceAllowlist` for `claimNextQueuedJob` — passes through
+  Drizzle's parameterised tagged-template binding via `sql.join`. No
+  hand-built `'${id}'::uuid` paths.
+
+### Field-level row → DTO divergence (centralised in `mappers.ts`)
+
+| DB column | DTO field | Why |
+| --- | --- | --- |
+| `storage_object_variants.variant_kind` | `variantKey` | Storage contract historic naming |
+| `storage_object_variants.duration_ms` | (omitted) | Variant DTO does not expose duration today |
+| `storage_processing_jobs.job_kind` | `jobType` | STORAGE-7 uses closed `ProcessingJobType` enum |
+| `storage_processing_jobs.error_message` | (omitted) | Raw runner output never leaves the DB |
+| `storage_processing_jobs.{started_at, finished_at}` | `updatedAt` (derived) | DTO needs one timestamp |
+| `storage_usage_daily.operations_class_a` | `classAOperations` | STORAGE-6 DTO naming |
+| `storage_usage_daily.operations_class_b` | `classBOperations` | STORAGE-6 DTO naming |
+| `bigint` columns (`byte_size`, etc.) | `number` | DTO contract uses `number` |
+| (no column) | `StorageProcessingJobRecord.required` | Derived from `jobKind` table; see below |
+
+### The `required` flag (STORAGE-7)
+
+The canonical migration STORAGE-2 does NOT carry a `required boolean`
+column on `storage_processing_jobs`. The STORAGE-7 contract requires it,
+so the repo derives `required` from a fixed `jobKind` → `boolean` map
+that mirrors the planner exactly:
+
+| `jobKind` | `required` |
+| --- | --- |
+| `scan_validation` | `true` |
+| `video_probe` | `true` |
+| `image_optimize` | `false` |
+| `video_thumbnail` | `false` |
+| `video_transcode` | `false` |
+| `document_preview` | `false` |
+| (unknown) | `true` (fail-closed) |
+
+When a follow-up migration adds the column, delete the lookup table in
+`mappers.ts` and read `required` straight off the row.
+
+### Integration test contract
+
+Tests live in `tests/infra/db/repositories/` and run against a real
+Postgres instance. The default URL is the dev Supabase stack
+(`postgresql://postgres:postgres@127.0.0.1:5432/postgres`); override
+with `STORAGE_INTEGRATION_DB_URL` in CI. Tests skip cleanly when the DB
+is unreachable so a clean laptop (no Docker, no Supabase) still passes
+`bun test`. Each test seeds its own workspace + user + provider
+fixture and relies on the `ON DELETE CASCADE` on `workspace_id` to
+clean up every storage row tree on teardown.
+
+### Out of scope (deferred to later STORAGE-FU-N stories)
+
+- **`StorageProviderResolver` / `ExtendedStorageProviderResolver` Postgres
+  implementations.** That's STORAGE-FU-3 (provider resolver + secret
+  manager interface). STORAGE-FU-2 ships only repository implementations.
+- **Composition root wiring.** That's STORAGE-FU-4. STORAGE-FU-2 ships
+  the implementations; the wiring of `registerUploadActionHandlers` /
+  `registerObjectActionHandlers` / `ProcessingWorker.start()` /
+  `AbandonedUploadCleanup.start()` lands next.
+- **Production runners.** That's STORAGE-FU-5 (sharp / ffmpeg /
+  libreoffice / clamav).
+- **Adding a `payload jsonb` column on `storage_processing_jobs`.** The
+  STORAGE-7 contract allows an empty payload; runners receive the parent
+  object via `JobRunnerContext.object`. A future column lands when
+  payload-driven runners need persistence.
+- **Adding a `required boolean` column on `storage_processing_jobs`.**
+  Today the repo derives `required` from `jobKind`. Adding the column
+  removes the lookup table.
