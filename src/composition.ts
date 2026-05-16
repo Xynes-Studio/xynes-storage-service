@@ -2,7 +2,7 @@
  * STORAGE-FU-4 — composition root for `xynes-storage-service`.
  *
  * Responsibilities (per
- * `xynes-infra/docs/plans/2026-05-14-storage-register-handlers-and-drizzle-wiring.md`
+ * `xynes-infra/docs/plans/archive/2026-05-14-storage-register-handlers-and-drizzle-wiring.md`
  * §7):
  *
  *   1. Construct ONE `StorageDbClient` (STORAGE-FU-1) from `DATABASE_URL`.

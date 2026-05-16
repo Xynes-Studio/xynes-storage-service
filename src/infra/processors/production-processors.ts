@@ -19,7 +19,7 @@
  * Replacing each stub with the real adapter (sharp/libvips bound,
  * ffmpeg static binary, libreoffice headless sidecar) is a follow-up
  * infra story per
- * `xynes/xynes-infra/docs/plans/2026-05-14-storage-register-handlers-and-drizzle-wiring.md`
+ * `xynes/xynes-infra/docs/plans/archive/2026-05-14-storage-register-handlers-and-drizzle-wiring.md`
  * §8 STORAGE-FU-5 acceptance criteria. The follow-up will:
  *   1. Add `sharp` (or equivalent) as a runtime dependency.
  *   2. Wire ffmpeg via `ffmpeg-static` + `fluent-ffmpeg` OR a sidecar

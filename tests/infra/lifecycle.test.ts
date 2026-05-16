@@ -2,7 +2,7 @@
  * STORAGE-FU-6 — worker lifecycle wiring tests.
  *
  * These tests cover (per
- * `xynes-infra/docs/plans/2026-05-14-storage-register-handlers-and-drizzle-wiring.md`
+ * `xynes-infra/docs/plans/archive/2026-05-14-storage-register-handlers-and-drizzle-wiring.md`
  * §9):
  *
  *   1. Worker polling defaults (5 s) + override via
