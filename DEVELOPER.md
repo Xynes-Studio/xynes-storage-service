@@ -946,6 +946,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-3 | ✅ Landed 2026-05-15 (Provider resolver + secret-manager interface) |
 | STORAGE-FU-4 | ✅ Landed 2026-05-15 (Composition root — handler registration + ready event) |
 | STORAGE-FU-5 | ✅ Landed 2026-05-15 (Production runners — stub-mode default + S3 IO + variant writer + production-stub processors) |
+| STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
 
 ## Drizzle Schema Mirror (STORAGE-FU-1)
 
@@ -1598,3 +1599,162 @@ const runnerDeps = createRunnerDependencies({
   `worker.start()` — the polling loop is deliberately deferred.
 - **Live integration smoke against R2.** That's the live-rollout
   plan (`xynes/xynes-infra/docs/plans/2026-05-14-storage-live-provider-rollout.md`).
+
+## Worker Lifecycle (STORAGE-FU-6)
+
+STORAGE-FU-6 closes the gap between STORAGE-FU-4's constructed-but-not-started
+`ProcessingWorker` + `AbandonedUploadCleanup` instances and a production-ready
+service that polls for queued jobs + abandoned uploads on startup and shuts
+down cleanly on SIGTERM/SIGINT.
+
+### Source layout
+
+- `src/infra/lifecycle.ts` — the single owner of worker / cleanup polling
+  loop wiring + graceful shutdown.
+  - `startLifecycle(composition, options?)` — calls `worker.start(intervalMs)`
+    and `cleanup.start(intervalMs)`, registers SIGTERM + SIGINT handlers,
+    returns a `LifecycleHandle` with an idempotent `stop()`.
+  - `resolveLifecycleConfig(env)` — reads `STORAGE_WORKER_POLL_INTERVAL_MS`,
+    `STORAGE_CLEANUP_INTERVAL_MS`, and `STORAGE_SHUTDOWN_TIMEOUT_MS` via the
+    strict `parsePositiveIntMs` parser. Defaults: 5000 ms (worker), 60000 ms
+    (cleanup), 30000 ms (graceful shutdown). Negative / zero / NaN / blank /
+    float / overflow all fall back to defaults.
+  - `parsePositiveIntMs(raw, fallback)` — exported pure helper used by the
+    config resolver. Mirrored privately in `src/composition.ts` as
+    `parsePositiveInt` (returns `undefined` on miss so the spread-into-options
+    pattern at the worker constructor stays clean).
+  - `LIFECYCLE_SIGNALS = ['SIGTERM', 'SIGINT']` constant.
+  - `LifecycleHandle` shape: `{ config: ResolvedLifecycleConfig, stop(): Promise<void> }`.
+- `src/composition.ts` — gained `STORAGE_WORKER_MAX_CONCURRENT` and
+  `STORAGE_WORKER_MAX_PER_WORKSPACE` env reading. Defaults: 4 (global) and
+  2 (per-workspace) — match STORAGE-7's documented defaults.
+- `src/index.ts` — invokes `startLifecycle(composition)` AFTER
+  `buildComposition()` and BEFORE `buildApp(config)`, so SIGTERM/SIGINT
+  handlers are registered before the HTTP server begins accepting traffic.
+
+### Public API
+
+```typescript
+import { buildComposition } from "./composition";
+import { startLifecycle } from "./infra/lifecycle";
+
+const composition = buildComposition();
+const lifecycle = startLifecycle(composition);
+const app = buildApp(config);
+
+// Workers are now polling. SIGTERM/SIGINT will gracefully stop them.
+// To stop manually (e.g. in tests):
+await lifecycle.stop();
+```
+
+### Operational env knobs
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `STORAGE_WORKER_POLL_INTERVAL_MS` | `5000` | `ProcessingWorker` poll interval. |
+| `STORAGE_CLEANUP_INTERVAL_MS` | `60000` | `AbandonedUploadCleanup` poll interval. |
+| `STORAGE_SHUTDOWN_TIMEOUT_MS` | `30000` | Maximum time `composition.shutdown` may take before a `shutdown_timeout` log entry is emitted and the process exits anyway. |
+| `STORAGE_WORKER_MAX_CONCURRENT` | `4` | Global max concurrent processing jobs across all workspaces. |
+| `STORAGE_WORKER_MAX_PER_WORKSPACE` | `2` | Max concurrent processing jobs for a single workspace (prevents starvation). |
+
+All five use the same strict positive-int parser: integer ≥ 1, otherwise
+the default wins. A malformed env value (`""`, `"abc"`, `"-5"`, `"3.14"`,
+`"99999999999999999999"`) silently falls back — the service never boots
+with a 0-ms poll loop or a negative concurrency cap.
+
+These env knobs are deliberately NOT surfaced in the `storage.service.ready`
+log entry — they're operational tuning, not part of the action-key contract.
+The STORAGE-FU-4 ready-event allowlist (`{ ts, level, service, message, event,
+actionKeys, cleanupPollIntervalMs, processorMode }`) is preserved byte-for-byte.
+The new `storage.lifecycle.started` log entry has its own narrow allowlist:
+`{ event, workerPollIntervalMs, cleanupPollIntervalMs, gracefulShutdownTimeoutMs }`.
+
+### Security invariants
+
+- **Single-shot signal handlers via in-flight guard.** A second SIGTERM
+  while shutdown is in-flight resolves to the SAME promise as the first
+  via the `stopping: Promise<void> | null` field. `composition.shutdown` /
+  `worker.stop` / `cleanup.stop` are called exactly once even under signal
+  races. Handler listeners are deregistered after shutdown completes so
+  the process exits cleanly without a dangling listener.
+- **Idempotent `stop()`.** Calling `stop()` twice resolves cleanly the
+  second time without re-invoking `worker.stop()` / `cleanup.stop()` /
+  `composition.shutdown()`. Defense-in-depth against a SIGTERM + explicit
+  `stop()` race.
+- **Stop swallows worker errors.** A thrown `composition.worker.stop()`
+  or `composition.cleanup.stop()` is logged via the structured logger
+  (which routes through STORAGE-9's redaction) and swallowed — the other
+  component still stops, and `composition.shutdown` still runs. Mirrors
+  STORAGE-7's `ProcessingWorker.runOnce()` error-swallow contract.
+- **Shutdown-timeout race.** `composition.shutdown` is raced against
+  `STORAGE_SHUTDOWN_TIMEOUT_MS` so a hung Postgres close cannot block a
+  deploy indefinitely. On timeout, a `storage.lifecycle.shutdown_timeout`
+  log entry is emitted and the process still calls `onShutdownComplete(0)`
+  (best-effort exit).
+- **No env leakage into the ready log.** Worker concurrency caps + poll
+  intervals are NOT in the `storage.service.ready` payload — they're
+  operational knobs, not part of the action-key contract. The
+  STORAGE-FU-4 hostile-env regex sweep continues to pass byte-for-byte.
+- **Positive-int env parser.** Negative / zero / NaN / blank / float /
+  overflow all fall back to documented defaults — a malformed env can
+  NEVER produce a 0-ms poll loop or a negative timeout.
+
+### Test seams
+
+`startLifecycle` accepts optional injection points for tests:
+
+```typescript
+const lifecycle = startLifecycle(composition, {
+  env: { STORAGE_WORKER_POLL_INTERVAL_MS: "100" }, // override the env source
+  registerSignalHandler: fakeRegister,             // capture signals deterministically
+  removeSignalHandler: fakeUnregister,
+  onShutdownComplete: () => {},                    // suppress process.exit in tests
+  setTimeoutFn: fakeSetTimeout,                    // drive the timeout race deterministically
+  clearTimeoutFn: () => {},
+});
+```
+
+Production callers never need any of these — `startLifecycle(composition)`
+with no options is the canonical path.
+
+### Tests
+
+- `tests/infra/lifecycle.test.ts` — **31 tests across 5 describe blocks**,
+  all colocated in one new test file:
+  - **`parsePositiveIntMs`** (8 tests) — defaults, valid ints, blank /
+    NaN / negative / zero / float / overflow fallback, explicit override.
+  - **`resolveLifecycleConfig`** (5 tests) — defaults, explicit env
+    overrides, mixed valid/invalid, shutdown-timeout override, all three
+    keys resolved together.
+  - **`startLifecycle — start phase`** (6 tests) — worker.start +
+    cleanup.start invoked with the correct intervalMs, default intervals
+    when env is unset, SIGTERM + SIGINT registered exactly once each,
+    `lifecycle.started` log allowlist, worker.start throwing degrades
+    but service boots, cleanup.start throwing degrades but service boots.
+  - **`startLifecycle — shutdown phase`** (10 tests) — explicit stop
+    calls composition.shutdown; second stop is a no-op; SIGTERM dispatches
+    shutdown then exit(0); SIGINT path identical; second signal while
+    in-flight collapses to single shutdown; shutdown timeout fires when
+    composition.shutdown hangs; composition.shutdown throwing surfaces as
+    `shutdown_failed` log entry without leaking the raw error;
+    **worker.stop throwing is swallowed and logged as `worker.stop_failed`**;
+    **cleanup.stop throwing is swallowed and logged as `cleanup.stop_failed`**;
+    registerSignalHandler throwing degrades silently — explicit stop still works.
+  - **`buildComposition — worker concurrency env`** (2 tests) —
+    `STORAGE_WORKER_MAX_CONCURRENT` / `STORAGE_WORKER_MAX_PER_WORKSPACE`
+    forwarded to `ProcessingWorker` constructor without throwing; blank /
+    negative values fall through to STORAGE-7 defaults.
+
+### Out of scope (deferred)
+
+- **Hard SIGKILL on graceful-shutdown timeout.** STORAGE-FU-6 enforces a
+  30 s timeout via `Promise.race` and emits a `shutdown_timeout` log
+  entry; it does NOT call `process.kill(process.pid, 'SIGKILL')`.
+  STORAGE-7's `ProcessingWorker.stop()` and `AbandonedUploadCleanup.stop()`
+  already await the current `runOnce` to complete. The orchestrator
+  (Docker / Kubernetes) is responsible for SIGKILL on its own deadline
+  (typically 30 s).
+- **Distributed queue product migration** (pg-boss / SQS) — current
+  Postgres-polling worker is sufficient per STORAGE-7 §"Out of scope".
+- **Live integration smoke against the running storage stack.** That's
+  the successor plan (`xynes/xynes-infra/docs/plans/2026-05-14-storage-live-provider-rollout.md`).

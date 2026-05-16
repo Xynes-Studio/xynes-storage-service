@@ -104,6 +104,36 @@ export const REGISTERED_ACTION_KEYS = [
   STORAGE_PROCESS_RETRY_ACTION_KEY,
 ] as const;
 
+// Strict integer pre-check — same regex used by `parsePositiveIntMs`
+// in `src/infra/lifecycle.ts`. Keeps the two parsers in sync so envs
+// like `STORAGE_WORKER_MAX_CONCURRENT="1e3"` cannot silently become
+// `1` (Codex P2 review on PR #14).
+const STRICT_INT_PATTERN = /^-?\d+$/;
+
+/**
+ * Parse a positive-integer env value. Returns `undefined` when the
+ * value is missing / blank / non-numeric / non-finite / <= 0 so the
+ * caller can let the consumer's own default win (STORAGE-7 worker
+ * defaults: 4 global / 2 per-workspace).
+ *
+ * Mirrors the `parsePositiveIntMs` helper from `infra/lifecycle.ts`
+ * but returns `undefined` (not a fallback) so the spread-into-options
+ * pattern at the worker constructor stays clean.
+ *
+ * Strict integer semantics (rejects floats, scientific notation,
+ * trailing garbage, and unsafe integer overflow) — see
+ * `parsePositiveIntMs` for the same contract.
+ */
+function parsePositiveInt(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === '') return undefined;
+  if (!STRICT_INT_PATTERN.test(trimmed)) return undefined;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined;
+  return parsed;
+}
+
 export interface CompositionRoot {
   readonly db: StorageDbClient;
   readonly worker: ProcessingWorker;
@@ -252,11 +282,23 @@ export function buildComposition(options: BuildCompositionOptions = {}): Composi
   // STORAGE-FU-6 will call `worker.start()` / `cleanup.start()`. We
   // construct them here so the composition graph is complete and the
   // ready-event log accurately reflects what the service is wired to do.
+  //
+  // Concurrency caps are env-configurable per STORAGE-FU-6 acceptance
+  // criteria (`STORAGE_WORKER_MAX_CONCURRENT` / `STORAGE_WORKER_MAX_PER_WORKSPACE`).
+  // Missing / blank / non-positive values fall through to the
+  // `ProcessingWorker` defaults (4 global / 2 per-workspace) — matches
+  // STORAGE-7 §"Out of scope" posture.
+  const workerMaxConcurrent = parsePositiveInt(env.STORAGE_WORKER_MAX_CONCURRENT);
+  const workerMaxPerWorkspace = parsePositiveInt(env.STORAGE_WORKER_MAX_PER_WORKSPACE);
   const worker = new ProcessingWorker({
     queue: queueRepo,
     status: objectStatusRepo,
     findObject: (input) => extendedObjectRepo.findByIdForWorkspace(input),
     runners: resolvedRunners,
+    ...(workerMaxConcurrent !== undefined ? { maxConcurrent: workerMaxConcurrent } : {}),
+    ...(workerMaxPerWorkspace !== undefined
+      ? { maxConcurrentPerWorkspace: workerMaxPerWorkspace }
+      : {}),
   });
 
   const cleanup = new AbandonedUploadCleanup({
