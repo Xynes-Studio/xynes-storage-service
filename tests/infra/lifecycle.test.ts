@@ -178,6 +178,42 @@ describe('STORAGE-FU-6 parsePositiveIntMs', () => {
   test('trims whitespace before parsing', () => {
     expect(parsePositiveIntMs('  2500  ', 5000)).toBe(2500);
   });
+
+  // Codex P1 review on PR #14: strict integer semantics. The previous
+  // implementation used `Number.parseInt` which silently truncated
+  // floats, scientific notation, and trailing-garbage strings to
+  // tiny ints (e.g. `"1e3"` → 1, `"3.14"` → 3, `"5000ms"` → 5000).
+  // These regression guards lock in the strict-int contract documented
+  // in the docstring.
+  test('returns fallback for floats (Codex P1: prevents 3.14 → 3)', () => {
+    expect(parsePositiveIntMs('3.14', 5000)).toBe(5000);
+    expect(parsePositiveIntMs('1.99', 5000)).toBe(5000);
+    expect(parsePositiveIntMs('0.5', 5000)).toBe(5000);
+  });
+
+  test('returns fallback for scientific notation (Codex P1: prevents 1e3 → 1)', () => {
+    expect(parsePositiveIntMs('1e3', 5000)).toBe(5000);
+    expect(parsePositiveIntMs('2E5', 5000)).toBe(5000);
+  });
+
+  test('returns fallback for trailing garbage (Codex P1: prevents 5000ms → 5000)', () => {
+    expect(parsePositiveIntMs('5000ms', 5000)).toBe(5000);
+    expect(parsePositiveIntMs('60s', 5000)).toBe(5000);
+    expect(parsePositiveIntMs('100 ', 5000)).toBe(100); // trailing whitespace ONLY is allowed (trim)
+    expect(parsePositiveIntMs('123abc', 5000)).toBe(5000);
+  });
+
+  test('returns fallback for unsafe integer overflow', () => {
+    // Number.MAX_SAFE_INTEGER is 2^53 - 1 = 9007199254740991
+    expect(parsePositiveIntMs('99999999999999999999', 5000)).toBe(5000);
+    expect(parsePositiveIntMs('9999999999999999999', 5000)).toBe(5000);
+  });
+
+  test('returns fallback for embedded whitespace or signs', () => {
+    expect(parsePositiveIntMs('1 000', 5000)).toBe(5000);
+    expect(parsePositiveIntMs('+100', 5000)).toBe(5000);
+    expect(parsePositiveIntMs('--5', 5000)).toBe(5000);
+  });
 });
 
 // ── resolveLifecycleConfig ────────────────────────────────────────────────
@@ -761,5 +797,71 @@ describe('STORAGE-FU-6 buildComposition — worker concurrency env', () => {
         dbClient: client,
       }),
     ).not.toThrow();
+  });
+
+  // Codex P2 review on PR #14: strict integer semantics on worker caps.
+  // The previous parser used `Number.parseInt` which silently truncated
+  // floats / scientific notation / trailing-garbage strings into tiny
+  // ints (e.g. `STORAGE_WORKER_MAX_CONCURRENT="1e3"` would have become
+  // 1 instead of falling through to the STORAGE-7 default of 4). These
+  // tests inspect the constructed `ProcessingWorker`'s private fields
+  // via a TS cast to lock in the documented "invalid → default" contract.
+  test('rejects floats and scientific notation for worker caps (Codex P2)', () => {
+    const { client } = makeFakeDbClient();
+    const root = buildComposition({
+      env: {
+        DATABASE_URL: 'postgres://fake',
+        STORAGE_WORKER_MAX_CONCURRENT: '1e3', // would silently become 1 under the old parser
+        STORAGE_WORKER_MAX_PER_WORKSPACE: '3.14', // would silently become 3
+      },
+      secrets: FAKE_SECRETS,
+      dbClient: client,
+    });
+    const worker = root.worker as unknown as {
+      maxConcurrent: number;
+      maxPerWorkspace: number;
+    };
+    // Both fall through to the STORAGE-7 worker defaults (4 / 2), NOT
+    // the silently-truncated values (1 / 3).
+    expect(worker.maxConcurrent).toBe(4);
+    expect(worker.maxPerWorkspace).toBe(2);
+  });
+
+  test('rejects trailing-garbage strings for worker caps (Codex P2)', () => {
+    const { client } = makeFakeDbClient();
+    const root = buildComposition({
+      env: {
+        DATABASE_URL: 'postgres://fake',
+        STORAGE_WORKER_MAX_CONCURRENT: '8 workers',
+        STORAGE_WORKER_MAX_PER_WORKSPACE: '2x',
+      },
+      secrets: FAKE_SECRETS,
+      dbClient: client,
+    });
+    const worker = root.worker as unknown as {
+      maxConcurrent: number;
+      maxPerWorkspace: number;
+    };
+    expect(worker.maxConcurrent).toBe(4);
+    expect(worker.maxPerWorkspace).toBe(2);
+  });
+
+  test('accepts a clean integer override for worker caps', () => {
+    const { client } = makeFakeDbClient();
+    const root = buildComposition({
+      env: {
+        DATABASE_URL: 'postgres://fake',
+        STORAGE_WORKER_MAX_CONCURRENT: '8',
+        STORAGE_WORKER_MAX_PER_WORKSPACE: '4',
+      },
+      secrets: FAKE_SECRETS,
+      dbClient: client,
+    });
+    const worker = root.worker as unknown as {
+      maxConcurrent: number;
+      maxPerWorkspace: number;
+    };
+    expect(worker.maxConcurrent).toBe(8);
+    expect(worker.maxPerWorkspace).toBe(4);
   });
 });

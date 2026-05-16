@@ -104,6 +104,12 @@ export const REGISTERED_ACTION_KEYS = [
   STORAGE_PROCESS_RETRY_ACTION_KEY,
 ] as const;
 
+// Strict integer pre-check — same regex used by `parsePositiveIntMs`
+// in `src/infra/lifecycle.ts`. Keeps the two parsers in sync so envs
+// like `STORAGE_WORKER_MAX_CONCURRENT="1e3"` cannot silently become
+// `1` (Codex P2 review on PR #14).
+const STRICT_INT_PATTERN = /^-?\d+$/;
+
 /**
  * Parse a positive-integer env value. Returns `undefined` when the
  * value is missing / blank / non-numeric / non-finite / <= 0 so the
@@ -113,13 +119,18 @@ export const REGISTERED_ACTION_KEYS = [
  * Mirrors the `parsePositiveIntMs` helper from `infra/lifecycle.ts`
  * but returns `undefined` (not a fallback) so the spread-into-options
  * pattern at the worker constructor stays clean.
+ *
+ * Strict integer semantics (rejects floats, scientific notation,
+ * trailing garbage, and unsafe integer overflow) — see
+ * `parsePositiveIntMs` for the same contract.
  */
 function parsePositiveInt(raw: string | undefined): number | undefined {
   if (raw === undefined || raw === null) return undefined;
   const trimmed = raw.trim();
   if (trimmed === '') return undefined;
+  if (!STRICT_INT_PATTERN.test(trimmed)) return undefined;
   const parsed = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return undefined;
   return parsed;
 }
 

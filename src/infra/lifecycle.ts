@@ -94,18 +94,35 @@ export interface LifecycleHandle {
 
 // ── env parsing ───────────────────────────────────────────────────────────
 
+// Strict integer pre-check used by both `parsePositiveIntMs` (here) and
+// `parsePositiveInt` in `src/composition.ts`. We refuse anything that is
+// not a pure base-10 integer literal so malformed envs like `"3.14"`,
+// `"1e3"`, or `"5000ms"` cannot silently degrade poll intervals to
+// truncated tiny numbers (Codex P1 review on PR #14).
+const STRICT_INT_PATTERN = /^-?\d+$/;
+
 /**
  * Parse a positive-integer milliseconds env value. Returns `fallback`
  * when the value is missing, blank, non-numeric, non-finite, negative,
  * or zero — never throws so the bootstrap path stays predictable on
  * misconfigured envs.
+ *
+ * Strict integer semantics:
+ *   - rejects floats (`"3.14"` → fallback, NOT `3`)
+ *   - rejects scientific notation (`"1e3"` → fallback, NOT `1`)
+ *   - rejects trailing garbage (`"5000ms"` → fallback, NOT `5000`)
+ *   - rejects unsafe integer overflow (`"99999999999999999999"` → fallback)
+ *
+ * These tighter rules close the gap flagged by Codex on PR #14 where
+ * `Number.parseInt` silently truncated malformed envs.
  */
 export function parsePositiveIntMs(raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw === null) return fallback;
   const trimmed = raw.trim();
   if (trimmed === '') return fallback;
+  if (!STRICT_INT_PATTERN.test(trimmed)) return fallback;
   const parsed = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback;
   return parsed;
 }
 
