@@ -68,6 +68,18 @@ export class FakeStorageAdapter implements StorageProviderAdapter {
   public createDownloadUrlImpl?: (opts: CreateDownloadUrlOptions) => Promise<DownloadUrl>;
   public deleteObjectImpl?: (opts: DeleteObjectOptions) => Promise<void>;
 
+  // STORAGE-FU-5 — server-side I/O methods. Tests that exercise the
+  // runner pipeline through the real adapter contract may set the
+  // `*Impl` overrides; otherwise a deterministic empty/byte payload
+  // is returned so contract-level tests pass.
+  public getObjectBytesImpl?: (opts: { objectKey: string }) => Promise<Uint8Array>;
+  public putObjectBytesImpl?: (opts: {
+    objectKey: string;
+    body: Uint8Array;
+    contentType: string;
+    ifAbsent?: boolean;
+  }) => Promise<{ byteSize: number }>;
+
   constructor(providerKind: ProviderKind = 'r2') {
     this.providerKind = providerKind;
   }
@@ -135,6 +147,23 @@ export class FakeStorageAdapter implements StorageProviderAdapter {
   async deleteObject(opts: DeleteObjectOptions): Promise<void> {
     this.calls.push({ method: 'deleteObject', opts });
     if (this.deleteObjectImpl) return this.deleteObjectImpl(opts);
+  }
+
+  async getObjectBytes(opts: { objectKey: string }): Promise<Uint8Array> {
+    this.calls.push({ method: 'getObjectBytes', opts });
+    if (this.getObjectBytesImpl) return this.getObjectBytesImpl(opts);
+    return new Uint8Array();
+  }
+
+  async putObjectBytes(opts: {
+    objectKey: string;
+    body: Uint8Array;
+    contentType: string;
+    ifAbsent?: boolean;
+  }): Promise<{ byteSize: number }> {
+    this.calls.push({ method: 'putObjectBytes', opts });
+    if (this.putObjectBytesImpl) return this.putObjectBytesImpl(opts);
+    return { byteSize: opts.body.byteLength };
   }
 }
 

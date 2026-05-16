@@ -175,6 +175,24 @@ export interface DeleteObjectOptions {
   readonly objectKey: string;
 }
 
+/** STORAGE-FU-5: server-side read of object bytes. Used by runners. */
+export interface GetObjectBytesOptions {
+  readonly objectKey: string;
+}
+
+/** STORAGE-FU-5: server-side write of object bytes. Used by runners. */
+export interface PutObjectBytesOptions {
+  readonly objectKey: string;
+  readonly body: Uint8Array;
+  readonly contentType: string;
+  /** When true, the write MUST refuse if the key already exists. */
+  readonly ifAbsent?: boolean;
+}
+
+export interface PutObjectBytesResult {
+  readonly byteSize: number;
+}
+
 /**
  * Adapter contract. Every method takes named options so the interface
  * stays additive (new opts can be added without breaking callers).
@@ -196,4 +214,20 @@ export interface StorageProviderAdapter {
   headObject(opts: HeadObjectOptions): Promise<HeadObjectResult>;
   createDownloadUrl(opts: CreateDownloadUrlOptions): Promise<DownloadUrl>;
   deleteObject(opts: DeleteObjectOptions): Promise<void>;
+  /**
+   * STORAGE-FU-5: server-side object read for processing runners.
+   * Returns the raw bytes. Errors are wrapped as `ProviderAdapterError`
+   * with redacted detail (no signature parameters, no bucket name, no
+   * credential material).
+   */
+  getObjectBytes(opts: GetObjectBytesOptions): Promise<Uint8Array>;
+  /**
+   * STORAGE-FU-5: server-side object write for processing runners.
+   * Returns the byte count actually persisted. NEVER emits
+   * `x-amz-tagging` headers (STORAGE-4 portability invariant).
+   * When `ifAbsent: true`, the adapter SHOULD set the `If-None-Match: *`
+   * conditional header so providers that honour it (R2, AWS S3, B2)
+   * fail the request when the key already exists.
+   */
+  putObjectBytes(opts: PutObjectBytesOptions): Promise<PutObjectBytesResult>;
 }

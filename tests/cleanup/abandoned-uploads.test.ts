@@ -178,6 +178,18 @@ class FakeProviderAdapter implements StorageProviderAdapter {
   async deleteObject(_opts: DeleteObjectOptions): Promise<void> {
     throw new Error('not implemented');
   }
+  // STORAGE-FU-5 — server-side I/O. Cleanup tests don't exercise these.
+  async getObjectBytes(_opts: { objectKey: string }): Promise<Uint8Array> {
+    throw new Error('not implemented');
+  }
+  async putObjectBytes(_opts: {
+    objectKey: string;
+    body: Uint8Array;
+    contentType: string;
+    ifAbsent?: boolean;
+  }): Promise<{ byteSize: number }> {
+    throw new Error('not implemented');
+  }
 }
 
 class FakeProviderResolver implements StorageProviderResolver {

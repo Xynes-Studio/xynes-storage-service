@@ -50,6 +50,8 @@ async function ensureVideoAndReadBytes(input: {
     contentType: string;
     byteSize: number;
     providerObjectKey: string;
+    workspaceId: string;
+    providerId: string;
   };
 }): Promise<Uint8Array> {
   const { providerIO, object } = input;
@@ -60,7 +62,11 @@ async function ensureVideoAndReadBytes(input: {
     throw new RunnerInputError('OVER_MAX_BYTES');
   }
   try {
-    return await providerIO.readObject({ objectKey: object.providerObjectKey });
+    return await providerIO.readObject({
+      objectKey: object.providerObjectKey,
+      workspaceId: object.workspaceId,
+      providerId: object.providerId,
+    });
   } catch {
     throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });
   }
@@ -140,6 +146,8 @@ export function createVideoThumbnailRunner(deps: VideoThumbnailRunnerDependencie
           body: render.bytes,
           contentType: render.contentType,
           ifAbsent: true,
+          workspaceId: object.workspaceId,
+          providerId: object.providerId,
         });
       } catch {
         throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });
@@ -198,6 +206,8 @@ export function createVideoTranscodeRunner(deps: VideoTranscodeRunnerDependencie
           body: render.bytes,
           contentType: render.contentType,
           ifAbsent: true,
+          workspaceId: object.workspaceId,
+          providerId: object.providerId,
         });
       } catch {
         throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });

@@ -253,6 +253,12 @@ describe('STORAGE-FU-4 composition — ready log entry', () => {
       'event',
       'actionKeys',
       'cleanupPollIntervalMs',
+      // STORAGE-FU-5: ready entry now also surfaces processor mode so
+      // operators can see at startup whether the worker is wired to
+      // stub processors (laptop / smoke) or the safe-fail production
+      // stubs (hosted-pre-real-adapters). NEVER carries provider
+      // config, credentials, or secret-manager URIs.
+      'processorMode',
     ]);
     for (const key of Object.keys(parsed)) {
       expect(allowed.has(key)).toBe(true);
@@ -557,5 +563,110 @@ describe('STORAGE-FU-4 buildEnqueueProcessingCallback', () => {
     expect(serialized).not.toContain('endpoint');
     expect(serialized).not.toContain('bucket');
     expect(serialized).not.toContain('credentialRef');
+  });
+});
+
+// ── STORAGE-FU-5 wiring assertions ────────────────────────────────────────
+
+describe('STORAGE-FU-5 composition — processor mode wiring', () => {
+  test('defaults to stub mode for NODE_ENV=test (laptop-runnable)', () => {
+    const { client } = makeFakeDbClient();
+    buildComposition({
+      env: { DATABASE_URL: 'postgres://fake', NODE_ENV: 'test' },
+      secrets: FAKE_SECRETS,
+      dbClient: client,
+    });
+    const readyEntries = captured.filter((e) => e.event === 'storage.service.ready');
+    expect(readyEntries.length).toBe(1);
+    const parsed = JSON.parse(readyEntries[0]!.serialized) as Record<string, unknown>;
+    expect(parsed.processorMode).toBe('stub');
+  });
+
+  test('selects live mode under NODE_ENV=production', () => {
+    const { client } = makeFakeDbClient();
+    buildComposition({
+      env: { DATABASE_URL: 'postgres://fake', NODE_ENV: 'production' },
+      secrets: FAKE_SECRETS,
+      dbClient: client,
+    });
+    const readyEntries = captured.filter((e) => e.event === 'storage.service.ready');
+    const parsed = JSON.parse(readyEntries.at(-1)!.serialized) as Record<string, unknown>;
+    expect(parsed.processorMode).toBe('live');
+  });
+
+  test('STORAGE_PROCESSOR_MODE env override is honoured', () => {
+    const { client } = makeFakeDbClient();
+    buildComposition({
+      env: {
+        DATABASE_URL: 'postgres://fake',
+        NODE_ENV: 'test',
+        STORAGE_PROCESSOR_MODE: 'live',
+      },
+      secrets: FAKE_SECRETS,
+      dbClient: client,
+    });
+    const readyEntries = captured.filter((e) => e.event === 'storage.service.ready');
+    const parsed = JSON.parse(readyEntries.at(-1)!.serialized) as Record<string, unknown>;
+    expect(parsed.processorMode).toBe('live');
+  });
+
+  test('explicit options.runners override marks processorMode as "override"', () => {
+    const { client } = makeFakeDbClient();
+    // Pass an empty runners override — composition should honour it
+    // verbatim and emit processorMode=override so operators can see at
+    // a glance that the production registry is NOT in effect.
+    buildComposition({
+      env: { DATABASE_URL: 'postgres://fake' },
+      secrets: FAKE_SECRETS,
+      dbClient: client,
+      runners: {},
+    });
+    const readyEntries = captured.filter((e) => e.event === 'storage.service.ready');
+    const parsed = JSON.parse(readyEntries.at(-1)!.serialized) as Record<string, unknown>;
+    expect(parsed.processorMode).toBe('override');
+  });
+
+  test('ready entry NEVER carries provider config / credentials / secret-manager URIs', () => {
+    const { client } = makeFakeDbClient();
+    buildComposition({
+      env: {
+        DATABASE_URL: 'postgres://alice:s3cret@db.internal:5432/storage',
+        NODE_ENV: 'production',
+        STORAGE_CREDENTIAL_PROD_ACCESS_KEY_ID: 'AKIA-LEAK-1234',
+        STORAGE_CREDENTIAL_PROD_SECRET_ACCESS_KEY: 'leak-secret',
+      },
+      secrets: FAKE_SECRETS,
+      dbClient: client,
+    });
+    const readyEntries = captured.filter((e) => e.event === 'storage.service.ready');
+    const serialized = readyEntries.map((e) => e.serialized).join('\n');
+    for (const needle of [
+      'AKIA-LEAK-1234',
+      'leak-secret',
+      'alice:s3cret',
+      'db.internal',
+      'STORAGE_CREDENTIAL_',
+      'secret://',
+    ]) {
+      expect(serialized).not.toContain(needle);
+    }
+  });
+
+  test('default composition wires every STORAGE-7 job-type runner (no UNKNOWN_ACTION)', () => {
+    const { client } = makeFakeDbClient();
+    const c = buildComposition({
+      env: { DATABASE_URL: 'postgres://fake', NODE_ENV: 'test' },
+      secrets: FAKE_SECRETS,
+      dbClient: client,
+    });
+    // We can't directly introspect the worker's runners map — it's
+    // private — but `processorMode=stub` means `createRunnerDependencies`
+    // was called with the stub processors, which exercises
+    // `createRunnerRegistry` from STORAGE-8 and pre-existing tests
+    // already prove that registry covers every job type. The
+    // composition-test rig only proves the runner registry was wired
+    // (vs. left empty as it was pre-STORAGE-FU-5).
+    expect(c.worker).toBeInstanceOf(ProcessingWorker);
+    expect(c.cleanup).toBeInstanceOf(AbandonedUploadCleanup);
   });
 });

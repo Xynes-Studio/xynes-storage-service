@@ -73,7 +73,11 @@ export function createImageOptimizeRunner(deps: ImageOptimizeRunnerDependencies)
 
       let bytes: Uint8Array;
       try {
-        bytes = await deps.providerIO.readObject({ objectKey: object.providerObjectKey });
+        bytes = await deps.providerIO.readObject({
+          objectKey: object.providerObjectKey,
+          workspaceId: object.workspaceId,
+          providerId: object.providerId,
+        });
       } catch {
         throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });
       }
@@ -98,6 +102,7 @@ export function createImageOptimizeRunner(deps: ImageOptimizeRunnerDependencies)
           object: {
             id: object.id,
             workspaceId: object.workspaceId,
+            providerId: object.providerId,
             providerObjectKey: object.providerObjectKey,
           },
         });
@@ -112,7 +117,7 @@ async function renderAndRecordVariant(input: {
   deps: ImageOptimizeRunnerDependencies;
   bytes: Uint8Array;
   spec: ImageVariantSpec;
-  object: { id: string; workspaceId: string; providerObjectKey: string };
+  object: { id: string; workspaceId: string; providerId: string; providerObjectKey: string };
 }): Promise<void> {
   const { deps, bytes, spec, object } = input;
 
@@ -136,6 +141,8 @@ async function renderAndRecordVariant(input: {
       body: render.bytes,
       contentType: render.contentType,
       ifAbsent: true,
+      workspaceId: object.workspaceId,
+      providerId: object.providerId,
     });
   } catch {
     throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });

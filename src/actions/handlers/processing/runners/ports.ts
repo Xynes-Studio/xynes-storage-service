@@ -32,15 +32,38 @@ import type { ImageVariantSpec, VideoProfile, VariantRole } from './profiles';
  * Runners NEVER receive the raw `StorageProviderAdapter` — that would
  * give them access to signed-URL minting + multipart APIs they don't
  * need. The wiring layer narrows the adapter to this two-method port.
+ *
+ * STORAGE-FU-5: `workspaceId` and `providerId` are OPTIONAL routing hints
+ * carried per-call so a production S3-backed implementation can resolve
+ * the right workspace+provider adapter against the secret-managed
+ * credential. Test fakes that operate on an in-memory keyspace MAY
+ * ignore them. Production implementations that operate against a real
+ * provider MUST honour them — otherwise they cannot pick the correct
+ * `(endpoint, region, bucket, credentials)` tuple for a multi-workspace
+ * deployment.
  */
 export interface ProviderObjectIO {
-  readObject(input: { objectKey: string }): Promise<Uint8Array>;
+  readObject(input: {
+    objectKey: string;
+    /**
+     * STORAGE-FU-5: optional routing hint. Production impls resolve the
+     * workspace's provider here; fakes MAY ignore. NEVER carries the
+     * raw credential.
+     */
+    workspaceId?: string;
+    /** STORAGE-FU-5: optional routing hint. See `workspaceId`. */
+    providerId?: string;
+  }): Promise<Uint8Array>;
   writeObject(input: {
     objectKey: string;
     body: Uint8Array;
     contentType: string;
     /** When true the writer MUST refuse if a row already exists. */
     ifAbsent?: boolean;
+    /** STORAGE-FU-5: optional routing hint. See `readObject`. */
+    workspaceId?: string;
+    /** STORAGE-FU-5: optional routing hint. See `readObject`. */
+    providerId?: string;
   }): Promise<{ byteSize: number }>;
 }
 
