@@ -14,6 +14,14 @@
  *     `workspaceId`. A mismatch surfaces as a generic "Parent object
  *     not found" error so cross-workspace probes cannot be used as an
  *     existence oracle.
+ *   - Soft-deleted parents are invisible (PR #13 Codex P2 fix). A job
+ *     that started before the parent was soft-deleted can race past
+ *     the worker's pre-execution object check; we re-check
+ *     `status <> 'deleted'` here so deleted objects cannot accumulate
+ *     fresh variant rows after the fact. The SAME `VARIANT_WRITER_PARENT_NOT_FOUND_MESSAGE`
+ *     surfaces for both "doesn't exist" and "soft-deleted" — preserves
+ *     the STORAGE-6 "deleted is indistinguishable from never-existed"
+ *     invariant.
  *   - INSERT runs `status='ready'` + stamps `ready_at = now()`. Runners
  *     only invoke `recordVariant` AFTER the bytes are committed at the
  *     provider, so a `ready` row is correct.
@@ -24,7 +32,7 @@
  *     `PROCESSOR_FAILED` (retryable). The worker's dedup at job-claim
  *     time means this only fires on a true race.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, ne } from 'drizzle-orm';
 import type { StorageDb } from '../db/client';
 import { storageObjectVariants, storageObjects } from '../db/schema';
 import type {
@@ -46,13 +54,19 @@ export class PostgresStorageVariantWriter implements StorageVariantWriter {
   async recordVariant(input: VariantRecord): Promise<void> {
     const { db } = this.deps;
 
-    // 1) Workspace ownership + collision check. One SELECT for both
-    //    invariants — the parent must (a) exist within the requested
-    //    workspace and (b) have a `providerObjectKey` distinct from
-    //    the variant's. We deliberately use the parent's recorded key
-    //    rather than re-deriving it; the runner has already written
-    //    bytes at `input.providerObjectKey`, and we want to be sure
-    //    that key isn't shadowing the original.
+    // 1) Workspace ownership + soft-delete + collision check. ONE SELECT
+    //    that filters on `id` + `workspace_id` + `status <> 'deleted'`
+    //    so:
+    //    (a) parent must exist within the requested workspace,
+    //    (b) parent must NOT be soft-deleted (PR #13 Codex P2 — a job
+    //        that started before deletion can race past the worker's
+    //        pre-execution object check; this is the second line of
+    //        defence), and
+    //    (c) the parent's recorded `providerObjectKey` must differ
+    //        from the variant's (original-protection).
+    //    The SAME `VARIANT_WRITER_PARENT_NOT_FOUND_MESSAGE` surfaces
+    //    for both (a) and (b) — preserves the STORAGE-6 "deleted is
+    //    indistinguishable from never-existed" invariant.
     const parents = await db
       .select({
         providerObjectKey: storageObjects.providerObjectKey,
@@ -62,6 +76,7 @@ export class PostgresStorageVariantWriter implements StorageVariantWriter {
         and(
           eq(storageObjects.id, input.objectId),
           eq(storageObjects.workspaceId, input.workspaceId),
+          ne(storageObjects.status, 'deleted'),
         ),
       )
       .limit(1);

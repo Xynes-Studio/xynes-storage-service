@@ -413,8 +413,15 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
       Bucket: this.bucket,
       Key: opts.objectKey,
     });
-    const response = await runWithRedactedError(() => this.client.send(command));
-    return readSdkStreamAsBytes(response.Body);
+    // PR #13 Codex P2: wrap BOTH the SDK send AND the stream-read inside
+    // `runWithRedactedError`. The body consumer can throw with raw
+    // SDK / network / TLS detail attached; without this wrap those
+    // details would escape the `ProviderAdapterError` redaction surface
+    // and break callers that expect the adapter's closed error shape.
+    return runWithRedactedError(async () => {
+      const response = await this.client.send(command);
+      return readSdkStreamAsBytes(response.Body);
+    });
   }
 
   async putObjectBytes(opts: PutObjectBytesOptions): Promise<PutObjectBytesResult> {

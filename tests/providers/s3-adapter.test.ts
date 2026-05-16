@@ -615,6 +615,60 @@ describe('S3StorageProviderAdapter — STORAGE-FU-5 getObjectBytes', () => {
       expect((err as Error).message).not.toContain('AKIA-LEAK-9999');
     }
   });
+
+  test('PR #13 Codex P2: stream-read failure is wrapped + redacted via runWithRedactedError', async () => {
+    // The SDK `send()` succeeds but the body consumer (transformToByteArray)
+    // throws. Pre-fix this raw error would have escaped the
+    // ProviderAdapterError redaction surface; post-fix it gets wrapped.
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        Body: {
+          transformToByteArray: async () => {
+            throw Object.assign(
+              new Error(
+                'TLS read failure: AKIA-STREAM-LEAK 0xDEADBEEF X-Amz-Signature=leakedsig123',
+              ),
+              { name: 'StreamReadFailure' },
+            );
+          },
+        },
+      },
+    });
+    try {
+      await adapter.getObjectBytes({ objectKey: 'a.bin' });
+      throw new Error('expected adapter to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProviderAdapterError);
+      expect((err as ProviderAdapterError).code).toBe('PROVIDER_OPERATION_FAILED');
+      const msg = (err as Error).message;
+      // Raw SDK / network detail must NEVER bleed through.
+      expect(msg).not.toContain('AKIA-STREAM-LEAK');
+      expect(msg).not.toContain('0xDEADBEEF');
+      expect(msg).not.toContain('X-Amz-Signature');
+      expect(msg).not.toContain('leakedsig123');
+      expect(msg).not.toContain('TLS read failure');
+    }
+  });
+
+  test('PR #13 Codex P2: arrayBuffer() failure is also wrapped + redacted', async () => {
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        Body: {
+          arrayBuffer: async () => {
+            throw new Error('socket reset by peer s3.fake.example/secret-bucket-name');
+          },
+        },
+      },
+    });
+    try {
+      await adapter.getObjectBytes({ objectKey: 'a.bin' });
+      throw new Error('expected adapter to throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProviderAdapterError);
+      expect((err as Error).message).not.toContain('secret-bucket-name');
+      expect((err as Error).message).not.toContain('s3.fake.example');
+    }
+  });
 });
 
 describe('S3StorageProviderAdapter — STORAGE-FU-5 putObjectBytes', () => {

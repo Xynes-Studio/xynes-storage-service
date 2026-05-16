@@ -311,6 +311,110 @@ describeIf('PostgresStorageVariantWriter — idempotency', () => {
   });
 });
 
+describeIf('PostgresStorageVariantWriter — soft-delete race (PR #13 Codex P2)', () => {
+  test('refuses to record a variant when the parent is soft-deleted (status=deleted)', async () => {
+    if (!conn) return;
+    const ws = await seedWorkspaceFixture(conn.db);
+    try {
+      const objectId = crypto.randomUUID();
+      // Schema constraint `storage_objects_deleted_consistency` requires
+      // `deleted_at IS NOT NULL` when `status='deleted'`.
+      await conn.db.execute(sql`
+        INSERT INTO platform.storage_objects
+          (id, workspace_id, provider_id, provider_object_key, filename,
+           content_type, byte_size, status, deleted_at, purpose, visibility, created_at, updated_at)
+        VALUES (
+          ${objectId}, ${ws.workspaceId}, ${ws.providerId},
+          'workspaces/ws/objects/obj/original.jpg', 'original.jpg',
+          'image/jpeg', 1024, 'deleted', now(), 'cms_media', 'private', now(), now()
+        )
+      `);
+
+      const writer = new PostgresStorageVariantWriter({ db: conn.db });
+      await expect(
+        writer.recordVariant({
+          objectId,
+          workspaceId: ws.workspaceId,
+          role: 'thumbnail_small',
+          providerObjectKey: 'workspaces/ws/objects/obj/variants/thumbnail_small.webp',
+          contentType: 'image/webp',
+          byteSize: 4096,
+        }),
+      ).rejects.toThrow(VARIANT_WRITER_PARENT_NOT_FOUND_MESSAGE);
+      // Nothing was inserted — the variant row count for the soft-deleted
+      // parent stays at zero.
+      const rows = await conn.db
+        .select()
+        .from(storageObjectVariants)
+        .where(eq(storageObjectVariants.objectId, objectId));
+      expect(rows.length).toBe(0);
+    } finally {
+      await ws.cleanup();
+    }
+  });
+
+  test('records the variant before deletion, refuses after deletion (race timeline)', async () => {
+    if (!conn) return;
+    const ws = await seedWorkspaceFixture(conn.db);
+    try {
+      const objectId = crypto.randomUUID();
+      await conn.db.execute(sql`
+        INSERT INTO platform.storage_objects
+          (id, workspace_id, provider_id, provider_object_key, filename,
+           content_type, byte_size, status, purpose, visibility, created_at, updated_at)
+        VALUES (
+          ${objectId}, ${ws.workspaceId}, ${ws.providerId},
+          'workspaces/ws/objects/obj/original.jpg', 'original.jpg',
+          'image/jpeg', 1024, 'uploaded', 'cms_media', 'private', now(), now()
+        )
+      `);
+      const writer = new PostgresStorageVariantWriter({ db: conn.db });
+
+      // Pre-deletion: write succeeds.
+      await writer.recordVariant({
+        objectId,
+        workspaceId: ws.workspaceId,
+        role: 'thumbnail_small',
+        providerObjectKey: 'workspaces/ws/objects/obj/variants/thumbnail_small.webp',
+        contentType: 'image/webp',
+        byteSize: 4096,
+      });
+
+      // Soft-delete the parent (simulates a worker-running-during-deletion race).
+      await conn.db.execute(sql`
+        UPDATE platform.storage_objects
+        SET status = 'deleted', deleted_at = now()
+        WHERE id = ${objectId}
+      `);
+
+      // Post-deletion: subsequent variant write refused.
+      await expect(
+        writer.recordVariant({
+          objectId,
+          workspaceId: ws.workspaceId,
+          role: 'preview_medium',
+          providerObjectKey: 'workspaces/ws/objects/obj/variants/preview_medium.webp',
+          contentType: 'image/webp',
+          byteSize: 8192,
+        }),
+      ).rejects.toThrow(VARIANT_WRITER_PARENT_NOT_FOUND_MESSAGE);
+
+      // The pre-deletion variant still exists (we don't retroactively
+      // delete those — the `ON DELETE CASCADE` on a hard delete would
+      // handle that, and the soft-delete preserves history per the
+      // STORAGE-2 schema).
+      const rows = await conn.db
+        .select()
+        .from(storageObjectVariants)
+        .where(eq(storageObjectVariants.objectId, objectId));
+      expect(rows.length).toBe(1);
+      expect(rows[0]!.variantKind).toBe('thumbnail_small');
+    } finally {
+      await ws.cleanup();
+    }
+  });
+});
+
 if (!conn) {
   // Loud skip so a CI misconfiguration doesn't silently hide coverage.
   // eslint-disable-next-line no-console
