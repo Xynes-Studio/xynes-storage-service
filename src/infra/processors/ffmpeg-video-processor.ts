@@ -94,6 +94,7 @@ import {
   MAX_VIDEO_DURATION_SECONDS,
   type VideoProfile,
 } from '../../actions/handlers/processing/runners/profiles';
+import { createRequire } from 'node:module';
 
 /**
  * Default process-level timeout. Five minutes is enough for a
@@ -156,12 +157,11 @@ export interface FfmpegVideoProcessorDeps {
  * `runner-dependencies.ts` can fall back to the production stub.
  */
 function resolveDefaultFfmpegPath(): string {
-  // Inlined require — see security invariant in runner-dependencies
-  // around `createRequire` for sharp. Same posture here.
-  // We import dynamically so the module isn't pulled in during stub
-  // mode (which has no need for ffmpeg).
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { createRequire } = require('node:module') as typeof import('node:module');
+  // We defer the actual `require()` to runtime via `createRequire`
+  // so the `ffmpeg-static` module isn't pulled in during stub mode
+  // (which has no need for ffmpeg). `createRequire` itself is a
+  // statically-imported ES symbol from `node:module` (see the top
+  // of the file) so there's no runtime `require()` syntax here.
   const requireFn = createRequire(import.meta.url);
   const mod = requireFn('ffmpeg-static') as { default?: string | null } | string | null;
   // The CJS export shape varies between bundlers: it can be either
