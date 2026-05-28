@@ -948,6 +948,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-4 | ✅ Landed 2026-05-15 (Composition root — handler registration + ready event) |
 | STORAGE-FU-5 | ✅ Landed 2026-05-15 (Production runners — stub-mode default + S3 IO + variant writer + production-stub processors) |
 | STORAGE-FU-5-FU-A | ✅ Landed 2026-05-28 (Sharp-backed `ImageProcessor` — closes Bug 1 for image variants; EXIF stripping mandatory; libvips cache disabled) |
+| STORAGE-FU-5-FU-B | ✅ Landed 2026-05-28 (ffmpeg-backed `VideoProcessor` — closes Bug 1 for video variants; `-map_metadata -1` strips embedded metadata; pipe-only I/O with no temp files; `STORAGE_FFMPEG_TIMEOUT_MS` per-job timeout; in-process Bun.spawn against `ffmpeg-static`) |
 | STORAGE-FU-5-FU-E | ✅ Landed 2026-05-28 (Deployment posture decision — sharp + ffmpeg in-process, LibreOffice + clamav sidecars; Compose overlay + K8s draft manifests) |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
 | DEDUP-1 | ✅ Landed 2026-05-28 (Content-hash dedup schema — `platform.storage_object_references` reference-counting join table + workspace-scoped partial unique index on `storage_objects (workspace_id, sha256)`) |
@@ -1630,7 +1631,7 @@ artefact OR the production-stub `PROCESSOR_FAILED` envelope. Closes
 | File | Role |
 |---|---|
 | `src/infra/processors/sharp-image-processor.ts` | `SharpImageProcessor` — sharp/libvips-backed `ImageProcessor` implementing STORAGE-8's port. |
-| `src/infra/processors/runner-dependencies.ts` | Extended: `buildLiveImageProcessor()` constructs `SharpImageProcessor` in live mode, falls back to the safe-fail stub with a single startup WARN if construction throws. |
+| `src/infra/processors/runner-dependencies.ts` | Extended: `buildLiveImageProcessor()` constructs `SharpImageProcessor` in live mode, falls back to the safe-fail stub with a single startup WARN if the loader throws. Honours `STORAGE_FFMPEG_TIMEOUT_MS` env. |
 | `package.json` | Adds `sharp@^0.34.5` as a runtime dependency. |
 
 ### Security invariants (asserted by tests)
@@ -1696,6 +1697,152 @@ only the image leg is affected. WARN message carries NO library hint
   fixture-based integration suite).
 - Animated GIF / WebP (single-frame only in MVP).
 - CMYK / wide-gamut output (sRGB only in MVP).
+- Live integration smoke against R2 (live-rollout plan).
+
+## ffmpeg-backed Video Processor (STORAGE-FU-5-FU-B)
+
+STORAGE-FU-5-FU-B closes the gap between STORAGE-FU-5's safe-fail
+`ProductionVideoProcessorStub` (which throws `UNSUPPORTED_FORMAT` on
+every call) and a real video processor backed by `ffmpeg-static`
+invoked via `Bun.spawn`. After this story, `video_probe` /
+`video_thumbnail` / `video_transcode` jobs in live mode produce real
+re-encoded bytes (poster JPEG > 1 KiB, H.264/AAC MP4 > 1 KiB) instead
+of the 24-byte `ftypisom` stub artefact OR the production-stub
+`PROCESSOR_FAILED` envelope. Closes **Bug 1 (video variants)** from
+the `2026-05-27-storage-followups-combined.md` plan.
+
+### Source
+
+| File | Role |
+|---|---|
+| `src/infra/processors/ffmpeg-video-processor.ts` | `FfmpegVideoProcessor` — `ffmpeg-static`-backed `VideoProcessor` implementing STORAGE-8's port. |
+| `src/infra/processors/runner-dependencies.ts` | Extended: `buildLiveVideoProcessor(env)` constructs `FfmpegVideoProcessor` in live mode, falls back to the safe-fail stub with a single startup WARN if the loader throws. Honours `STORAGE_FFMPEG_TIMEOUT_MS` env. |
+| `package.json` | Adds `ffmpeg-static@^5.3.0` as a runtime dependency. |
+
+### Env contract
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STORAGE_FFMPEG_TIMEOUT_MS` | `300000` (5 min) | Per-invocation hard timeout. ffmpeg processes that exceed this are killed; the runner sees a retryable `PROCESSOR_FAILED`. Must be a positive integer; malformed values fall back to the default. |
+| `FFMPEG_BIN` | (unset) | Optional override for the ffmpeg binary path consumed by `ffmpeg-static`'s own loader. Use only when the bundled binary is unavailable. |
+
+### Security invariants (asserted by tests)
+
+1. **Embedded metadata stripping is MANDATORY.** Every poster +
+   transcode argv carries `-map_metadata -1`. Asserted at the
+   argv-builder level (cheap, deterministic) AND end-to-end against
+   a real ffmpeg run by embedding a `comment=STORAGE_FU_5_FU_B_CANARY`
+   field in the source MP4 and asserting the canary substring does
+   NOT survive into the transcode output bytes.
+2. **No filesystem temp files.** ffmpeg reads from `pipe:0` (stdin)
+   and writes to `pipe:1` (stdout). The processor never reaches for
+   `os.tmpdir()` so a crash mid-encode cannot leak partial bytes.
+   Asserted at the argv-builder level by scanning for `/tmp` / `/var`
+   / `/private` path references.
+3. **ffmpeg arguments are NEVER user-controlled.** Argv is built from
+   the closed-set `VideoProfile` + fixed flags. `Bun.spawn` is invoked
+   with an array (never via shell), so even if a hostile string slipped
+   past the type system into a numeric profile field, the OS would
+   interpret it as a single argv token, not a shell metacharacter.
+   Asserted by regex sweep for `;` / `|` / `&` / `` ` `` / `$(` / `<`
+   / `>` in every argv element.
+4. **Defense-in-depth hard cap re-validation.** STORAGE-8 video
+   runners ALSO check `MAX_VIDEO_DIMENSION` (4k) +
+   `MAX_VIDEO_DURATION_SECONDS` (1 h). The processor re-validates
+   inside `probe()` so a future direct caller can't bypass.
+   `OVER_MAX_DIMENSIONS` / `OVER_MAX_DURATION` are non-retryable.
+5. **Process timeout enforced.** A runaway ffmpeg invocation is killed
+   after `STORAGE_FFMPEG_TIMEOUT_MS` (default 5 min) via
+   `proc.kill()`. The killed process surfaces as a retryable
+   `PROCESSOR_FAILED` — the worker will retry up to `maxAttempts`
+   then dead-letter.
+6. **Closed-set runner errors only.** ffmpeg stderr text is NEVER
+   surfaced. Library / SDK error text NEVER leaks through
+   `RunnerInputError.message` / `RunnerExecutionError.message`.
+   Decode-time failures map to
+   `RunnerInputError('UNSUPPORTED_FORMAT')` (non-retryable);
+   render-time failures map to
+   `RunnerExecutionError('PROCESSOR_FAILED', retryable: true)`.
+7. **Bytes copied on return.** `renderPoster` / `renderTranscode`
+   return a fresh `Uint8Array` — callers never observe the
+   underlying `ArrayBuffer` that the Bun stdout reader owned.
+
+### Codec posture (MVP closed set)
+
+- **Video codec:** H.264 (`libx264`, preset `medium`). Bitrate driven
+  by `VideoProfile.targetBitrateKbps`. `pix_fmt yuv420p` for broadest
+  player compatibility.
+- **Audio codec:** AAC LC at 128 kbps fixed default.
+- **Container:** fragmented MP4 (`-movflags +frag_keyframe+empty_moov`)
+  so the muxer can write to a non-seekable `pipe:1` without rewriting
+  the `moov` atom. Players + browsers handle fMP4 transparently;
+  CDNs cache the bytes byte-for-byte.
+
+AV1 / WebM / HLS / DASH / hardware-accelerated encoding (NVENC /
+VideoToolbox) and multi-resolution ladders are deferred per
+STORAGE-8 "out of scope".
+
+### stderr parser
+
+ffmpeg's `-i pipe:0 -f null -` invocation prints input metadata to
+stderr in a stable, line-oriented format. `parseFfmpegProbe(stderr)`
+returns a `ParsedProbe` object with:
+
+| Field | Source |
+|---|---|
+| `durationSeconds` | `Duration: HH:MM:SS.cc` line |
+| `width` / `height` | First `Stream #N:M ... Video: ... WIDTHxHEIGHT` line |
+| `container` | First token of `Input #0, <container>, from` |
+| `videoCodec` / `audioCodec` | First Video / Audio stream codec name |
+| `rotationDegrees` | `displaymatrix: rotation of N` (newer) or `rotate: N` (legacy) |
+
+Every field is optional. Malformed lines are skipped without
+throwing. Adversarial input (`\x00\x01\x02`, 100k chars, etc.) is
+asserted not to throw. A buffer that yields no video stream surfaces
+as `UNSUPPORTED_FORMAT` at `probe()`.
+
+### Live-mode fallback posture
+
+`buildLiveVideoProcessor(env)` tries to construct `new FfmpegVideoProcessor(deps)`.
+On success, returns it. On failure (missing ffmpeg-static binary,
+unsupported platform/arch tuple, ESM/CJS interop hiccup), logs ONE
+`WARN` line at startup and returns `ProductionVideoProcessorStub` —
+every `video_*` job dead-letters with `PROCESSOR_FAILED` after
+`maxAttempts`. The worker keeps running; only the video leg is
+affected. WARN message carries NO library hint (STORAGE-9 redaction
+posture).
+
+### Tests
+
+- **`tests/infra/processors/ffmpeg-video-processor.test.ts`** (NEW,
+  55 unit + 1 integration test, 247 expects) — parser happy paths
+  (HEALTHY_STDERR, ROTATED_STDERR, ROTATED_LEGACY_STDERR,
+  OVER_CAP_STDERR, OVER_DURATION_STDERR, NO_VIDEO_STREAM_STDERR) +
+  parser malformed inputs / argv builders (probe + poster +
+  transcode) / processor probe + renderPoster + renderTranscode
+  via injected spawner fakes / spawner contract (timeout, exit code,
+  stdin forwarding, argv kind) / `resolveDefaultFfmpegPath` /
+  **Bug 1 integration guard against real ffmpeg** (probe + poster +
+  transcode against an in-memory MP4 with embedded canary metadata).
+- **`tests/infra/processors/runner-dependencies.test.ts`** (+1 Bug 1
+  regression guard "live video variants are real bytes" + 6 env-helper
+  tests + 2 fallback-posture tests) — wires `video_thumbnail` +
+  `video_transcode` runners against an in-memory MP4, captures
+  variant writes, asserts each variant > 1024 bytes;
+  `resolveFfmpegTimeoutMs` env parser; `buildLiveVideoProcessor`
+  single-WARN fallback latch.
+
+### Out of scope (deferred)
+
+- HLS / DASH adaptive streaming output.
+- Multi-resolution ladder per profile.
+- Hardware-accelerated encoding (NVENC / VideoToolbox).
+- Re-probing the transcode output for canonical duration (the
+  caller — `video_transcode` runner — does not consult
+  `VideoTranscodeRender.durationSeconds`; we report `0` as the
+  honest "unknown" signal rather than fabricating a number).
+- ffprobe-based JSON probe (we use `ffmpeg -i ... -f null -` stderr
+  scraping because `ffmpeg-static` doesn't bundle ffprobe).
 - Live integration smoke against R2 (live-rollout plan).
 
 ## Worker Lifecycle (STORAGE-FU-6)
