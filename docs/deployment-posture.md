@@ -84,12 +84,14 @@ Both processors process bytes **in memory only** — no filesystem temp files re
 
 ### LibreOffice sidecar — `libreoffice-sidecar`
 
-A long-lived `soffice` process in headless mode behind a thin Bun HTTP shim that accepts `POST /convert { sourceContentType, bytes }` and returns the PNG/JPEG preview. Per-request `soffice` startup avoided by keeping the JRE warm (LibreOffice's `--accept` socket protocol is sufficient; no custom shim needed for MVP — see §5 for the compose definition).
+A long-lived `soffice` process in headless mode behind a thin Bun HTTP shim that accepts `POST /convert { sourceContentType, bytes }` and returns the PNG/JPEG preview. Per-request `soffice` startup is avoided by keeping the JRE warm via LibreOffice's `--accept` socket protocol.
 
-- **macros disabled** via `--disable-macros` and `--norestore` launch flags (STORAGE-9 §3.6 invariant).
+> **⚠️ Implementation status (FU-E vs FU-C).** FU-E (this story) commits to the **sidecar topology + env contract + security posture** only. The Bun HTTP shim that actually serves `POST /convert` + `GET /health` on TCP `8100` is **owned by FU-C** (`STORAGE-FU-5-FU-C — LibreOffice-backed DocumentProcessor`). The canonical Compose overlay at `xynes/xynes-infra/infra/compose/storage-live-processors.yml` pins the placeholder image `lscr.io/linuxserver/libreoffice:7.6.7` for dev/QA convenience, but that image ships a desktop GUI on ports 3000/3001 — it does NOT serve the `/convert` HTTP API documented in §4. The compose overlay's own inline comment calls this out and FU-C will replace the placeholder image with a custom slim image that runs `soffice --headless --accept` plus the Bun shim. Until FU-C lands, an operator who flips `STORAGE_PROCESSOR_MODE=live` will see `document_preview` jobs dead-letter via `PROCESSOR_FAILED` (the safe-fail behaviour documented in §4) — the document-preview leg of Bug 1 stays open until FU-C closes it.
+
+- **macros disabled** via `SAL_DISABLE_MACROS=1` set on the sidecar container env (canonical compose overlay line 50; K8s deployment manifest line 41). This is LibreOffice's documented globally-enforced environment switch — `--disable-macros` is NOT a real CLI flag in the official parameter list (see [LibreOffice start parameters](https://help.libreoffice.org/latest/en-US/text/shared/guide/start_parameters.html)). Macro RCE surface against malicious documents is closed at the container env level, not via a per-request CLI flag. STORAGE-9 §3.6 invariant.
 - **temp directory cleanup** runs `finally` per request; the sidecar's own temp dir is `tmpfs`-mounted so a crash leaves no on-disk residue.
 - **timeout** per request (default 60 s) via `STORAGE_SOFFICE_TIMEOUT_MS`.
-- **discovery** — storage-service reaches the sidecar via `LIBREOFFICE_SERVICE_URL=http://libreoffice-sidecar:8100`.
+- **discovery** — storage-service reaches the sidecar via `LIBREOFFICE_SERVICE_URL=http://libreoffice-sidecar:8100` (the shim's listen port, once FU-C lands).
 
 ### clamav sidecars — `clamav-clamd` + `clamav-freshclam`
 
@@ -231,13 +233,17 @@ For both `libreoffice-sidecar` and `clamav-clamd`:
 
 ### LibreOffice macro execution
 
-LibreOffice's macro engine is a known RCE attack surface against malicious document inputs. The sidecar launches `soffice` with `--disable-macros` and `--norestore`:
+LibreOffice's macro engine is a known RCE attack surface against malicious document inputs. **Macros are disabled at the container env level**, NOT via a CLI flag — `--disable-macros` is NOT part of LibreOffice's [official start-parameters list](https://help.libreoffice.org/latest/en-US/text/shared/guide/start_parameters.html), so relying on it would be a silent no-op and would violate this invariant.
+
+The sidecar sets `SAL_DISABLE_MACROS=1` in the container environment (canonical compose overlay line 50; K8s deployment manifest line 41), which LibreOffice honours globally for all `soffice` invocations within the container. This is **enforced at container startup**, not per-request, so a hostile document cannot bypass it. The actual `soffice` invocation inside the sidecar takes the standard supported flags only:
 
 ```
-soffice --headless --disable-macros --norestore --convert-to png:writer_png_Export --outdir /tmp/<uuid>/ /tmp/<uuid>/input
+soffice --headless --norestore --convert-to png:writer_png_Export --outdir /tmp/<uuid>/ /tmp/<uuid>/input
 ```
 
-Macros are disabled **globally** at the launch flag level, not per-request. A document carrying macros has them stripped before render.
+Macros are disabled **globally** at the container env level, not per-request. A document carrying macros has them stripped before render.
+
+> **Defense in depth (future hardening).** A locked LibreOffice user-profile / registrymodifications.xcu can additionally pin `Macro.Security = 4` (Very High) so even a hostile invocation that unsets `SAL_DISABLE_MACROS` cannot run macros. This is a follow-up for FU-C's sidecar image — the env-var approach is sufficient for MVP because the sidecar runs read-only-root with `cap_drop: [ALL]` (no way to override the container env from inside).
 
 ### clamav definition refresh
 
@@ -273,10 +279,12 @@ After FU-A + FU-E land:
    docker compose exec storage-service sh -c 'echo "PING" | nc clamav-clamd 3310'
    # expected: PONG
    ```
-5. Verify LibreOffice sidecar:
+5. Verify LibreOffice sidecar reachability (TCP-level only until FU-C ships the HTTP shim — see §3):
    ```bash
-   docker compose exec storage-service curl -sf http://libreoffice-sidecar:8100/health
-   # expected: 200 OK
+   docker compose exec storage-service sh -c 'nc -z libreoffice-sidecar 8100 && echo OK'
+   # expected: OK
+   # Once FU-C lands the Bun HTTP shim, this upgrades to:
+   #   docker compose exec storage-service curl -sf http://libreoffice-sidecar:8100/health
    ```
 6. Re-run the smoke harness:
    ```bash

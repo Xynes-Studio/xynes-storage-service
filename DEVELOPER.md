@@ -1915,7 +1915,7 @@ docker compose --env-file .env.dev.local \
 
 # 3. Verify sidecars reachable from storage-service:
 docker compose exec storage-service sh -c 'echo "PING" | nc clamav-clamd 3310'   # → PONG
-docker compose exec storage-service curl -sf http://libreoffice-sidecar:8100/    # → 200
+docker compose exec storage-service sh -c 'nc -z libreoffice-sidecar 8100 && echo OK'   # → OK (TCP only; FU-C ships /health)
 
 # 4. Re-run the smoke harness:
 bash scripts/smoke-universal-storage.sh --full --provider r2
