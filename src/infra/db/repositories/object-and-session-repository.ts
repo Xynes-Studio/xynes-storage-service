@@ -30,7 +30,7 @@
  *     before the wire DTO. We document this rule below at the mapper
  *     boundary.
  */
-import { and, asc, desc, eq, gte, lte, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lte, lt, or, sql } from 'drizzle-orm';
 import type { StorageDb } from '../client';
 import { storageObjects, storageUploadSessions } from '../schema';
 import type {
@@ -174,6 +174,42 @@ export class PostgresStorageObjectRepository implements StorageObjectRepository 
           eq(storageObjects.workspaceId, input.workspaceId),
         ),
       )
+      .limit(1);
+    if (rows.length === 0) return null;
+    return mapStorageObjectRow(rows[0]);
+  }
+
+  /**
+   * DEDUP-2 — Probe for an existing object in this workspace whose
+   * `sha256` matches AND whose `status` is `uploaded` / `processing` /
+   * `ready`. The predicate mirrors the partial unique index from the
+   * DEDUP-1 migration (`storage_objects_workspace_sha256_uidx`).
+   *
+   * Workspace scoping is enforced at the SQL layer — the `workspace_id`
+   * filter is the FIRST predicate so a hostile probe with someone else's
+   * sha256 cannot leak existence across tenants.
+   *
+   * Returns the first matching row (ordered by `created_at` ASC, then
+   * `id` ASC to make the tiebreaker deterministic). If the dedup
+   * reconciliation from the DEDUP-1 migration has run, at most one such
+   * row should exist for any `(workspace_id, sha256)`; ordering is
+   * defense-in-depth.
+   */
+  async findExistingByWorkspaceSha256(input: {
+    workspaceId: string;
+    sha256: string;
+  }): Promise<StorageObjectRecord | null> {
+    const rows = await this.db
+      .select()
+      .from(storageObjects)
+      .where(
+        and(
+          eq(storageObjects.workspaceId, input.workspaceId),
+          eq(storageObjects.sha256, input.sha256),
+          inArray(storageObjects.status, ['uploaded', 'processing', 'ready']),
+        ),
+      )
+      .orderBy(asc(storageObjects.createdAt), asc(storageObjects.id))
       .limit(1);
     if (rows.length === 0) return null;
     return mapStorageObjectRow(rows[0]);

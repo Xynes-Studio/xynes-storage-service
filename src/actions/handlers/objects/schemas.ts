@@ -151,12 +151,49 @@ export type CreateDownloadUrlPayload = z.infer<typeof createDownloadUrlPayloadSc
 
 // ── Delete object ──────────────────────────────────────────────────────────
 
+/**
+ * DEDUP-2 — closed-set owner kinds matching
+ * `platform.storage_object_references.owner_kind` CHECK. The values are
+ * mirrored from `uploads/schemas.ts` to keep the delete handler decoupled
+ * from the upload handler (separation of concerns).
+ */
+export const DELETE_OWNER_KINDS = [
+  'cms_entry',
+  'comment',
+  'doc_service',
+  'user_avatar',
+  'workspace_logo',
+  'platform_generic',
+] as const;
+
 export const deleteObjectPayloadSchema = z
   .object({
     operation: z.literal('delete'),
     objectId: z.string().uuid(),
+    /**
+     * DEDUP-2 — when both `ownerKind` and `ownerId` are present, the
+     * handler removes ONLY that specific `(object_id, owner_kind,
+     * owner_id)` reference row. If references remain, the object is
+     * NOT soft-deleted. If both fields are omitted, the handler falls
+     * back to the legacy STORAGE-6 force-soft-delete behaviour.
+     *
+     * `ownerKind` MUST be paired with `ownerId` (and vice versa) — the
+     * payload validator enforces this via a `.superRefine`.
+     */
+    ownerKind: z.enum(DELETE_OWNER_KINDS).optional(),
+    ownerId: z.string().uuid().optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((data, ctx) => {
+    const hasOwnerKind = data.ownerKind !== undefined;
+    const hasOwnerId = data.ownerId !== undefined;
+    if (hasOwnerKind !== hasOwnerId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'ownerKind and ownerId must be provided together',
+      });
+    }
+  });
 
 export type DeleteObjectPayload = z.infer<typeof deleteObjectPayloadSchema>;
 

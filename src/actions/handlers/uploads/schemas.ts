@@ -20,6 +20,22 @@ export const DEFAULT_UPLOAD_PURPOSE = 'platform_generic';
 /** Allowed visibility values — mirrors `storage_objects.visibility` CHECK. */
 export const UPLOAD_VISIBILITIES = ['private', 'public'] as const;
 
+/**
+ * DEDUP-2 — closed-set owner kinds for `platform.storage_object_references`.
+ *
+ * MUST stay in lock-step with `STORAGE_OBJECT_REFERENCE_OWNER_KINDS` in
+ * `src/actions/handlers/uploads/types.ts` and the canonical migration's
+ * CHECK constraint.
+ */
+export const UPLOAD_OWNER_KINDS = [
+  'cms_entry',
+  'comment',
+  'doc_service',
+  'user_avatar',
+  'workspace_logo',
+  'platform_generic',
+] as const;
+
 // `filename` is bounded so a hostile caller cannot wedge huge strings into
 // the DB or into provider response-content-disposition headers later.
 // 255 bytes is the POSIX filename ceiling; 1024 bytes is the AWS S3 key
@@ -90,6 +106,23 @@ export const createUploadPayloadSchema = z
     purpose: purposeSchema.optional(),
     visibility: z.enum(UPLOAD_VISIBILITIES).optional(),
     compression: z.boolean().optional(),
+    /**
+     * DEDUP-2 — optional owner kind. When omitted, the handler defaults to
+     * `platform_generic` so legacy callers continue to work. When provided
+     * alongside `ownerId`, the handler attaches a reference row in
+     * `platform.storage_object_references` linking this upload to the
+     * specified owner. Used by DEDUP-2 to support reference-counted
+     * soft-deletes.
+     */
+    ownerKind: z.enum(UPLOAD_OWNER_KINDS).optional(),
+    /**
+     * DEDUP-2 — optional owner id (UUID). When omitted, the handler
+     * generates a fresh UUID so anonymous references can coexist on the
+     * same object. The composite PK `(object_id, owner_kind, owner_id)`
+     * still guarantees idempotency at the DB layer for callers that DO
+     * supply a stable id.
+     */
+    ownerId: z.string().uuid('ownerId must be a UUID').optional(),
   })
   .strict();
 

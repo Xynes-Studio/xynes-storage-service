@@ -33,6 +33,8 @@ import type {
   CreateObjectWithSessionResult,
   ResolvedProvider,
   StorageObjectRecord,
+  StorageObjectReferenceOwnerKind,
+  StorageObjectReferenceRepository,
   StorageObjectRepository,
   StorageProviderResolver,
   UploadHandlerDependencies,
@@ -233,6 +235,21 @@ export class FakeRepositories {
       this.state.objects.set(objectId, updated);
       return updated;
     },
+    // DEDUP-2 — mirrors the partial unique index predicate from DEDUP-1
+    // (`storage_objects_workspace_sha256_uidx`): only rows in
+    // `uploaded` / `processing` / `ready` count as a dedup hit.
+    findExistingByWorkspaceSha256: async ({ workspaceId, sha256 }) => {
+      const candidates = [...this.state.objects.values()]
+        .filter((o) => o.workspaceId === workspaceId)
+        .filter((o) => o.sha256 === sha256)
+        .filter((o) => o.status === 'uploaded' || o.status === 'processing' || o.status === 'ready')
+        // Deterministic tiebreaker — mirrors the prod repo ORDER BY.
+        .sort((a, b) => {
+          const t = a.createdAt.getTime() - b.createdAt.getTime();
+          return t !== 0 ? t : a.id.localeCompare(b.id);
+        });
+      return candidates[0] ?? null;
+    },
   };
 
   readonly sessions: UploadSessionRepository = {
@@ -393,21 +410,134 @@ export function makeDeps(
     repositories: FakeRepositories;
     providers: FakeProviderResolver;
     idFactory: () => string;
+    references: FakeReferencesRepository | null;
   }> = {},
 ): UploadHandlerDependencies & {
   repositories: FakeRepositories;
   providers: FakeProviderResolver;
+  /**
+   * Test-only accessor for the references fake. Separate name from the
+   * `UploadHandlerDependencies.references?` slot so the handler still
+   * sees `undefined` when callers pass `references: null` (legacy
+   * STORAGE-5 path).
+   */
+  referencesFake: FakeReferencesRepository | null;
 } {
   const repositories = overrides.repositories ?? new FakeRepositories();
   const providers = overrides.providers ?? new FakeProviderResolver();
+  // DEDUP-2: when the caller passes `references: null` explicitly, the
+  // handler runs WITHOUT the dedup short-circuit (legacy STORAGE-5 path).
+  // The default is `null` so every pre-DEDUP-2 test keeps its byte-for-
+  // byte posture — tests that exercise dedup pass `references: new
+  // FakeReferencesRepository()` explicitly.
+  const references = overrides.references === undefined ? null : overrides.references;
   return {
     objects: repositories.objects,
     sessions: repositories.sessions,
     providers,
+    references: references ?? undefined,
     now: overrides.now,
     idFactory: overrides.idFactory ?? makeDeterministicIds().next,
     sessionTtlSeconds: overrides.sessionTtlSeconds,
     multipartThresholdBytes: overrides.multipartThresholdBytes,
     repositories,
+    referencesFake: references,
   };
+}
+
+/**
+ * DEDUP-2 — in-memory `FakeReferencesRepository` for handler tests.
+ *
+ * Composite-key map: `${objectId}:${ownerKind}:${ownerId}` -> insertedAt.
+ * `addReference` is idempotent (duplicate keys return `inserted: false`),
+ * matching the DB-side `ON CONFLICT DO NOTHING` semantics.
+ *
+ * Workspace scoping: the fake takes a `parentWorkspaceLookup` callback so
+ * the handler tests can verify cross-workspace probes return the same
+ * "no-op" outcomes as the prod repo.
+ */
+export class FakeReferencesRepository implements StorageObjectReferenceRepository {
+  private readonly state = new Map<string, Date>();
+  /** Capture every addReference / removeReference call for assertions. */
+  public readonly calls: Array<{
+    readonly method: 'addReference' | 'removeReference' | 'countReferences';
+    readonly objectId: string;
+    readonly workspaceId: string;
+    readonly ownerKind?: StorageObjectReferenceOwnerKind;
+    readonly ownerId?: string;
+  }> = [];
+  /** When set, methods refuse for objects whose lookup returns false. */
+  public parentWorkspaceLookup: (objectId: string, workspaceId: string) => boolean = () => true;
+  /** When set, `addReference` throws this once. */
+  public throwOnAddOnce?: Error;
+
+  private key(objectId: string, ownerKind: string, ownerId: string): string {
+    return `${objectId}:${ownerKind}:${ownerId}`;
+  }
+
+  async addReference(input: {
+    objectId: string;
+    workspaceId: string;
+    ownerKind: StorageObjectReferenceOwnerKind;
+    ownerId: string;
+  }): Promise<{ readonly inserted: boolean }> {
+    this.calls.push({ method: 'addReference', ...input });
+    if (this.throwOnAddOnce) {
+      const e = this.throwOnAddOnce;
+      this.throwOnAddOnce = undefined;
+      throw e;
+    }
+    if (!this.parentWorkspaceLookup(input.objectId, input.workspaceId)) {
+      return { inserted: false };
+    }
+    const k = this.key(input.objectId, input.ownerKind, input.ownerId);
+    if (this.state.has(k)) return { inserted: false };
+    this.state.set(k, new Date());
+    return { inserted: true };
+  }
+
+  async removeReference(input: {
+    objectId: string;
+    workspaceId: string;
+    ownerKind: StorageObjectReferenceOwnerKind;
+    ownerId: string;
+  }): Promise<{ readonly remaining: number }> {
+    this.calls.push({ method: 'removeReference', ...input });
+    if (!this.parentWorkspaceLookup(input.objectId, input.workspaceId)) {
+      return { remaining: 0 };
+    }
+    this.state.delete(this.key(input.objectId, input.ownerKind, input.ownerId));
+    let remaining = 0;
+    for (const key of this.state.keys()) {
+      if (key.startsWith(`${input.objectId}:`)) remaining += 1;
+    }
+    return { remaining };
+  }
+
+  async countReferences(input: { objectId: string; workspaceId: string }): Promise<number> {
+    this.calls.push({ method: 'countReferences', ...input });
+    if (!this.parentWorkspaceLookup(input.objectId, input.workspaceId)) return 0;
+    let count = 0;
+    for (const key of this.state.keys()) {
+      if (key.startsWith(`${input.objectId}:`)) count += 1;
+    }
+    return count;
+  }
+
+  /** Test helper: directly seed a reference row. */
+  seed(input: {
+    objectId: string;
+    ownerKind: StorageObjectReferenceOwnerKind;
+    ownerId: string;
+  }): void {
+    this.state.set(this.key(input.objectId, input.ownerKind, input.ownerId), new Date());
+  }
+
+  /** Test helper: dump the current set for assertions. */
+  list(): Array<{ objectId: string; ownerKind: string; ownerId: string }> {
+    return [...this.state.keys()].map((k) => {
+      const [objectId, ownerKind, ownerId] = k.split(':');
+      return { objectId, ownerKind, ownerId };
+    });
+  }
 }

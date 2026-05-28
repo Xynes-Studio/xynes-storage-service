@@ -39,7 +39,7 @@ export function createDeleteObjectHandler(deps: ObjectsHandlerDependencies) {
     if (!parseResult.success) {
       throw new ValidationError(parseResult.error.issues[0]?.message ?? 'Invalid payload');
     }
-    const { objectId } = parseResult.data;
+    const { objectId, ownerKind, ownerId } = parseResult.data;
 
     const object = await deps.objects.findByIdForWorkspace({
       objectId,
@@ -51,6 +51,49 @@ export function createDeleteObjectHandler(deps: ObjectsHandlerDependencies) {
     if (object.status === 'deleted') {
       // Idempotent — repeat call returns current state.
       return { object: toPublicObject(object) };
+    }
+
+    // DEDUP-2 — reference-counted soft-delete path.
+    //
+    // When the caller supplied BOTH `ownerKind` AND `ownerId` (the payload
+    // validator enforces the pairing), remove ONLY that specific
+    // `(object_id, owner_kind, owner_id)` reference. If references remain,
+    // the underlying bytes are still in use by other consumers — surface
+    // `referencesRemaining` and skip the soft-delete. If the removal
+    // drops the last reference, fall through to the legacy soft-delete
+    // path.
+    //
+    // When the caller did NOT supply owner metadata (legacy / force-
+    // delete mode), preserve the byte-for-byte STORAGE-6 behaviour: the
+    // object is soft-deleted immediately and reference rows are left
+    // in place (the `ON DELETE CASCADE` on `object_id` from DEDUP-1
+    // cleans them up if/when the row is hard-deleted later).
+    if (ownerKind !== undefined && ownerId !== undefined) {
+      if (deps.references === undefined) {
+        // Defensive: a caller asked for reference-counted delete but
+        // the service is not wired with a references repo. Treat this
+        // as a service-config issue, not a caller error. We refuse
+        // rather than silently force-deleting because the caller
+        // explicitly asked for ref-counted semantics — silently
+        // changing behaviour would be surprising.
+        throw new ValidationError('Reference-counted delete is not available on this deployment');
+      }
+      const { remaining } = await deps.references.removeReference({
+        objectId,
+        workspaceId: ctx.workspaceId,
+        ownerKind,
+        ownerId,
+      });
+      if (remaining > 0) {
+        // Bytes still in use — return the object UNCHANGED and surface
+        // the remaining reference count so the caller knows their
+        // dereference succeeded but no soft-delete happened.
+        return {
+          object: toPublicObject(object),
+          referencesRemaining: remaining,
+        };
+      }
+      // remaining === 0 -> fall through to soft-delete.
     }
 
     const softDeleted = await deps.objects.softDeleteForWorkspace({

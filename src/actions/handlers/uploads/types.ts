@@ -34,6 +34,30 @@ export type UploadMethod = 'single' | 'multipart';
 
 export type Visibility = 'private' | 'public';
 
+/**
+ * DEDUP-2 — closed-set owner kinds for `platform.storage_object_references`.
+ *
+ * MUST match `STORAGE_OBJECT_REFERENCE_OWNER_KINDS` from
+ * `src/infra/db/schema.ts` byte-for-byte. The schema declaration is the
+ * canonical source of truth (cross-checked by `bun run db:check`); the
+ * handler-side mirror exists so the upload/delete handlers do not import
+ * from the DB layer.
+ *
+ * Adding a new owner kind requires (1) updating the canonical Supabase
+ * migration's CHECK constraint, (2) updating the Drizzle schema mirror,
+ * (3) updating this tuple, and (4) updating the upstream handler that
+ * mints references of the new kind.
+ */
+export const STORAGE_OBJECT_REFERENCE_OWNER_KINDS = [
+  'cms_entry',
+  'comment',
+  'doc_service',
+  'user_avatar',
+  'workspace_logo',
+  'platform_generic',
+] as const;
+export type StorageObjectReferenceOwnerKind = (typeof STORAGE_OBJECT_REFERENCE_OWNER_KINDS)[number];
+
 export interface StorageObjectRecord {
   readonly id: string;
   readonly workspaceId: string;
@@ -124,6 +148,82 @@ export interface StorageObjectRepository {
     objectId: string;
     workspaceId: string;
   }): Promise<StorageObjectRecord | null>;
+
+  /**
+   * DEDUP-2 — Probe for an existing object in this workspace whose
+   * `sha256` matches AND whose `status` is one of `uploaded`, `processing`,
+   * or `ready`. Returns the row, or `null` when no dedup hit applies
+   * (no row, different workspace, `sha256 IS NULL`, or row in
+   * `pending_upload` / `failed` / `deleted`).
+   *
+   * The dedup-hit predicate matches the partial unique index created by
+   * the DEDUP-1 migration (`storage_objects_workspace_sha256_uidx`) so
+   * the handler short-circuit + the DB constraint stay in lock-step.
+   *
+   * SECURITY: This method is the ONLY surface where a caller can probe
+   * by `sha256`. It is workspace-scoped at the SQL layer — cross-workspace
+   * probes (same sha256 in another workspace) MUST return `null`.
+   * Tenant-isolation invariant.
+   */
+  findExistingByWorkspaceSha256(input: {
+    workspaceId: string;
+    sha256: string;
+  }): Promise<StorageObjectRecord | null>;
+}
+
+/**
+ * DEDUP-2 — Reference-counting repository for `platform.storage_object_references`.
+ *
+ * Backed by a join table created in the DEDUP-1 migration. Composite PK
+ * `(object_id, owner_kind, owner_id)` enforces idempotency at the DB
+ * layer — repeat inserts are a no-op via `ON CONFLICT … DO NOTHING`.
+ *
+ * The repository is workspace-agnostic on the surface (the `object_id`
+ * already binds a reference to a single workspace via the `storage_objects`
+ * FK), but every method takes a `workspaceId` so production
+ * implementations can defense-in-depth the lookup by also filtering on
+ * `storage_objects.workspace_id`.
+ */
+export interface StorageObjectReferenceRepository {
+  /**
+   * Insert a `(object_id, owner_kind, owner_id)` row. Idempotent: a
+   * duplicate triple is treated as success (the caller already had the
+   * reference). Returns `true` when a new row was inserted, `false` when
+   * the triple already existed.
+   *
+   * Implementations MUST verify the object belongs to the workspace
+   * before inserting — defense in depth on top of the FK.
+   */
+  addReference(input: {
+    objectId: string;
+    workspaceId: string;
+    ownerKind: StorageObjectReferenceOwnerKind;
+    ownerId: string;
+  }): Promise<{ readonly inserted: boolean }>;
+
+  /**
+   * Remove a specific `(object_id, owner_kind, owner_id)` row. Idempotent:
+   * removing a row that does not exist is treated as success. Returns
+   * the count of remaining references on the object AFTER the removal.
+   *
+   * The remaining-count is used by the delete handler to decide whether
+   * to actually soft-delete the parent object (count === 0) or leave it
+   * in place because other consumers still need it.
+   */
+  removeReference(input: {
+    objectId: string;
+    workspaceId: string;
+    ownerKind: StorageObjectReferenceOwnerKind;
+    ownerId: string;
+  }): Promise<{ readonly remaining: number }>;
+
+  /**
+   * Count references attached to the object. Used by the delete handler
+   * when called WITHOUT a specific `ownerKind`/`ownerId` (legacy /
+   * force-delete mode) to decide whether the object is safe to soft-
+   * delete.
+   */
+  countReferences(input: { objectId: string; workspaceId: string }): Promise<number>;
 }
 
 export interface UploadSessionRepository {
@@ -209,6 +309,20 @@ export interface UploadHandlerDependencies {
   readonly objects: StorageObjectRepository;
   readonly sessions: UploadSessionRepository;
   readonly providers: StorageProviderResolver;
+  /**
+   * DEDUP-2 — reference-counting repository for
+   * `platform.storage_object_references`. When set, the upload-create
+   * handler probes for a `(workspace_id, sha256)` dedup hit before
+   * minting a provider URL; on a hit, it inserts a new reference row
+   * via `addReference` and returns the EXISTING object with
+   * `dedupHit: true`.
+   *
+   * When OMITTED, the dedup short-circuit is disabled — the handler
+   * falls through to the legacy "always mint a fresh upload" path.
+   * This keeps STORAGE-5 / STORAGE-6 tests + any caller that hasn't
+   * wired the new repo working byte-for-byte.
+   */
+  readonly references?: StorageObjectReferenceRepository;
   /** Defaults to `() => new Date()`. Overridable for deterministic tests. */
   readonly now?: () => Date;
   /** Defaults to `crypto.randomUUID()`. Overridable for deterministic tests. */

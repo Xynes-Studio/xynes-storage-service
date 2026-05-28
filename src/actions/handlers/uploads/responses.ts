@@ -100,6 +100,19 @@ export interface CreateUploadSessionResponse {
   readonly parts: ReadonlyArray<CreateUploadSessionPartUrl>;
   readonly expiresAt: string;
   readonly object: PublicStorageObject;
+  /**
+   * DEDUP-2 — `true` when this response represents a dedup hit: the
+   * caller's bytes were already in the workspace (matching `sha256` on
+   * an `uploaded`/`processing`/`ready` row), so no provider URL was
+   * minted. In that case `uploadUrl` is `null`, `parts` is empty,
+   * `uploadHeaders` is empty, and the caller MUST skip the direct
+   * provider upload AND skip `complete` — the existing object is
+   * already in its final state.
+   *
+   * Defaults to `false` for fresh uploads. Additive — pre-DEDUP-2
+   * callers that do not read this field continue to work unchanged.
+   */
+  readonly dedupHit: boolean;
 }
 
 // ── Complete / abort session responses ────────────────────────────────────

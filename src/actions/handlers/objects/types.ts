@@ -23,7 +23,12 @@
  * original object — never the workspace's current default.
  */
 import type { ProviderKind, StorageProviderAdapter } from '../../../infra/providers/types';
-import type { ObjectStatus, ResolvedProvider, StorageObjectRecord } from '../uploads/types';
+import type {
+  ObjectStatus,
+  ResolvedProvider,
+  StorageObjectRecord,
+  StorageObjectReferenceRepository,
+} from '../uploads/types';
 
 // Re-export the upload-side records so STORAGE-6 callers don't have to
 // reach across folders.
@@ -31,6 +36,8 @@ export type {
   ObjectStatus,
   ResolvedProvider,
   StorageObjectRecord,
+  StorageObjectReferenceOwnerKind,
+  StorageObjectReferenceRepository,
   Visibility,
   UploadMethod,
 } from '../uploads/types';
@@ -211,6 +218,20 @@ export interface ObjectsHandlerDependencies {
   readonly jobs: StorageProcessingJobRepository;
   readonly usage: StorageUsageRepository;
   readonly providers: ExtendedStorageProviderResolver;
+  /**
+   * DEDUP-2 — reference-counting repository. When set, the delete
+   * handler:
+   *   - With `ownerKind`/`ownerId` on the payload: removes that specific
+   *     reference. If references remain, returns `referencesRemaining`
+   *     and DOES NOT soft-delete the object.
+   *   - Without `ownerKind`/`ownerId`: defers to the legacy soft-delete
+   *     path (preserves byte-for-byte STORAGE-6 behaviour).
+   *
+   * When OMITTED, the reference-counted delete is disabled — repeats
+   * the legacy STORAGE-6 path verbatim. Tests that haven't been
+   * migrated to DEDUP-2 keep passing.
+   */
+  readonly references?: StorageObjectReferenceRepository;
   /** Defaults to `() => new Date()`. Overridable for deterministic tests. */
   readonly now?: () => Date;
   /** Default download-URL TTL in seconds. Capped at 1 hour by the schema. */
