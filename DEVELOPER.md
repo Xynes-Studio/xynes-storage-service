@@ -947,6 +947,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-4 | ✅ Landed 2026-05-15 (Composition root — handler registration + ready event) |
 | STORAGE-FU-5 | ✅ Landed 2026-05-15 (Production runners — stub-mode default + S3 IO + variant writer + production-stub processors) |
 | STORAGE-FU-5-FU-A | ✅ Landed 2026-05-28 (Sharp-backed `ImageProcessor` — closes Bug 1 for image variants; EXIF stripping mandatory; libvips cache disabled) |
+| STORAGE-FU-5-FU-E | ✅ Landed 2026-05-28 (Deployment posture decision — sharp + ffmpeg in-process, LibreOffice + clamav sidecars; Compose overlay + K8s draft manifests) |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
 | STORAGE-LIVE-1 | ✅ Landed 2026-05-16 (R2 dev bucket + lifecycle + CORS + credential reference) |
 | STORAGE-LIVE-2 | ✅ Landed 2026-05-16 (`platform.workspace_storage_providers` R2 dev seed migration + bootstrap wiring) |
@@ -1852,3 +1853,84 @@ with no options is the canonical path.
   Postgres-polling worker is sufficient per STORAGE-7 §"Out of scope".
 - **Live integration smoke against the running storage stack.** That's
   the successor plan (`xynes/xynes-infra/docs/plans/2026-05-14-storage-live-provider-rollout.md`).
+
+
+## Deployment Posture (STORAGE-FU-5-FU-E)
+
+STORAGE-FU-5-FU-E is the architectural decision record for **how each
+live processor (sharp / ffmpeg / LibreOffice / clamav) is deployed**.
+It does not change runtime code — the per-processor implementation
+stories (FU-A..D) consume the decision via the env contract. The
+canonical document is [`docs/deployment-posture.md`](docs/deployment-posture.md);
+the summary below is a navigation index.
+
+### Decision summary
+
+| Processor   | Posture                  | Rationale                                                       |
+|-------------|--------------------------|-----------------------------------------------------------------|
+| sharp       | In-process (Dockerfile)  | ~30 MB libvips binding; in-memory I/O; tight library coupling.  |
+| ffmpeg      | In-process (Dockerfile)  | ~80 MB static binary; piped stdin/stdout; no daemon.            |
+| LibreOffice | Sidecar container        | ~400 MB (soffice + JRE + fonts); independent restart cadence.   |
+| clamav      | Sidecar container (×2)   | ~250 MB defs + freshclam updater isolation; least-privilege.    |
+
+Tier-1 (sharp + ffmpeg) keeps the runtime hot path small and fast.
+Tier-2 (LibreOffice + clamav) pushes fat dependencies with independent
+lifecycles into sidecars reached over the pod-local network only.
+
+### Env contract (consumed by FU-A..D)
+
+| Env var | Default | Tier | Notes |
+|---|---|---|---|
+| `STORAGE_PROCESSOR_MODE` | `stub` (non-prod) / `live` (prod) | — | Master switch. |
+| `STORAGE_FFMPEG_TIMEOUT_MS` | `300000` (5 min) | Tier-1 | Per-job timeout (FU-B). |
+| `STORAGE_SOFFICE_TIMEOUT_MS` | `60000` (60 s) | Tier-2 | Per-job timeout (FU-C). |
+| `LIBREOFFICE_SERVICE_URL` | `http://libreoffice-sidecar:8100` | Tier-2 | Pod-local DNS only. |
+| `CLAMD_HOST` | `clamav-clamd` | Tier-2 | Pod-local DNS only. |
+| `CLAMD_PORT` | `3310` | Tier-2 | TCP port. |
+| `CLAMD_SOCKET` | _(unset)_ | Tier-2 | Unix socket; takes precedence over TCP when set. |
+
+Tier-2 processors fall back to the safe-fail production stub when the
+env var is unset — a misconfigured live deployment dead-letters cleanly
+without crashing the worker.
+
+### Artefacts shipped by FU-E
+
+| File | Owner repo | Role |
+|---|---|---|
+| `docs/deployment-posture.md` | `xynes-storage-service` | Canonical decision record (§1–§11). |
+| `infra/compose/storage-live-processors.yml` | `xynes-infra` | Opt-in Compose overlay adding 3 sidecars + extending storage-service env. |
+| `infra/release/deployment-posture/k8s/` | `xynes-infra` | 8-file K3s draft (Namespace, Deployments, Services, PVC, NetworkPolicy). Documentation-grade — not deployed by MVP CI. |
+| `scripts/test/storage-fu-5-fu-e-deployment-posture.test.sh` | `xynes-infra` | Static validator wired into `scripts/test/run.sh`. |
+
+### Operator rollout sequence (after FU-A + FU-E both land)
+
+```bash
+# 1. Flip processor mode (in the git-ignored .env.dev.local).
+# 2. Restart with the live-processors overlay:
+cd xynes/xynes-infra
+docker compose --env-file .env.dev.local \
+  -f docker-compose.dev.yml \
+  -f infra/compose/storage-live-processors.yml \
+  up -d storage-service libreoffice-sidecar clamav-clamd clamav-freshclam
+
+# 3. Verify sidecars reachable from storage-service:
+docker compose exec storage-service sh -c 'echo "PING" | nc clamav-clamd 3310'   # → PONG
+docker compose exec storage-service curl -sf http://libreoffice-sidecar:8100/    # → 200
+
+# 4. Re-run the smoke harness:
+bash scripts/smoke-universal-storage.sh --full --provider r2
+```
+
+The operator step is NOT automated by FU-E — FU-E ships the decision +
+manifests + runbook entry. The flip is a manual rollout gate that depends
+on FU-A (and FU-B/C/D for video / document / scanner respectively).
+
+### Out of scope
+
+- Helm chart authoring (defer to ops).
+- Multi-region deployment topology.
+- Auto-scaling policies.
+- Production secret-management for sidecar env vars (covered by
+  STORAGE-FU-3 hosted-secret-manager follow-ups).
+- Per-replica horizontal-pod-autoscaling.
+- Sidecar binary installation in CI (FU-F handles CI bring-up).
