@@ -92,6 +92,7 @@ async function insertObject(params: {
   readonly sha256: string | null;
   readonly status: string;
   readonly providerObjectKeyHint?: string;
+  readonly createdAt?: Date;
 }): Promise<string> {
   const objectId = randomUUID();
   const providerObjectKey =
@@ -99,6 +100,9 @@ async function insertObject(params: {
   // Soft-deleted rows must carry a non-null `deleted_at` per the
   // `storage_objects_deleted_consistency` CHECK from STORAGE-2.
   const deletedAtSql = params.status === 'deleted' ? sql`now()` : sql`NULL`;
+  const createdAtSql = params.createdAt
+    ? sql`${params.createdAt.toISOString()}::timestamptz`
+    : sql`now()`;
   await params.db.execute(sql`
     INSERT INTO platform.storage_objects
       (id, workspace_id, provider_id, provider_object_key, filename, content_type,
@@ -107,7 +111,7 @@ async function insertObject(params: {
     VALUES (
       ${objectId}, ${params.workspaceId}, ${params.providerId}, ${providerObjectKey},
       'file.bin', 'application/octet-stream', 1024, ${params.sha256}, 'platform_generic',
-      'private', ${params.status}, true, now(), now(), ${deletedAtSql}
+      'private', ${params.status}, true, ${createdAtSql}, now(), ${deletedAtSql}
     )
   `);
   return objectId;
@@ -532,5 +536,387 @@ describeIf('DEDUP-1 — platform.storage_object_references', () => {
       WHERE object_id = ${objectId}
     `)) as unknown as Array<{ n: number }>;
     expect(rows[0].n).toBe(0);
+  });
+});
+
+/**
+ * Codex P1 fix: pre-index reconciliation block in the DEDUP-1 migration.
+ *
+ * The migration MUST demote pre-existing duplicate `(workspace_id, sha256)`
+ * rows BEFORE creating the partial unique index, otherwise the
+ * `CREATE UNIQUE INDEX` aborts on any environment that already accumulated
+ * legacy duplicates (which is exactly Bug 2's signature). These tests
+ * simulate the reconciliation logic against synthetic duplicates and
+ * assert the winner-selection contract.
+ *
+ * Tests that need to seed duplicates run inside a Drizzle transaction
+ * that DROPs the partial unique index up-front (so duplicates can be
+ * inserted), runs the reconciliation, asserts post-state, then throws a
+ * sentinel error to force ROLLBACK. The dev DB index + rows survive the
+ * test run untouched (verified by the index-count assertion after each
+ * txn). Tests that don't need duplicates use the live index directly.
+ *
+ * Reconciliation contract:
+ *   - Oldest row per (workspace_id, sha256) group wins (lowest created_at,
+ *     then lowest id as tiebreaker). Status preserved.
+ *   - All later duplicates flip to status='deleted', deleted_at=now(),
+ *     failure_code='DEDUP_RECONCILED'.
+ */
+describeIf('DEDUP-1 — pre-index reconciliation (Codex P1 fix)', () => {
+  const ROLLBACK_SENTINEL = '__DEDUP_RECONCILE_ROLLBACK_SENTINEL__';
+
+  const RECONCILE_SQL = sql`
+    WITH ranked_duplicates AS (
+      SELECT
+        id,
+        workspace_id,
+        sha256,
+        ROW_NUMBER() OVER (
+          PARTITION BY workspace_id, sha256
+          ORDER BY created_at ASC, id ASC
+        ) AS rn
+      FROM platform.storage_objects
+      WHERE sha256 IS NOT NULL
+        AND status IN ('uploaded', 'processing', 'ready')
+    )
+    UPDATE platform.storage_objects
+    SET status = 'deleted',
+        deleted_at = now(),
+        failure_code = 'DEDUP_RECONCILED',
+        failure_message = 'Soft-deleted by DEDUP-1 migration; older duplicate is the dedup winner.',
+        updated_at = now()
+    WHERE id IN (SELECT id FROM ranked_duplicates WHERE rn > 1)
+  `;
+
+  async function txInsertObject(
+    tx: IntegrationDb['db'],
+    params: {
+      readonly workspaceId: string;
+      readonly providerId: string;
+      readonly sha256: string | null;
+      readonly status: string;
+      readonly providerObjectKeyHint?: string;
+      readonly createdAt?: Date;
+    },
+  ): Promise<string> {
+    const objectId = randomUUID();
+    const providerObjectKey =
+      params.providerObjectKeyHint ??
+      `workspaces/${params.workspaceId}/objects/${objectId}/file.bin`;
+    const deletedAtSql = params.status === 'deleted' ? sql`now()` : sql`NULL`;
+    const createdAtSql = params.createdAt
+      ? sql`${params.createdAt.toISOString()}::timestamptz`
+      : sql`now()`;
+    await tx.execute(sql`
+      INSERT INTO platform.storage_objects
+        (id, workspace_id, provider_id, provider_object_key, filename, content_type,
+         byte_size, sha256, purpose, visibility, status, compression_requested,
+         created_at, updated_at, deleted_at)
+      VALUES (
+        ${objectId}, ${params.workspaceId}, ${params.providerId}, ${providerObjectKey},
+        'file.bin', 'application/octet-stream', 1024, ${params.sha256}, 'platform_generic',
+        'private', ${params.status}, true, ${createdAtSql}, now(), ${deletedAtSql}
+      )
+    `);
+    return objectId;
+  }
+
+  /** Runs `work` inside a transaction with the dedup index dropped, then forces ROLLBACK. */
+  async function withDroppedIndex(
+    db: IntegrationDb['db'],
+    work: (tx: IntegrationDb['db']) => Promise<void>,
+  ): Promise<void> {
+    await db
+      .transaction(async (tx) => {
+        await tx.execute(sql`DROP INDEX platform.storage_objects_workspace_sha256_uidx`);
+        await work(tx);
+        throw new Error(ROLLBACK_SENTINEL);
+      })
+      .catch((err: unknown) => {
+        if (!(err instanceof Error) || err.message !== ROLLBACK_SENTINEL) {
+          throw err;
+        }
+      });
+  }
+
+  async function assertIndexRestored(db: IntegrationDb['db']): Promise<void> {
+    const idxCount = (await db.execute(sql`
+      SELECT COUNT(*)::int AS n FROM pg_indexes
+      WHERE schemaname = 'platform'
+        AND indexname = 'storage_objects_workspace_sha256_uidx'
+    `)) as unknown as Array<{ n: number }>;
+    expect(idxCount[0].n).toBe(1);
+  }
+
+  test('keeps the OLDEST row as the dedup winner; demotes later duplicates', async () => {
+    if (!ctx.current) return;
+    const fx = await seedWorkspaceFixture(ctx.current.db);
+    try {
+      const sha = 'f'.repeat(64);
+      await withDroppedIndex(ctx.current.db, async (tx) => {
+        const winnerId = await txInsertObject(tx, {
+          workspaceId: fx.workspaceId,
+          providerId: fx.providerId,
+          sha256: sha,
+          status: 'ready',
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/winner/file.bin`,
+        });
+        const loser1Id = await txInsertObject(tx, {
+          workspaceId: fx.workspaceId,
+          providerId: fx.providerId,
+          sha256: sha,
+          status: 'ready',
+          createdAt: new Date('2026-02-01T00:00:00Z'),
+          providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/loser1/file.bin`,
+        });
+        const loser2Id = await txInsertObject(tx, {
+          workspaceId: fx.workspaceId,
+          providerId: fx.providerId,
+          sha256: sha,
+          status: 'processing',
+          createdAt: new Date('2026-03-01T00:00:00Z'),
+          providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/loser2/file.bin`,
+        });
+
+        await tx.execute(RECONCILE_SQL);
+
+        const winner = (await tx.execute(sql`
+          SELECT status, failure_code, deleted_at IS NOT NULL AS has_deleted_at
+          FROM platform.storage_objects WHERE id = ${winnerId}
+        `)) as unknown as Array<{
+          status: string;
+          failure_code: string | null;
+          has_deleted_at: boolean;
+        }>;
+        expect(winner[0].status).toBe('ready');
+        expect(winner[0].failure_code).toBeNull();
+        expect(winner[0].has_deleted_at).toBe(false);
+
+        for (const loserId of [loser1Id, loser2Id]) {
+          const loser = (await tx.execute(sql`
+            SELECT status, failure_code, deleted_at IS NOT NULL AS has_deleted_at
+            FROM platform.storage_objects WHERE id = ${loserId}
+          `)) as unknown as Array<{
+            status: string;
+            failure_code: string | null;
+            has_deleted_at: boolean;
+          }>;
+          expect(loser[0].status).toBe('deleted');
+          expect(loser[0].failure_code).toBe('DEDUP_RECONCILED');
+          expect(loser[0].has_deleted_at).toBe(true);
+        }
+
+        // After reconciliation, the partial unique index can be re-created
+        // without conflict.
+        await tx.execute(sql`
+          CREATE UNIQUE INDEX storage_objects_workspace_sha256_uidx
+            ON platform.storage_objects (workspace_id, sha256)
+            WHERE sha256 IS NOT NULL AND status IN ('uploaded', 'processing', 'ready')
+        `);
+      });
+      await assertIndexRestored(ctx.current.db);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  test('breaks ties on equal created_at by lower id (deterministic winner selection)', async () => {
+    if (!ctx.current) return;
+    const fx = await seedWorkspaceFixture(ctx.current.db);
+    try {
+      const sha = '1'.repeat(64);
+      const sameTime = new Date('2026-01-01T00:00:00Z');
+      await withDroppedIndex(ctx.current.db, async (tx) => {
+        const allIds: string[] = [];
+        for (const tag of ['a', 'b', 'c', 'd']) {
+          allIds.push(
+            await txInsertObject(tx, {
+              workspaceId: fx.workspaceId,
+              providerId: fx.providerId,
+              sha256: sha,
+              status: 'ready',
+              createdAt: sameTime,
+              providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/${tag}/file.bin`,
+            }),
+          );
+        }
+
+        await tx.execute(RECONCILE_SQL);
+
+        const expectedWinner = [...allIds].sort()[0];
+        const winners = (await tx.execute(sql`
+          SELECT id FROM platform.storage_objects
+          WHERE workspace_id = ${fx.workspaceId}
+            AND sha256 = ${sha}
+            AND status IN ('uploaded', 'processing', 'ready')
+        `)) as unknown as Array<{ id: string }>;
+        expect(winners).toHaveLength(1);
+        expect(winners[0].id).toBe(expectedWinner);
+      });
+      await assertIndexRestored(ctx.current.db);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  test('idempotent: re-running reconciliation after the first pass is a no-op', async () => {
+    if (!ctx.current) return;
+    const fx = await seedWorkspaceFixture(ctx.current.db);
+    try {
+      const sha = '2'.repeat(64);
+      await withDroppedIndex(ctx.current.db, async (tx) => {
+        await txInsertObject(tx, {
+          workspaceId: fx.workspaceId,
+          providerId: fx.providerId,
+          sha256: sha,
+          status: 'ready',
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+          providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/win/file.bin`,
+        });
+        const loserId = await txInsertObject(tx, {
+          workspaceId: fx.workspaceId,
+          providerId: fx.providerId,
+          sha256: sha,
+          status: 'ready',
+          createdAt: new Date('2026-02-01T00:00:00Z'),
+          providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/lose/file.bin`,
+        });
+
+        await tx.execute(RECONCILE_SQL);
+        const after1 = (await tx.execute(sql`
+          SELECT updated_at FROM platform.storage_objects WHERE id = ${loserId}
+        `)) as unknown as Array<{ updated_at: Date }>;
+        const updatedAt1 = after1[0].updated_at;
+
+        await tx.execute(RECONCILE_SQL);
+        const after2 = (await tx.execute(sql`
+          SELECT updated_at FROM platform.storage_objects WHERE id = ${loserId}
+        `)) as unknown as Array<{ updated_at: Date }>;
+        expect(new Date(after2[0].updated_at).getTime()).toBe(new Date(updatedAt1).getTime());
+      });
+      await assertIndexRestored(ctx.current.db);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  test('does NOT demote rows with sha256 IS NULL', async () => {
+    if (!ctx.current) return;
+    const fx = await seedWorkspaceFixture(ctx.current.db);
+    try {
+      // The dev index excludes NULL-sha256 rows via its predicate, so no
+      // temp DROP needed.
+      const a = await insertObject({
+        db: ctx.current.db,
+        workspaceId: fx.workspaceId,
+        providerId: fx.providerId,
+        sha256: null,
+        status: 'ready',
+        providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/null-a/file.bin`,
+      });
+      const b = await insertObject({
+        db: ctx.current.db,
+        workspaceId: fx.workspaceId,
+        providerId: fx.providerId,
+        sha256: null,
+        status: 'ready',
+        providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/null-b/file.bin`,
+      });
+
+      await ctx.current.db.execute(RECONCILE_SQL);
+
+      for (const id of [a, b]) {
+        const row = (await ctx.current.db.execute(sql`
+          SELECT status, failure_code FROM platform.storage_objects WHERE id = ${id}
+        `)) as unknown as Array<{ status: string; failure_code: string | null }>;
+        expect(row[0].status).toBe('ready');
+        expect(row[0].failure_code).toBeNull();
+      }
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  test('does NOT demote duplicates across different workspaces (tenant isolation)', async () => {
+    if (!ctx.current) return;
+    const fx = await seedTwoWorkspaceFixture(ctx.current.db);
+    try {
+      const sha = '3'.repeat(64);
+      // Workspace-scoped index permits same sha256 across workspaces; no
+      // temp DROP needed.
+      const aId = await insertObject({
+        db: ctx.current.db,
+        workspaceId: fx.a.workspaceId,
+        providerId: fx.a.providerId,
+        sha256: sha,
+        status: 'ready',
+        createdAt: new Date('2026-01-01T00:00:00Z'),
+        providerObjectKeyHint: `workspaces/${fx.a.workspaceId}/objects/file.bin`,
+      });
+      const bId = await insertObject({
+        db: ctx.current.db,
+        workspaceId: fx.b.workspaceId,
+        providerId: fx.b.providerId,
+        sha256: sha,
+        status: 'ready',
+        createdAt: new Date('2026-02-01T00:00:00Z'),
+        providerObjectKeyHint: `workspaces/${fx.b.workspaceId}/objects/file.bin`,
+      });
+
+      await ctx.current.db.execute(RECONCILE_SQL);
+
+      for (const id of [aId, bId]) {
+        const row = (await ctx.current.db.execute(sql`
+          SELECT status, failure_code FROM platform.storage_objects WHERE id = ${id}
+        `)) as unknown as Array<{ status: string; failure_code: string | null }>;
+        expect(row[0].status).toBe('ready');
+        expect(row[0].failure_code).toBeNull();
+      }
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  test('does NOT demote rows whose status is terminal (pending_upload / failed / deleted)', async () => {
+    if (!ctx.current) return;
+    const fx = await seedWorkspaceFixture(ctx.current.db);
+    try {
+      const sha = '4'.repeat(64);
+      // Terminal-status rows — the dev index excludes them; reconciliation
+      // predicate also excludes them.
+      const pendingId = await insertObject({
+        db: ctx.current.db,
+        workspaceId: fx.workspaceId,
+        providerId: fx.providerId,
+        sha256: sha,
+        status: 'pending_upload',
+        providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/pending/file.bin`,
+      });
+      const failedId = await insertObject({
+        db: ctx.current.db,
+        workspaceId: fx.workspaceId,
+        providerId: fx.providerId,
+        sha256: sha,
+        status: 'failed',
+        providerObjectKeyHint: `workspaces/${fx.workspaceId}/objects/failed/file.bin`,
+      });
+
+      await ctx.current.db.execute(RECONCILE_SQL);
+
+      const pending = (await ctx.current.db.execute(sql`
+        SELECT status, failure_code FROM platform.storage_objects WHERE id = ${pendingId}
+      `)) as unknown as Array<{ status: string; failure_code: string | null }>;
+      expect(pending[0].status).toBe('pending_upload');
+      expect(pending[0].failure_code).toBeNull();
+
+      const failed = (await ctx.current.db.execute(sql`
+        SELECT status, failure_code FROM platform.storage_objects WHERE id = ${failedId}
+      `)) as unknown as Array<{ status: string; failure_code: string | null }>;
+      expect(failed[0].status).toBe('failed');
+      expect(failed[0].failure_code).toBeNull();
+    } finally {
+      await fx.cleanup();
+    }
   });
 });

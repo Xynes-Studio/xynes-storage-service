@@ -1880,9 +1880,48 @@ storage-client behaviour lands with **DEDUP-2** (`xynes-storage-service` +
 ### Canonical migration
 
 - **File:** `xynes/xynes-infra/supabase/migrations/20260528090000_storage_object_references_and_dedup_index.sql`
-- **Contract test:** `xynes/xynes-infra/scripts/test/universal-storage-dedup-schema.test.sh` — auto-wired into `scripts/test/run.sh`. 57 assertions / 0 failures.
+- **Contract test:** `xynes/xynes-infra/scripts/test/universal-storage-dedup-schema.test.sh` — auto-wired into `scripts/test/run.sh`. **65 assertions / 0 failures** (includes 8 reconciliation-block assertions).
 - **Drizzle mirror update:** `src/infra/db/schema.ts` declares `storageObjectReferences` + `STORAGE_OBJECT_REFERENCE_OWNER_KINDS` closed-set.
 - **Drift detector:** `bun run db:check` now loads BOTH the STORAGE-2 base migration AND this DEDUP-1 migration via concatenation; the closed-set parity check covers the new `owner_kind` CHECK constraint, and a dedicated invariant assertion locks the workspace-scoped partial unique index in place.
+
+### Pre-index reconciliation (Codex P1 fix)
+
+The migration includes a reconciliation block that runs **BEFORE** the
+`CREATE UNIQUE INDEX` statement. Without it, the index creation would
+abort on any environment that already accumulated legacy duplicates
+(same `(workspace_id, sha256)` with multiple rows in active statuses —
+which is exactly Bug 2's signature).
+
+The reconciliation is a `WITH ranked_duplicates AS (...) UPDATE ...`
+that soft-deletes every duplicate except the OLDEST per
+`(workspace_id, sha256)` group:
+
+- **Winner selection.** Lowest `created_at` first, lowest `id` as
+  tiebreaker. Winner's status is preserved.
+- **Losers.** Flip to `status='deleted'`, `deleted_at=now()`,
+  `failure_code='DEDUP_RECONCILED'`, and a stable English
+  `failure_message`. Non-destructive: rows + provider object keys +
+  audit columns are preserved for forensic / billing review.
+- **DB safety.** UPDATE only. No `DROP` / `ALTER … DROP` / `TRUNCATE` /
+  `DELETE FROM`. The soft-delete pattern is the same one STORAGE-2
+  already uses; the `storage_objects_deleted_consistency` CHECK is
+  satisfied because `deleted_at` is set.
+- **Idempotency.** Re-running the migration is a no-op for the
+  reconciliation step — the partial unique index already enforces the
+  "exactly one active row per `(workspace_id, sha256)`" invariant, so
+  there are no remaining duplicates to demote. `UPDATE 0`.
+- **Operator audit.** Post-deploy, an operator can identify which rows
+  the migration demoted with
+  `SELECT count(*) FROM platform.storage_objects WHERE failure_code = 'DEDUP_RECONCILED'`.
+
+The reconciliation invariant is covered by **6 new integration tests**
+in `tests/infra/db/repositories/dedup-schema.integration.test.ts`
+under the `DEDUP-1 — pre-index reconciliation (Codex P1 fix)` describe
+block: winner selection (oldest), tiebreaker (lowest id), idempotency,
+NULL-sha256 immunity, cross-workspace immunity, terminal-status
+immunity. Tests that need to seed duplicates run inside a Drizzle
+transaction with the dev index temporarily dropped + a rollback
+sentinel that restores it.
 
 ### Security invariants
 
