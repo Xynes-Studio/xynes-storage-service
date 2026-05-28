@@ -149,7 +149,7 @@ describe('createRunnerDependencies — mode selection', () => {
     expect(r.mode).toBe('stub');
   });
 
-  test('live mode wires SharpImageProcessor for image_optimize (STORAGE-FU-5-FU-A); video / document still use production stubs', async () => {
+  test('live mode wires SharpImageProcessor for image_optimize + FfmpegVideoProcessor for video_* (STORAGE-FU-5-FU-A + FU-B); document still uses production stub', async () => {
     const r = createRunnerDependencies({
       providerIO: FAKE_IO,
       variants: FAKE_VARIANTS,
@@ -406,5 +406,246 @@ describe('createRunnerDependencies — STORAGE-FU-5-FU-A: live image variants ar
     const contentTypes = new Set(writes.map((w) => w.contentType));
     expect(contentTypes.has('image/webp')).toBe(true);
     expect(contentTypes.has('image/avif')).toBe(true);
+  });
+});
+
+// ── STORAGE-FU-5-FU-B: Bug 1 regression guard (video) ────────────────────
+
+/**
+ * STORAGE-FU-5-FU-B — Bug 1 regression guard for video variants.
+ *
+ * Before FU-B landed, a `video_thumbnail` job in live mode produced
+ * a 4-byte JPEG-SOI+EOI stub artefact, and `video_transcode` produced
+ * a 24-byte `ftypisom` MP4 box header stub. Both are bunk.
+ *
+ * This test wires the full video_thumbnail + video_transcode runners
+ * against a real in-memory MP4 produced by ffmpeg-static and asserts:
+ *
+ *   1. The thumbnail runner writes a poster variant > 1024 bytes.
+ *   2. The transcode runner writes a transcode_h264 variant > 1024
+ *      bytes.
+ *   3. Both variant content-types match their declared format.
+ */
+describe('createRunnerDependencies — STORAGE-FU-5-FU-B: live video variants are real bytes', () => {
+  test('video_thumbnail + video_transcode against a real MP4 write variants > 1024 bytes (Bug 1 guard)', async () => {
+    // Resolve the ffmpeg-static binary path inline so this test
+    // self-contains its source-MP4 generation (mirrors the pattern
+    // in `ffmpeg-video-processor.test.ts` Bug 1 guard).
+    const { __forTesting__: vp } =
+      await import('../../../src/infra/processors/ffmpeg-video-processor');
+    const ffmpegPath = vp.resolveDefaultFfmpegPath();
+
+    // Generate a 2-second 160x120 H.264+AAC MP4 in memory.
+    const gen = Bun.spawn(
+      [
+        ffmpegPath,
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc=duration=2:size=160x120:rate=10',
+        '-f',
+        'lavfi',
+        '-i',
+        'sine=frequency=440:duration=2',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-c:a',
+        'aac',
+        '-pix_fmt',
+        'yuv420p',
+        '-movflags',
+        '+frag_keyframe+empty_moov',
+        '-f',
+        'mp4',
+        'pipe:1',
+      ],
+      { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+    );
+    const sourceMp4 = new Uint8Array(await new Response(gen.stdout).arrayBuffer());
+    await gen.exited;
+    expect(sourceMp4.length).toBeGreaterThan(0);
+
+    // Capturing IO + variant writer.
+    const writes: Array<{
+      objectKey: string;
+      body: Uint8Array;
+      contentType: string;
+      byteSize: number;
+    }> = [];
+    const capturingIO = {
+      async readObject(): Promise<Uint8Array> {
+        return new Uint8Array(sourceMp4);
+      },
+      async writeObject(input: {
+        objectKey: string;
+        body: Uint8Array;
+        contentType: string;
+      }): Promise<{ byteSize: number }> {
+        writes.push({ ...input, byteSize: input.body.length });
+        return { byteSize: input.body.length };
+      },
+    };
+    const recorded: Array<{ role: string; contentType: string; byteSize: number }> = [];
+    const capturingVariants = {
+      async recordVariant(input: {
+        role: string;
+        contentType: string;
+        byteSize: number;
+      }): Promise<void> {
+        recorded.push({
+          role: input.role,
+          contentType: input.contentType,
+          byteSize: input.byteSize,
+        });
+      },
+    };
+
+    const r = createRunnerDependencies({
+      providerIO: capturingIO,
+      variants: capturingVariants,
+      env: { NODE_ENV: 'production' },
+    });
+    expect(r.mode).toBe('live');
+
+    const job = {
+      id: 'job-1',
+      jobType: 'video_thumbnail' as const,
+      objectId: 'obj-1',
+      workspaceId: 'ws-1',
+      attempts: 0,
+      maxAttempts: 3,
+      payload: {},
+      required: false,
+    };
+    const object = {
+      id: 'obj-1',
+      workspaceId: 'ws-1',
+      providerId: 'prov-1',
+      providerObjectKey: 'k/orig.mp4',
+      filename: 'orig.mp4',
+      contentType: 'video/mp4',
+      byteSize: sourceMp4.length,
+      sha256: null,
+      purpose: 'cms_media' as const,
+      visibility: 'private' as const,
+      status: 'uploaded' as const,
+      compressionRequested: true,
+      createdBy: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      uploadedAt: new Date(),
+    };
+
+    // Run the thumbnail runner.
+    const posterResult = await r.registry.video_thumbnail!({ job, object });
+    expect(posterResult).toEqual({});
+
+    // Run the transcode runner against the same source.
+    const transcodeResult = await r.registry.video_transcode!({
+      job: { ...job, jobType: 'video_transcode' },
+      object,
+    });
+    expect(transcodeResult).toEqual({});
+
+    // Bug 1 regression guard: every variant > 1024 bytes.
+    expect(writes.length).toBe(2);
+    for (const w of writes) {
+      expect(w.byteSize).toBeGreaterThan(1024);
+    }
+    const contentTypes = new Set(writes.map((w) => w.contentType));
+    expect(contentTypes.has('image/jpeg')).toBe(true); // poster
+    expect(contentTypes.has('video/mp4')).toBe(true); // transcode
+
+    // Variant records mirror the writes.
+    expect(recorded.length).toBe(2);
+    expect(new Set(recorded.map((r) => r.role))).toEqual(new Set(['poster', 'transcode_h264']));
+  }, 60_000);
+});
+
+// ── STORAGE-FU-5-FU-B: env contract + fallback ───────────────────────────
+
+import { __forTesting__ as runnerDepsForTesting } from '../../../src/infra/processors/runner-dependencies';
+
+describe('resolveFfmpegTimeoutMs', () => {
+  test('returns undefined when env var is unset', () => {
+    expect(runnerDepsForTesting.resolveFfmpegTimeoutMs({})).toBeUndefined();
+  });
+
+  test('returns undefined when env var is empty', () => {
+    expect(
+      runnerDepsForTesting.resolveFfmpegTimeoutMs({ STORAGE_FFMPEG_TIMEOUT_MS: '' }),
+    ).toBeUndefined();
+  });
+
+  test('returns undefined when env var is non-numeric', () => {
+    expect(
+      runnerDepsForTesting.resolveFfmpegTimeoutMs({ STORAGE_FFMPEG_TIMEOUT_MS: 'never' }),
+    ).toBeUndefined();
+  });
+
+  test('returns undefined when env var is non-positive', () => {
+    expect(
+      runnerDepsForTesting.resolveFfmpegTimeoutMs({ STORAGE_FFMPEG_TIMEOUT_MS: '0' }),
+    ).toBeUndefined();
+    expect(
+      runnerDepsForTesting.resolveFfmpegTimeoutMs({ STORAGE_FFMPEG_TIMEOUT_MS: '-10' }),
+    ).toBeUndefined();
+  });
+
+  test('returns undefined when env var is a float (non-integer)', () => {
+    expect(
+      runnerDepsForTesting.resolveFfmpegTimeoutMs({ STORAGE_FFMPEG_TIMEOUT_MS: '1.5' }),
+    ).toBeUndefined();
+  });
+
+  test('returns parsed integer for a valid positive int env var', () => {
+    expect(
+      runnerDepsForTesting.resolveFfmpegTimeoutMs({ STORAGE_FFMPEG_TIMEOUT_MS: '90000' }),
+    ).toBe(90000);
+  });
+});
+
+describe('buildLiveVideoProcessor — fallback posture', () => {
+  test('returns a working processor when the loader resolves', () => {
+    runnerDepsForTesting.resetFfmpegFallbackLogged();
+    const proc = runnerDepsForTesting.buildLiveVideoProcessor({});
+    expect(proc).toBeDefined();
+    expect(typeof proc.probe).toBe('function');
+    expect(typeof proc.renderPoster).toBe('function');
+    expect(typeof proc.renderTranscode).toBe('function');
+  });
+
+  test('falls back to production stub when the loader throws (single WARN)', () => {
+    runnerDepsForTesting.resetFfmpegFallbackLogged();
+    const origWarn = console.warn;
+    const warnCalls: unknown[][] = [];
+    console.warn = (...args: unknown[]) => {
+      warnCalls.push(args);
+    };
+    try {
+      // First call: throws inside loader → WARN fires.
+      const proc1 = runnerDepsForTesting.buildLiveVideoProcessor({}, () => {
+        throw new Error('synthetic ffmpeg-loader failure (test fixture)');
+      });
+      expect(proc1).toBeDefined();
+      // Second call: same throwing loader → WARN does NOT re-fire.
+      const proc2 = runnerDepsForTesting.buildLiveVideoProcessor({}, () => {
+        throw new Error('synthetic again');
+      });
+      expect(proc2).toBeDefined();
+      expect(warnCalls.length).toBe(1);
+      // WARN message carries NO library hint (STORAGE-9 redaction).
+      const warnText = String(warnCalls[0][0]);
+      expect(warnText).toMatch(/runner-dependencies/);
+      expect(warnText).not.toMatch(/synthetic|loader|stack|ffmpeg-static/i);
+    } finally {
+      console.warn = origWarn;
+      runnerDepsForTesting.resetFfmpegFallbackLogged();
+    }
   });
 });

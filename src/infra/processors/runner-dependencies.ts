@@ -10,17 +10,19 @@
  *
  *   - `live` (default for `NODE_ENV === 'production'`)
  *     STORAGE-FU-5-FU-A: wires `SharpImageProcessor` (sharp/libvips)
- *     for `image_optimize`. Video / document still use the safe-fail
- *     production stubs that throw `UNSUPPORTED_FORMAT` until
- *     STORAGE-FU-5-FU-B (ffmpeg) and STORAGE-FU-5-FU-C (LibreOffice)
- *     land. This is a deliberate fail-safe: a hosted environment that
- *     flips `live` without the per-family adapter wired sees clean
- *     closed-set runner failures, not opaque crashes.
+ *     for `image_optimize`.
+ *     STORAGE-FU-5-FU-B: wires `FfmpegVideoProcessor` (ffmpeg-static)
+ *     for `video_probe` / `video_thumbnail` / `video_transcode`.
+ *     Document still uses the safe-fail production stub that throws
+ *     `UNSUPPORTED_FORMAT` until STORAGE-FU-5-FU-C (LibreOffice)
+ *     lands. This is a deliberate fail-safe: a hosted environment
+ *     that flips `live` without the per-family adapter wired sees
+ *     clean closed-set runner failures, not opaque crashes.
  *
- *     Sharp import failure (corrupted libvips binding, unsupported
- *     platform) falls back to `ProductionImageProcessorStub` with a
- *     single startup WARN — image jobs dead-letter cleanly instead of
- *     crashing the worker.
+ *     Sharp or ffmpeg-static import failure (corrupted binding /
+ *     binary, unsupported platform) falls back to the production
+ *     stubs with a single startup WARN per family — image / video
+ *     jobs dead-letter cleanly instead of crashing the worker.
  *
  * Override via `STORAGE_PROCESSOR_MODE` env. `live` requires every
  * downstream binary to be installed; treat that switch as a deploy
@@ -54,11 +56,17 @@ import {
   ProductionImageProcessorStub,
   ProductionVideoProcessorStub,
 } from './production-processors';
-// Type-only import — does NOT pull in `sharp` at module load. The
-// runtime value is lazy-loaded inside `buildLiveImageProcessor()`
-// via `createRequire` so stub mode boots even when sharp/libvips is
-// missing or corrupted (STORAGE-FU-5-FU-A safe-fail invariant).
+// Type-only imports — does NOT pull in `sharp` or `ffmpeg-static` at
+// module load. The runtime values are lazy-loaded inside
+// `buildLiveImageProcessor()` / `buildLiveVideoProcessor()` via
+// `createRequire` so stub mode boots even when the native binaries
+// are missing or corrupted (STORAGE-FU-5-FU-A / FU-B safe-fail
+// invariant).
 import type { SharpImageProcessor as SharpImageProcessorType } from './sharp-image-processor';
+import type {
+  FfmpegVideoProcessor as FfmpegVideoProcessorType,
+  FfmpegVideoProcessorDeps,
+} from './ffmpeg-video-processor';
 import { createRequire } from 'node:module';
 
 export const PROCESSOR_MODES = ['stub', 'live'] as const;
@@ -165,21 +173,88 @@ function buildLiveImageProcessor(
 }
 
 /**
- * Test-only seam for STORAGE-FU-5-FU-A fallback regression tests.
+ * Build the production video processor.
+ *
+ * STORAGE-FU-5-FU-B: live mode wires `FfmpegVideoProcessor`
+ * (`ffmpeg-static` invoked via `Bun.spawn`). Same lazy-load contract
+ * as `buildLiveImageProcessor` — the require fires only when live
+ * mode is actually selected, and a failure (missing binary, ESM/CJS
+ * interop hiccup, unsupported platform/arch in ffmpeg-static) falls
+ * back to `ProductionVideoProcessorStub` with a single startup WARN
+ * so every video_* job dead-letters with `PROCESSOR_FAILED` instead
+ * of crashing the worker.
+ *
+ * **Env contract.** The optional `STORAGE_FFMPEG_TIMEOUT_MS` env var
+ * tunes the per-invocation timeout. Default 5 minutes (per the
+ * deployment-posture doc).
+ *
+ * **Test seam.** Mirrors the sharp pattern: a `loader` param injects
+ * a failure factory without process-wide module mocking; a `deps`
+ * param lets tests pass a deterministic spawner.
+ */
+let ffmpegFallbackLogged = false;
+type FfmpegProcessorCtor = new (deps?: FfmpegVideoProcessorDeps) => FfmpegVideoProcessorType;
+function defaultFfmpegLoader(): FfmpegProcessorCtor {
+  const requireFn = createRequire(import.meta.url);
+  const mod = requireFn('./ffmpeg-video-processor') as {
+    FfmpegVideoProcessor: FfmpegProcessorCtor;
+  };
+  return mod.FfmpegVideoProcessor;
+}
+function resolveFfmpegTimeoutMs(env: NodeJS.ProcessEnv): number | undefined {
+  const raw = env.STORAGE_FFMPEG_TIMEOUT_MS;
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    return undefined;
+  }
+  return parsed;
+}
+function buildLiveVideoProcessor(
+  env: NodeJS.ProcessEnv,
+  loader: () => FfmpegProcessorCtor = defaultFfmpegLoader,
+): VideoProcessor {
+  try {
+    const Ctor = loader();
+    const timeoutMs = resolveFfmpegTimeoutMs(env);
+    return new Ctor(timeoutMs !== undefined ? { timeoutMs } : undefined);
+  } catch (err) {
+    if (!ffmpegFallbackLogged) {
+      ffmpegFallbackLogged = true;
+      // Single WARN at startup; never re-emit per-call. Message
+      // carries NO library hint — STORAGE-9 redaction posture.
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[runner-dependencies] ffmpeg unavailable; video_* runners will dead-letter with PROCESSOR_FAILED until adapter is wired',
+      );
+      void err;
+    }
+    return new ProductionVideoProcessorStub();
+  }
+}
+
+/**
+ * Test-only seam for STORAGE-FU-5-FU-A / FU-B fallback regression
+ * tests.
  *
  * Exported under a `__forTesting__` prefix so the linter / reader can
  * spot misuse — production callers MUST NOT depend on this. The seam
  * lets tests:
- *   1. Inject a custom sharp loader that throws (simulating a missing
- *      libvips binding) WITHOUT calling Bun's `mock.module`, which is
- *      process-wide and pollutes neighbouring test files.
- *   2. Reset the `sharpFallbackLogged` latch between tests so the
+ *   1. Inject a custom sharp / ffmpeg loader that throws (simulating
+ *      a missing native binding) WITHOUT calling Bun's `mock.module`,
+ *      which is process-wide and pollutes neighbouring test files.
+ *   2. Reset the per-family fallback latch between tests so the
  *      single-WARN invariant can be asserted deterministically.
  */
 export const __forTesting__ = {
   buildLiveImageProcessor,
+  buildLiveVideoProcessor,
+  resolveFfmpegTimeoutMs,
   resetSharpFallbackLogged(): void {
     sharpFallbackLogged = false;
+  },
+  resetFfmpegFallbackLogged(): void {
+    ffmpegFallbackLogged = false;
   },
 };
 
@@ -197,8 +272,7 @@ export function createRunnerDependencies(
   const image: ImageProcessor =
     options.image ?? (mode === 'stub' ? new StubImageProcessor() : buildLiveImageProcessor());
   const video: VideoProcessor =
-    options.video ??
-    (mode === 'stub' ? new StubVideoProcessor() : new ProductionVideoProcessorStub());
+    options.video ?? (mode === 'stub' ? new StubVideoProcessor() : buildLiveVideoProcessor(env));
   const document: DocumentProcessor =
     options.document ??
     (mode === 'stub' ? new StubDocumentProcessor() : new ProductionDocumentProcessorStub());
