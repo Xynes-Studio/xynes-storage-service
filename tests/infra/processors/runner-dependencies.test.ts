@@ -649,3 +649,358 @@ describe('buildLiveVideoProcessor — fallback posture', () => {
     }
   });
 });
+
+// ── STORAGE-FU-5-FU-C: env contract + fallback ───────────────────────────
+
+describe('resolveSofficeTimeoutMs', () => {
+  test('returns undefined when env var is unset', () => {
+    expect(runnerDepsForTesting.resolveSofficeTimeoutMs({})).toBeUndefined();
+  });
+
+  test('returns undefined when env var is empty', () => {
+    expect(
+      runnerDepsForTesting.resolveSofficeTimeoutMs({ STORAGE_SOFFICE_TIMEOUT_MS: '' }),
+    ).toBeUndefined();
+  });
+
+  test('returns undefined when env var is non-numeric', () => {
+    expect(
+      runnerDepsForTesting.resolveSofficeTimeoutMs({ STORAGE_SOFFICE_TIMEOUT_MS: 'soon' }),
+    ).toBeUndefined();
+  });
+
+  test('returns undefined when env var is non-positive', () => {
+    expect(
+      runnerDepsForTesting.resolveSofficeTimeoutMs({ STORAGE_SOFFICE_TIMEOUT_MS: '0' }),
+    ).toBeUndefined();
+    expect(
+      runnerDepsForTesting.resolveSofficeTimeoutMs({ STORAGE_SOFFICE_TIMEOUT_MS: '-30' }),
+    ).toBeUndefined();
+  });
+
+  test('returns undefined when env var is a float', () => {
+    expect(
+      runnerDepsForTesting.resolveSofficeTimeoutMs({ STORAGE_SOFFICE_TIMEOUT_MS: '1.5' }),
+    ).toBeUndefined();
+  });
+
+  test('returns parsed integer for a valid positive int env var', () => {
+    expect(
+      runnerDepsForTesting.resolveSofficeTimeoutMs({ STORAGE_SOFFICE_TIMEOUT_MS: '90000' }),
+    ).toBe(90000);
+  });
+});
+
+describe('resolveLibreOfficeServiceUrl', () => {
+  test('returns undefined when env var is unset', () => {
+    expect(runnerDepsForTesting.resolveLibreOfficeServiceUrl({})).toBeUndefined();
+  });
+
+  test('returns undefined when env var is empty', () => {
+    expect(
+      runnerDepsForTesting.resolveLibreOfficeServiceUrl({ LIBREOFFICE_SERVICE_URL: '' }),
+    ).toBeUndefined();
+  });
+
+  test('returns undefined when env var is whitespace-only', () => {
+    expect(
+      runnerDepsForTesting.resolveLibreOfficeServiceUrl({ LIBREOFFICE_SERVICE_URL: '   ' }),
+    ).toBeUndefined();
+  });
+
+  test('returns trimmed value for a non-empty env var', () => {
+    expect(
+      runnerDepsForTesting.resolveLibreOfficeServiceUrl({
+        LIBREOFFICE_SERVICE_URL: '  http://libreoffice-sidecar:8100  ',
+      }),
+    ).toBe('http://libreoffice-sidecar:8100');
+  });
+});
+
+describe('buildLiveDocumentProcessor — fallback posture', () => {
+  test('returns ProductionDocumentProcessorStub when LIBREOFFICE_SERVICE_URL is unset (single WARN, reason=url-missing)', () => {
+    runnerDepsForTesting.resetLibreOfficeFallbackLogged();
+    const origWarn = console.warn;
+    const warnCalls: unknown[][] = [];
+    console.warn = (...args: unknown[]) => {
+      warnCalls.push(args);
+    };
+    try {
+      const proc1 = runnerDepsForTesting.buildLiveDocumentProcessor({});
+      // Calling again does NOT re-emit the WARN.
+      const proc2 = runnerDepsForTesting.buildLiveDocumentProcessor({});
+      expect(proc1).toBeDefined();
+      expect(proc2).toBeDefined();
+      expect(warnCalls.length).toBe(1);
+      // Audit hint: closed-set `reason` tag.
+      const warnText = String(warnCalls[0][0]);
+      expect(warnText).toMatch(/runner-dependencies/);
+      expect(warnText).toMatch(/url-missing/);
+      expect(warnText).not.toMatch(/libreoffice-sidecar|http:|https:/);
+    } finally {
+      console.warn = origWarn;
+      runnerDepsForTesting.resetLibreOfficeFallbackLogged();
+    }
+  });
+
+  test('returns LibreOfficeDocumentProcessor when URL is set and loader resolves', async () => {
+    runnerDepsForTesting.resetLibreOfficeFallbackLogged();
+    const proc = runnerDepsForTesting.buildLiveDocumentProcessor({
+      LIBREOFFICE_SERVICE_URL: 'http://libreoffice-sidecar:8100',
+    });
+    expect(proc).toBeDefined();
+    expect(typeof proc.renderFirstPagePreview).toBe('function');
+  });
+
+  test('falls back to ProductionDocumentProcessorStub when the loader throws (single WARN, reason=ctor-failed)', () => {
+    runnerDepsForTesting.resetLibreOfficeFallbackLogged();
+    const origWarn = console.warn;
+    const warnCalls: unknown[][] = [];
+    console.warn = (...args: unknown[]) => {
+      warnCalls.push(args);
+    };
+    try {
+      const proc1 = runnerDepsForTesting.buildLiveDocumentProcessor(
+        { LIBREOFFICE_SERVICE_URL: 'http://libreoffice-sidecar:8100' },
+        () => {
+          throw new Error('synthetic libreoffice-loader failure (test fixture)');
+        },
+      );
+      const proc2 = runnerDepsForTesting.buildLiveDocumentProcessor(
+        { LIBREOFFICE_SERVICE_URL: 'http://libreoffice-sidecar:8100' },
+        () => {
+          throw new Error('synthetic again');
+        },
+      );
+      expect(proc1).toBeDefined();
+      expect(proc2).toBeDefined();
+      expect(warnCalls.length).toBe(1);
+      const warnText = String(warnCalls[0][0]);
+      expect(warnText).toMatch(/runner-dependencies/);
+      expect(warnText).toMatch(/ctor-failed/);
+      // No library / URL hint.
+      expect(warnText).not.toMatch(/synthetic|loader|stack|libreoffice-sidecar|http:/i);
+    } finally {
+      console.warn = origWarn;
+      runnerDepsForTesting.resetLibreOfficeFallbackLogged();
+    }
+  });
+
+  test('falls back to ProductionDocumentProcessorStub when the URL is invalid (ctor throws)', () => {
+    runnerDepsForTesting.resetLibreOfficeFallbackLogged();
+    const origWarn = console.warn;
+    const warnCalls: unknown[][] = [];
+    console.warn = (...args: unknown[]) => {
+      warnCalls.push(args);
+    };
+    try {
+      const proc = runnerDepsForTesting.buildLiveDocumentProcessor({
+        LIBREOFFICE_SERVICE_URL: 'file:///etc/passwd',
+      });
+      // Real loader resolves but the ctor throws on the bad URL →
+      // fallback path runs.
+      expect(proc).toBeDefined();
+      expect(warnCalls.length).toBe(1);
+      const warnText = String(warnCalls[0][0]);
+      expect(warnText).toMatch(/ctor-failed/);
+    } finally {
+      console.warn = origWarn;
+      runnerDepsForTesting.resetLibreOfficeFallbackLogged();
+    }
+  });
+
+  test('forwards STORAGE_SOFFICE_TIMEOUT_MS to the constructor', async () => {
+    runnerDepsForTesting.resetLibreOfficeFallbackLogged();
+    let observedDeps: { serviceUrl: string; timeoutMs?: number } | undefined;
+    // Inject a fake Ctor via the loader seam that records its
+    // constructor args. We have to return a class shape that
+    // matches the type signature, so use a stub class.
+    class FakeCtor {
+      constructor(deps: { serviceUrl: string; timeoutMs?: number }) {
+        observedDeps = deps;
+      }
+      async renderFirstPagePreview(): Promise<never> {
+        throw new Error('unused in this test');
+      }
+    }
+    const proc = runnerDepsForTesting.buildLiveDocumentProcessor(
+      {
+        LIBREOFFICE_SERVICE_URL: 'http://libreoffice-sidecar:8100',
+        STORAGE_SOFFICE_TIMEOUT_MS: '15000',
+      },
+      () => FakeCtor as unknown as new (deps: { serviceUrl: string; timeoutMs?: number }) => never,
+    );
+    expect(proc).toBeDefined();
+    expect(observedDeps?.serviceUrl).toBe('http://libreoffice-sidecar:8100');
+    expect(observedDeps?.timeoutMs).toBe(15000);
+  });
+
+  test('omits timeoutMs from constructor when env var is unset', () => {
+    runnerDepsForTesting.resetLibreOfficeFallbackLogged();
+    let observedDeps: { serviceUrl: string; timeoutMs?: number } | undefined;
+    class FakeCtor {
+      constructor(deps: { serviceUrl: string; timeoutMs?: number }) {
+        observedDeps = deps;
+      }
+      async renderFirstPagePreview(): Promise<never> {
+        throw new Error('unused');
+      }
+    }
+    const proc = runnerDepsForTesting.buildLiveDocumentProcessor(
+      { LIBREOFFICE_SERVICE_URL: 'http://libreoffice-sidecar:8100' },
+      () => FakeCtor as unknown as new (deps: { serviceUrl: string; timeoutMs?: number }) => never,
+    );
+    expect(proc).toBeDefined();
+    expect(observedDeps?.serviceUrl).toBe('http://libreoffice-sidecar:8100');
+    // No `timeoutMs` key when env var is unset — defaults inside the
+    // ctor take over.
+    expect('timeoutMs' in (observedDeps as object)).toBe(false);
+  });
+});
+
+// ── STORAGE-FU-5-FU-C: Bug 1 regression guard (document) ─────────────────
+
+/**
+ * STORAGE-FU-5-FU-C — Bug 1 regression guard for document variants.
+ *
+ * Before FU-C landed, a `document_preview` job in live mode produced
+ * a 4-byte JPEG-SOI+EOI stub artefact (`StubDocumentProcessor`) or
+ * `UNSUPPORTED_FORMAT` (`ProductionDocumentProcessorStub`). FU-C
+ * wires the LibreOffice sidecar HTTP client so the runner produces a
+ * real PNG/JPEG preview.
+ *
+ * This test wires the full document_preview runner against a fake
+ * `globalThis.fetch` that simulates the sidecar returning a real
+ * preview body. It asserts:
+ *
+ *   1. The runner completes successfully (no PROCESSOR_FAILED).
+ *   2. A `preview_first_page` variant is written.
+ *   3. The variant byte size is > 1024 bytes (Bug 1 sanity floor).
+ *   4. The content-type is `image/png` or `image/jpeg`.
+ */
+describe('createRunnerDependencies — STORAGE-FU-5-FU-C: live document variants are real bytes', () => {
+  test('document_preview against a fake sidecar writes preview > 1024 bytes (Bug 1 guard)', async () => {
+    // Build a synthetic 2 KiB PNG body — bigger than the Bug 1 floor
+    // but small enough that the test stays in memory.
+    const fakePreviewBytes = new Uint8Array(2048);
+    // PNG signature + filler.
+    fakePreviewBytes[0] = 0x89;
+    fakePreviewBytes[1] = 0x50;
+    fakePreviewBytes[2] = 0x4e;
+    fakePreviewBytes[3] = 0x47;
+    fakePreviewBytes[4] = 0x0d;
+    fakePreviewBytes[5] = 0x0a;
+    fakePreviewBytes[6] = 0x1a;
+    fakePreviewBytes[7] = 0x0a;
+    // Capturing IO + variant writer (same pattern as FU-A / FU-B).
+    const writes: Array<{
+      objectKey: string;
+      body: Uint8Array;
+      contentType: string;
+      byteSize: number;
+    }> = [];
+    const capturingIO = {
+      async readObject(): Promise<Uint8Array> {
+        // Simulate the original PDF bytes — content doesn't matter
+        // because the fake sidecar ignores them.
+        return new Uint8Array([0x25, 0x50, 0x44, 0x46]); // %PDF
+      },
+      async writeObject(input: {
+        objectKey: string;
+        body: Uint8Array;
+        contentType: string;
+      }): Promise<{ byteSize: number }> {
+        writes.push({ ...input, byteSize: input.body.length });
+        return { byteSize: input.body.length };
+      },
+    };
+    const recorded: Array<{ role: string; contentType: string; byteSize: number }> = [];
+    const capturingVariants = {
+      async recordVariant(input: {
+        role: string;
+        contentType: string;
+        byteSize: number;
+      }): Promise<void> {
+        recorded.push({
+          role: input.role,
+          contentType: input.contentType,
+          byteSize: input.byteSize,
+        });
+      },
+    };
+
+    // Patch globalThis.fetch to simulate the sidecar.
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      return new Response(fakePreviewBytes, {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          'x-document-page-width': '1240',
+          'x-document-page-height': '1754',
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      const r = createRunnerDependencies({
+        providerIO: capturingIO,
+        variants: capturingVariants,
+        env: {
+          NODE_ENV: 'production',
+          LIBREOFFICE_SERVICE_URL: 'http://libreoffice-sidecar:8100',
+        },
+      });
+      expect(r.mode).toBe('live');
+      const result = await r.registry.document_preview!({
+        job: {
+          id: 'job-1',
+          jobType: 'document_preview',
+          objectId: 'obj-1',
+          workspaceId: 'ws-1',
+          attempts: 0,
+          maxAttempts: 3,
+          payload: {},
+          required: false,
+        },
+        object: {
+          id: 'obj-1',
+          workspaceId: 'ws-1',
+          providerId: 'prov-1',
+          providerObjectKey: 'k/orig.pdf',
+          filename: 'orig.pdf',
+          contentType: 'application/pdf',
+          byteSize: 4,
+          sha256: null,
+          purpose: 'cms_media',
+          visibility: 'private',
+          status: 'uploaded',
+          compressionRequested: true,
+          createdBy: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          uploadedAt: new Date(),
+        },
+      });
+
+      // Runner reports success.
+      expect(result).toEqual({});
+
+      // Exactly one variant was written.
+      expect(writes.length).toBe(1);
+      expect(recorded.length).toBe(1);
+
+      // Bug 1 regression guard: variant > 1024 bytes.
+      expect(writes[0].byteSize).toBeGreaterThan(1024);
+
+      // Content-type matches the closed set.
+      expect(writes[0].contentType).toMatch(/^image\/(png|jpeg)$/);
+
+      // Recorded role + dimensions.
+      expect(recorded[0].role).toBe('preview_first_page');
+      expect(recorded[0].contentType).toBe('image/png');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});

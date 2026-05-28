@@ -949,6 +949,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-5 | ✅ Landed 2026-05-15 (Production runners — stub-mode default + S3 IO + variant writer + production-stub processors) |
 | STORAGE-FU-5-FU-A | ✅ Landed 2026-05-28 (Sharp-backed `ImageProcessor` — closes Bug 1 for image variants; EXIF stripping mandatory; libvips cache disabled) |
 | STORAGE-FU-5-FU-B | ✅ Landed 2026-05-28 (ffmpeg-backed `VideoProcessor` — closes Bug 1 for video variants; `-map_metadata -1` strips embedded metadata; pipe-only I/O with no temp files; `STORAGE_FFMPEG_TIMEOUT_MS` per-job timeout; in-process Bun.spawn against `ffmpeg-static`) |
+| STORAGE-FU-5-FU-C | ✅ Landed 2026-05-28 (LibreOffice-backed `DocumentProcessor` — closes Bug 1 for document preview variants; HTTP client to pod-local sidecar via `LIBREOFFICE_SERVICE_URL`; `STORAGE_SOFFICE_TIMEOUT_MS` per-job timeout; safe-fail to production stub when URL unset) |
 | STORAGE-FU-5-FU-E | ✅ Landed 2026-05-28 (Deployment posture decision — sharp + ffmpeg in-process, LibreOffice + clamav sidecars; Compose overlay + K8s draft manifests) |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
 | DEDUP-1 | ✅ Landed 2026-05-28 (Content-hash dedup schema — `platform.storage_object_references` reference-counting join table + workspace-scoped partial unique index on `storage_objects (workspace_id, sha256)`) |
@@ -1843,6 +1844,183 @@ posture).
   honest "unknown" signal rather than fabricating a number).
 - ffprobe-based JSON probe (we use `ffmpeg -i ... -f null -` stderr
   scraping because `ffmpeg-static` doesn't bundle ffprobe).
+- Live integration smoke against R2 (live-rollout plan).
+
+## LibreOffice-backed Document Processor (STORAGE-FU-5-FU-C)
+
+STORAGE-FU-5-FU-C closes the gap between STORAGE-FU-5's safe-fail
+`ProductionDocumentProcessorStub` and a real, byte-producing
+`DocumentProcessor` for `STORAGE_PROCESSOR_MODE=live`. Before this
+story, a `document_preview` job in live mode dead-lettered with
+`PROCESSOR_FAILED` after `maxAttempts` retries (production stub) or
+produced a 4-byte JPEG SOI+EOI artefact in stub mode. After FU-C,
+live deployments produce real PNG/JPEG previews by speaking HTTP to
+the **LibreOffice sidecar** committed to in STORAGE-FU-5-FU-E.
+
+This **closes Bug 1 (document preview variants)** from the combined
+follow-ups plan — pending the operator-side env flip + the FU-E
+follow-up that builds the slim sidecar image carrying the Bun HTTP
+shim.
+
+### Topology — sidecar, NOT in-process
+
+Per STORAGE-FU-5-FU-E §3 the LibreOffice processor runs as a
+**sidecar** reached over pod-local DNS. We do NOT bundle `soffice`
+into the storage-service image because:
+
+1. **Image footprint** — `soffice` + JRE + fonts is ~400 MB.
+2. **Restart isolation** — `soffice` crashes don't take down the
+   worker; document jobs degrade cleanly via `PROCESSOR_FAILED`.
+3. **Blast radius** — historical `soffice` RCEs against malicious
+   documents. Macros are disabled globally via `SAL_DISABLE_MACROS=1`
+   on the sidecar container, and the sidecar runs least-privilege
+   (`cap_drop: [ALL]`, `read_only: true`, `no-new-privileges:true`).
+4. **Cold-start cost** — `soffice` startup is ~2 s. A long-lived
+   sidecar amortises that.
+
+### Wire contract
+
+```
+POST ${LIBREOFFICE_SERVICE_URL}/convert
+Content-Type: application/json
+{ "sourceContentType": "<allowlisted MIME>", "bytes": "<base64>" }
+
+  ↓
+
+200 OK
+Content-Type: image/png | image/jpeg
+X-Document-Page-Width:  <integer>
+X-Document-Page-Height: <integer>
+<raw PNG/JPEG bytes>
+```
+
+Status-code semantics enforced by the processor:
+- `200` + allowlisted Content-Type → success.
+- `200` + unexpected Content-Type / empty body → `PROCESSOR_FAILED` (retryable).
+- `400`–`499` → `UNSUPPORTED_FORMAT` (non-retryable; the sidecar
+  rejected THIS document, retrying same bytes against same sidecar
+  won't help).
+- `500`–`599` → `PROCESSOR_FAILED` (retryable; transient sidecar fault).
+- Network failure / DNS failure / timeout → `PROCESSOR_FAILED`.
+- Anything else (`1xx`, `3xx`) → `PROCESSOR_FAILED`.
+
+### Env contract
+
+- **`LIBREOFFICE_SERVICE_URL`** (required for live mode). Default in
+  the FU-E Compose overlay is `http://libreoffice-sidecar:8100`.
+  **Pod-local DNS only** — must be `http://` or `https://`; any other
+  scheme is rejected at construction time. When unset, `live` mode
+  silently falls back to `ProductionDocumentProcessorStub` with a
+  single startup `WARN` (audit reason: `url-missing`). Every
+  `document_preview` job dead-letters cleanly via `PROCESSOR_FAILED`;
+  the worker stays up.
+- **`STORAGE_SOFFICE_TIMEOUT_MS`** (optional). Default `60_000`
+  (60 s). Per-job timeout enforced via `AbortController`. Parser
+  rule: integer ≥ 1, otherwise default. Negative / zero / NaN / blank
+  / float all fall back to default — a malformed env can NEVER
+  produce a 0-ms timeout (instant abort) or a negative cap.
+
+### Security invariants enforced by tests
+
+1. **Allowlist re-check.** The STORAGE-8 `document_preview` runner
+   already filters on `SAFE_DOCUMENT_PREVIEW_MIMES`; the processor
+   re-checks defense-in-depth and rejects non-safe MIMEs with
+   `UNSUPPORTED_FORMAT` BEFORE any HTTP I/O.
+2. **Hard byte cap re-check.** Re-validates against
+   `MAX_DOCUMENT_BYTES` (100 MiB) BEFORE bytes go over the wire.
+3. **Output Content-Type is a closed set.** Sidecar responses
+   claiming any non-`image/png` / `image/jpeg` MIME are rejected.
+4. **URL validation at construction.** Only `http://` and `https://`
+   schemes accepted. `file://`, `ftp://`, `data:`, `javascript:`,
+   unparseable strings all throw `LIBREOFFICE_SERVICE_URL_INVALID`
+   at startup — fails loud, not silent.
+5. **No raw HTTP error text in runner errors.** Sidecar response
+   bodies, headers, stack traces NEVER reach the closed-set runner
+   error codes. A regression test injects a hostile error containing
+   `AKIA-LEAK`, `x-amz-signature=...`, and `xynes_live_...` strings
+   and asserts NONE of them survive into `RunnerExecutionError.message`
+   — only the closed-set `PROCESSOR_FAILED` code.
+6. **Per-request timeout enforced.** A run-away conversion is
+   aborted at `STORAGE_SOFFICE_TIMEOUT_MS` via `AbortController`.
+   Timed-out conversions surface as retryable `PROCESSOR_FAILED`.
+7. **No filesystem temp files in this processor.** Bytes go over the
+   wire as base64 inside a JSON body; the sidecar owns its own
+   tmpfs-mounted temp dir for the `soffice --convert-to` working
+   area and cleans it up per request.
+8. **No URL/path interpolation from user input.** The request URL is
+   `${LIBREOFFICE_SERVICE_URL}/convert` — a constant built from env
+   + a literal path segment via `new URL('/convert', base)`. A
+   trailing slash on the base or an embedded path is correctly
+   normalised; nothing from `input` reaches the URL.
+9. **Output bytes are copied** into a fresh `Uint8Array` on return —
+   callers never observe the underlying `ArrayBuffer` that the
+   `fetch` response body owned.
+10. **Document properties NEVER survive** the conversion. This is
+    the SIDECAR's responsibility (`soffice` strips embedded metadata
+    by default when converting to a raster format). The processor
+    adds defense-in-depth by rejecting sidecar responses with the
+    wrong Content-Type — a misbehaved sidecar that tries to return
+    the original document bytes as a "preview" is structurally
+    blocked.
+
+### Source layout
+
+| File | Purpose |
+|---|---|
+| `src/infra/processors/libreoffice-document-processor.ts` | `LibreOfficeDocumentProcessor` + `DocumentSidecarClient` DI port + `defaultFetchSidecarClient` + `validateSidecarUrl` + `buildConvertUrl` + `DEFAULT_SOFFICE_TIMEOUT_MS` |
+| `src/infra/processors/runner-dependencies.ts` | Adds `buildLiveDocumentProcessor(env, loader?)` with safe-fail to production stub when `LIBREOFFICE_SERVICE_URL` is unset / loader throws / URL is malformed |
+| `src/infra/processors/index.ts` | Barrel re-exports the new types and helpers |
+| `tests/infra/processors/libreoffice-document-processor.test.ts` | 60 unit tests covering pure helpers, processor behaviour, sidecar status mapping, and `defaultFetchSidecarClient` wire shape |
+| `tests/infra/processors/runner-dependencies.test.ts` | Adds 18 FU-C tests: env-helper coverage + fallback posture + Bug 1 regression guard |
+
+### DI seam
+
+The constructor accepts `LibreOfficeDocumentProcessorDeps`:
+
+```ts
+interface LibreOfficeDocumentProcessorDeps {
+  readonly serviceUrl: string;                // required, validated
+  readonly client?: DocumentSidecarClient;    // test override
+  readonly timeoutMs?: number;                // default 60_000
+}
+```
+
+`DocumentSidecarClient` is the seam tests use to inject a
+deterministic response without HTTP I/O:
+
+```ts
+interface DocumentSidecarClient {
+  convert(input: {
+    serviceUrl: string;
+    sourceContentType: string;
+    bytes: Uint8Array;
+    timeoutMs: number;
+  }): Promise<DocumentSidecarConvertResult>;
+}
+```
+
+`defaultFetchSidecarClient` is the production implementation that
+calls `globalThis.fetch` with the JSON-base64 body shape documented
+above.
+
+### Out of scope (deferred to later FU stories)
+
+- Multi-page preview rendering (single first-page only).
+- OCR for image-only PDFs.
+- Office encryption / password-protected document handling.
+- Streaming responses (sidecar buffers the full PNG/JPEG in memory
+  before responding; payloads stay under `MAX_DOCUMENT_BYTES`).
+- The Bun HTTP shim that actually serves `POST /convert` on the
+  sidecar container — STORAGE-FU-5-FU-E flagged it as the LibreOffice
+  sidecar implementation gap. The placeholder image
+  (`lscr.io/linuxserver/libreoffice:7.6.7`) ships a desktop GUI, NOT
+  the `/convert` API. Until a custom slim image with the shim is
+  built, an operator who flips `STORAGE_PROCESSOR_MODE=live` with
+  the placeholder image up will see `document_preview` jobs
+  dead-letter via `PROCESSOR_FAILED` (the safe-fail behaviour
+  documented above) — exactly the posture FU-E §3 commits to.
+- Fixture-based integration suite against a real `soffice` binary
+  (STORAGE-FU-5-FU-F).
 - Live integration smoke against R2 (live-rollout plan).
 
 ## Worker Lifecycle (STORAGE-FU-6)

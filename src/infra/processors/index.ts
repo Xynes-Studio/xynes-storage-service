@@ -36,6 +36,17 @@ export {
 } from './production-processors';
 
 export {
+  LibreOfficeDocumentProcessor,
+  DEFAULT_SOFFICE_TIMEOUT_MS,
+  defaultFetchSidecarClient,
+  validateSidecarUrl,
+  buildConvertUrl,
+  type DocumentSidecarClient,
+  type DocumentSidecarConvertResult,
+  type LibreOfficeDocumentProcessorDeps,
+} from './libreoffice-document-processor';
+
+export {
   createRunnerDependencies,
   isProcessorMode,
   PROCESSOR_MODES,
