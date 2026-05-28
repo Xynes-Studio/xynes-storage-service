@@ -47,6 +47,7 @@ import {
   UPLOAD_SESSION_STATUSES,
   STORAGE_VARIANT_STATUSES,
   PROCESSING_JOB_STATUSES,
+  STORAGE_OBJECT_REFERENCE_OWNER_KINDS,
 } from '../src/infra/db/schema';
 
 const DEFAULT_MIGRATION_PATH = resolve(
@@ -59,6 +60,26 @@ const DEFAULT_MIGRATION_PATH = resolve(
   '20260513090000_universal_storage_platform_schema.sql',
 );
 
+/**
+ * DEDUP-1 adds a second canonical migration alongside the STORAGE-2 base
+ * schema. The drift check reads BOTH and concatenates the SQL so table /
+ * CHECK / forbidden-column assertions work uniformly.
+ *
+ * Override the additional paths via `STORAGE_INFRA_EXTRA_MIGRATION_PATHS`
+ * (colon-separated). Default is the DEDUP-1 migration's canonical path.
+ */
+const DEFAULT_EXTRA_MIGRATION_PATHS = [
+  resolve(
+    import.meta.dir,
+    '..',
+    '..',
+    'xynes-infra',
+    'supabase',
+    'migrations',
+    '20260528090000_storage_object_references_and_dedup_index.sql',
+  ),
+] as const;
+
 const REQUIRED_TABLES = [
   'workspace_storage_providers',
   'storage_objects',
@@ -66,6 +87,7 @@ const REQUIRED_TABLES = [
   'storage_object_variants',
   'storage_processing_jobs',
   'storage_usage_daily',
+  'storage_object_references',
 ] as const;
 
 const FORBIDDEN_COLUMN_NAMES = [
@@ -126,6 +148,12 @@ const CHECKED_CONSTRAINTS: readonly CheckedConstraint[] = [
     migrationPattern: /storage_processing_jobs_status_check[\s\S]*?status\s+IN\s+\(([^)]+)\)/,
     mirrorValues: PROCESSING_JOB_STATUSES,
   },
+  {
+    description: 'storage_object_references.owner_kind',
+    migrationPattern:
+      /storage_object_references_owner_kind_check[\s\S]*?owner_kind\s+IN\s+\(([^)]+)\)/,
+    mirrorValues: STORAGE_OBJECT_REFERENCE_OWNER_KINDS,
+  },
 ];
 
 function parseInValues(match: string): string[] {
@@ -140,28 +168,47 @@ function parseInValues(match: string): string[] {
 
 async function main(): Promise<void> {
   const migrationPath = process.env.STORAGE_INFRA_MIGRATION_PATH ?? DEFAULT_MIGRATION_PATH;
-  let sql: string;
-  try {
-    sql = await readFile(migrationPath, 'utf-8');
-  } catch (err) {
-    console.error(
-      `[db:check] Could not read canonical migration at ${migrationPath}.\n` +
-        `Set STORAGE_INFRA_MIGRATION_PATH to override.\n` +
-        `Original error: ${(err as Error).message}`,
-    );
-    process.exit(2);
-  }
 
-  const errors: string[] = [];
+  // Load the base migration AND every additional canonical migration that
+  // contributes columns / tables / CHECK constraints the mirror depends on.
+  // Concatenation works because every assertion below is a substring /
+  // regex match against the combined SQL — order doesn't matter.
+  const extraPathsRaw = process.env.STORAGE_INFRA_EXTRA_MIGRATION_PATHS;
+  const extraPaths: string[] = extraPathsRaw
+    ? extraPathsRaw
+        .split(':')
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0)
+    : [...DEFAULT_EXTRA_MIGRATION_PATHS];
 
-  // 1. Every required table must appear in the canonical migration.
-  for (const table of REQUIRED_TABLES) {
-    if (!sql.includes(`platform.${table}`)) {
-      errors.push(`Canonical migration is missing required table platform.${table}`);
+  const allPaths = [migrationPath, ...extraPaths];
+  const sqlParts: string[] = [];
+
+  for (const p of allPaths) {
+    try {
+      sqlParts.push(await readFile(p, 'utf-8'));
+    } catch (err) {
+      console.error(
+        `[db:check] Could not read canonical migration at ${p}.\n` +
+          `Set STORAGE_INFRA_MIGRATION_PATH (base) or STORAGE_INFRA_EXTRA_MIGRATION_PATHS (additional) to override.\n` +
+          `Original error: ${(err as Error).message}`,
+      );
+      process.exit(2);
     }
   }
 
-  // 2. No forbidden raw-credential columns may appear in the canonical migration.
+  const sql = sqlParts.join('\n-- END OF MIGRATION FILE --\n');
+
+  const errors: string[] = [];
+
+  // 1. Every required table must appear in the concatenated canonical migrations.
+  for (const table of REQUIRED_TABLES) {
+    if (!sql.includes(`platform.${table}`)) {
+      errors.push(`Canonical migrations are missing required table platform.${table}`);
+    }
+  }
+
+  // 2. No forbidden raw-credential columns may appear in any canonical migration.
   for (const forbidden of FORBIDDEN_COLUMN_NAMES) {
     // Match column declarations `forbidden_name TYPE` only (avoid matching
     // the security comment paragraph at the top of the migration that lists
@@ -175,7 +222,19 @@ async function main(): Promise<void> {
     }
   }
 
-  // 3. Every closed-set CHECK constraint must match the mirror's exported
+  // 3. DEDUP-1 invariant: the workspace-scoped partial unique index on
+  //    (workspace_id, sha256) MUST be present so dedup is structurally
+  //    workspace-scoped. A unique index keyed on `sha256` alone would be
+  //    a cross-tenant leak.
+  if (!sql.includes('storage_objects_workspace_sha256_uidx')) {
+    errors.push(
+      'DEDUP-1 invariant violated: missing partial unique index ' +
+        '`storage_objects_workspace_sha256_uidx` on platform.storage_objects ' +
+        '(workspace_id, sha256). Dedup MUST be workspace-scoped.',
+    );
+  }
+
+  // 4. Every closed-set CHECK constraint must match the mirror's exported
   //    type-union constants exactly (set-equality, ignoring source order).
   for (const constraint of CHECKED_CONSTRAINTS) {
     const match = sql.match(constraint.migrationPattern);
