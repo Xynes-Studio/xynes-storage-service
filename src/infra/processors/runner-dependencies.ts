@@ -67,6 +67,10 @@ import type {
   FfmpegVideoProcessor as FfmpegVideoProcessorType,
   FfmpegVideoProcessorDeps,
 } from './ffmpeg-video-processor';
+import type {
+  LibreOfficeDocumentProcessor as LibreOfficeDocumentProcessorType,
+  LibreOfficeDocumentProcessorDeps,
+} from './libreoffice-document-processor';
 import { createRequire } from 'node:module';
 
 export const PROCESSOR_MODES = ['stub', 'live'] as const;
@@ -234,27 +238,128 @@ function buildLiveVideoProcessor(
 }
 
 /**
- * Test-only seam for STORAGE-FU-5-FU-A / FU-B fallback regression
- * tests.
+ * Build the production document processor.
+ *
+ * STORAGE-FU-5-FU-C: live mode wires `LibreOfficeDocumentProcessor`
+ * (HTTP client → libreoffice-sidecar pod-local sidecar). Same
+ * lazy-load contract as `buildLiveImageProcessor` / `buildLiveVideoProcessor`
+ * — the require fires only when live mode is actually selected, and
+ * a failure (missing module, ESM/CJS interop hiccup) falls back to
+ * `ProductionDocumentProcessorStub` with a single startup WARN so
+ * every `document_preview` job dead-letters with `PROCESSOR_FAILED`
+ * instead of crashing the worker.
+ *
+ * **Env contract.** Required: `LIBREOFFICE_SERVICE_URL` — the
+ * pod-local URL of the libreoffice-sidecar shim (default
+ * `http://libreoffice-sidecar:8100`). UNSET / blank → safe-fail to
+ * `ProductionDocumentProcessorStub` with a single startup WARN, per
+ * FU-E §4 "Tier-2 processors fall back to the safe-fail production
+ * stub when the env var is unset". Optional:
+ * `STORAGE_SOFFICE_TIMEOUT_MS` — per-job timeout in ms; default
+ * `60000` (60 s).
+ *
+ * **Why URL-unset is safe-fail (not throw).** A misconfigured live
+ * deploy that drops `LIBREOFFICE_SERVICE_URL` should NOT crash the
+ * whole worker. The image + video + scan runners still work; only
+ * `document_preview` jobs degrade to clean `PROCESSOR_FAILED`
+ * dead-letter envelopes. STORAGE-7 retries up to `maxAttempts` and
+ * dead-letters — exactly the posture FU-E §4 commits to.
+ *
+ * **Test seam.** Mirrors the sharp / ffmpeg pattern: a `loader` param
+ * injects a failure factory; a `deps` param lets tests pass a
+ * deterministic sidecar client.
+ */
+let libreofficeFallbackLogged = false;
+type LibreOfficeProcessorCtor = new (
+  deps: LibreOfficeDocumentProcessorDeps,
+) => LibreOfficeDocumentProcessorType;
+function defaultLibreOfficeLoader(): LibreOfficeProcessorCtor {
+  const requireFn = createRequire(import.meta.url);
+  const mod = requireFn('./libreoffice-document-processor') as {
+    LibreOfficeDocumentProcessor: LibreOfficeProcessorCtor;
+  };
+  return mod.LibreOfficeDocumentProcessor;
+}
+function resolveSofficeTimeoutMs(env: NodeJS.ProcessEnv): number | undefined {
+  const raw = env.STORAGE_SOFFICE_TIMEOUT_MS;
+  if (typeof raw !== 'string' || raw.length === 0) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    return undefined;
+  }
+  return parsed;
+}
+function resolveLibreOfficeServiceUrl(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.LIBREOFFICE_SERVICE_URL;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return undefined;
+  return trimmed;
+}
+function warnLibreOfficeFallback(reason: 'url-missing' | 'ctor-failed'): void {
+  if (libreofficeFallbackLogged) return;
+  libreofficeFallbackLogged = true;
+  // Single WARN at startup; never re-emit per-call. Message
+  // carries NO library hint and NO URL — STORAGE-9 redaction
+  // posture. The `reason` tag is the closed-set audit hook so
+  // operators can grep for `url-missing` vs `ctor-failed`.
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[runner-dependencies] libreoffice unavailable (${reason}); document_preview will dead-letter with PROCESSOR_FAILED until adapter is wired`,
+  );
+}
+function buildLiveDocumentProcessor(
+  env: NodeJS.ProcessEnv,
+  loader: () => LibreOfficeProcessorCtor = defaultLibreOfficeLoader,
+): DocumentProcessor {
+  const serviceUrl = resolveLibreOfficeServiceUrl(env);
+  if (serviceUrl === undefined) {
+    warnLibreOfficeFallback('url-missing');
+    return new ProductionDocumentProcessorStub();
+  }
+  try {
+    const Ctor = loader();
+    const timeoutMs = resolveSofficeTimeoutMs(env);
+    return new Ctor({
+      serviceUrl,
+      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    });
+  } catch (err) {
+    warnLibreOfficeFallback('ctor-failed');
+    void err;
+    return new ProductionDocumentProcessorStub();
+  }
+}
+
+/**
+ * Test-only seam for STORAGE-FU-5-FU-A / FU-B / FU-C fallback
+ * regression tests.
  *
  * Exported under a `__forTesting__` prefix so the linter / reader can
  * spot misuse — production callers MUST NOT depend on this. The seam
  * lets tests:
- *   1. Inject a custom sharp / ffmpeg loader that throws (simulating
- *      a missing native binding) WITHOUT calling Bun's `mock.module`,
- *      which is process-wide and pollutes neighbouring test files.
+ *   1. Inject a custom sharp / ffmpeg / libreoffice loader that throws
+ *      (simulating a missing native binding or sidecar resolution
+ *      failure) WITHOUT calling Bun's `mock.module`, which is
+ *      process-wide and pollutes neighbouring test files.
  *   2. Reset the per-family fallback latch between tests so the
  *      single-WARN invariant can be asserted deterministically.
  */
 export const __forTesting__ = {
   buildLiveImageProcessor,
   buildLiveVideoProcessor,
+  buildLiveDocumentProcessor,
   resolveFfmpegTimeoutMs,
+  resolveSofficeTimeoutMs,
+  resolveLibreOfficeServiceUrl,
   resetSharpFallbackLogged(): void {
     sharpFallbackLogged = false;
   },
   resetFfmpegFallbackLogged(): void {
     ffmpegFallbackLogged = false;
+  },
+  resetLibreOfficeFallbackLogged(): void {
+    libreofficeFallbackLogged = false;
   },
 };
 
@@ -275,7 +380,7 @@ export function createRunnerDependencies(
     options.video ?? (mode === 'stub' ? new StubVideoProcessor() : buildLiveVideoProcessor(env));
   const document: DocumentProcessor =
     options.document ??
-    (mode === 'stub' ? new StubDocumentProcessor() : new ProductionDocumentProcessorStub());
+    (mode === 'stub' ? new StubDocumentProcessor() : buildLiveDocumentProcessor(env));
   const scanner: MalwareScanner = options.scanner ?? noopMalwareScanner;
 
   const registry = createRunnerRegistry({
