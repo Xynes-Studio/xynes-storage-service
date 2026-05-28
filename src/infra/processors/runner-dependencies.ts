@@ -54,7 +54,12 @@ import {
   ProductionImageProcessorStub,
   ProductionVideoProcessorStub,
 } from './production-processors';
-import { SharpImageProcessor } from './sharp-image-processor';
+// Type-only import — does NOT pull in `sharp` at module load. The
+// runtime value is lazy-loaded inside `buildLiveImageProcessor()`
+// via `createRequire` so stub mode boots even when sharp/libvips is
+// missing or corrupted (STORAGE-FU-5-FU-A safe-fail invariant).
+import type { SharpImageProcessor as SharpImageProcessorType } from './sharp-image-processor';
+import { createRequire } from 'node:module';
 
 export const PROCESSOR_MODES = ['stub', 'live'] as const;
 export type ProcessorMode = (typeof PROCESSOR_MODES)[number];
@@ -107,14 +112,43 @@ export interface ResolvedRunnerDependencies {
  * `image_optimize` job dead-letters with `PROCESSOR_FAILED` instead of
  * crashing the whole process.
  *
+ * **Lazy-load contract.** `sharp-image-processor.ts` carries module-
+ * level side effects (`import sharp from 'sharp'` + `sharp.cache(false)`).
+ * If we imported the class statically, the require chain would
+ * evaluate at module load and throw BEFORE this function's try/catch
+ * runs — taking the whole process down. Even worse, stub mode would
+ * fail to boot even though it never needs sharp at all. We use
+ * `createRequire` here to defer evaluation: the require only fires
+ * when live mode is actually selected, and any failure (missing
+ * binding, broken libvips link, ESM/CJS interop hiccup) is caught.
+ *
  * The WARN log fires EXACTLY ONCE per process at startup. Subsequent
  * fallbacks (e.g. if a transient `sharp` import succeeded but
  * construction throws on a later call) reuse the same flag.
+ *
+ * **Test seam.** The `loader` parameter lets tests inject a failure
+ * factory without globally mocking the `sharp` module — Bun's
+ * `mock.module` is process-wide and would break neighbouring test
+ * files. Production callers never pass `loader`.
  */
 let sharpFallbackLogged = false;
-function buildLiveImageProcessor(): ImageProcessor {
+type SharpProcessorCtor = new () => SharpImageProcessorType;
+function defaultSharpLoader(): SharpProcessorCtor {
+  const requireFn = createRequire(import.meta.url);
+  const mod = requireFn('./sharp-image-processor') as {
+    SharpImageProcessor: SharpProcessorCtor;
+  };
+  return mod.SharpImageProcessor;
+}
+function buildLiveImageProcessor(
+  loader: () => SharpProcessorCtor = defaultSharpLoader,
+): ImageProcessor {
   try {
-    return new SharpImageProcessor();
+    // Lazy-resolve the SharpImageProcessor module ONLY in live mode.
+    // Stub mode never reaches this branch, so a clean-laptop install
+    // without libvips can still boot the service in stub mode.
+    const Ctor = loader();
+    return new Ctor();
   } catch (err) {
     if (!sharpFallbackLogged) {
       sharpFallbackLogged = true;
@@ -129,6 +163,25 @@ function buildLiveImageProcessor(): ImageProcessor {
     return new ProductionImageProcessorStub();
   }
 }
+
+/**
+ * Test-only seam for STORAGE-FU-5-FU-A fallback regression tests.
+ *
+ * Exported under a `__forTesting__` prefix so the linter / reader can
+ * spot misuse — production callers MUST NOT depend on this. The seam
+ * lets tests:
+ *   1. Inject a custom sharp loader that throws (simulating a missing
+ *      libvips binding) WITHOUT calling Bun's `mock.module`, which is
+ *      process-wide and pollutes neighbouring test files.
+ *   2. Reset the `sharpFallbackLogged` latch between tests so the
+ *      single-WARN invariant can be asserted deterministically.
+ */
+export const __forTesting__ = {
+  buildLiveImageProcessor,
+  resetSharpFallbackLogged(): void {
+    sharpFallbackLogged = false;
+  },
+};
 
 /**
  * Assemble the runner registry the `ProcessingWorker` consumes. The
