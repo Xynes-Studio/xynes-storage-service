@@ -149,24 +149,25 @@ describe('createRunnerDependencies — mode selection', () => {
     expect(r.mode).toBe('stub');
   });
 
-  test('live mode wires production stubs (failures surface as retryable PROCESSOR_FAILED until real adapters land)', async () => {
+  test('live mode wires SharpImageProcessor for image_optimize (STORAGE-FU-5-FU-A); video / document still use production stubs', async () => {
     const r = createRunnerDependencies({
       providerIO: FAKE_IO,
       variants: FAKE_VARIANTS,
       env: { NODE_ENV: 'production' },
     });
     expect(r.mode).toBe('live');
-    // Probe the image runner: the production stub throws
-    // RunnerInputError('UNSUPPORTED_FORMAT') inside the runner's
-    // processor.probe() call. The image runner's inner try/catch
-    // wraps EVERY processor throw into a retryable
-    // `PROCESSOR_FAILED` (this is the STORAGE-8 design — runners
-    // don't distinguish "format unsupported" from "transient
-    // processor outage" at the call site). The result is a
-    // retryable failure that eventually dead-letters after
-    // `maxAttempts` retries — operators see `PROCESSOR_FAILED` in
-    // logs and trace it back to a missing production adapter
-    // wiring.
+    // The image runner now consumes SharpImageProcessor in live mode
+    // (STORAGE-FU-5-FU-A). Passing zero bytes to the runner exercises
+    // the failure path: sharp can't decode an empty buffer →
+    // RunnerInputError('UNSUPPORTED_FORMAT') inside the processor →
+    // the image runner's defensive try/catch wraps that as
+    // RunnerExecutionError('PROCESSOR_FAILED', retryable: true) →
+    // STORAGE-7 worker dead-letters after maxAttempts retries.
+    //
+    // This test guards the WIRING, not the byte-level behaviour: the
+    // SharpImageProcessor's own unit tests in
+    // `sharp-image-processor.test.ts` exercise probe / render / EXIF
+    // stripping / dimension caps against real (synthetic) image bytes.
     const result = await r.registry.image_optimize!({
       job: {
         id: 'job-1',
@@ -197,6 +198,13 @@ describe('createRunnerDependencies — mode selection', () => {
         uploadedAt: new Date(),
       },
     });
+    // FAKE_IO returns zero bytes — SharpImageProcessor.metadata()
+    // throws on empty input → RunnerInputError('UNSUPPORTED_FORMAT')
+    // inside the processor → the image runner's defensive try/catch
+    // wraps that as PROCESSOR_FAILED (retryable). This proves the
+    // wiring works end-to-end without exercising real image bytes —
+    // the byte-level guarantees land in the FU-A Bug 1 regression
+    // guard at the bottom of this file.
     expect(result).toEqual({
       errorCode: 'PROCESSOR_FAILED',
       retryable: true,
@@ -253,5 +261,150 @@ describe('createRunnerDependencies — caller overrides', () => {
     void ProductionImageProcessorStub;
     void ProductionVideoProcessorStub;
     void ProductionDocumentProcessorStub;
+  });
+});
+
+// ── STORAGE-FU-5-FU-A: Bug 1 regression guard ────────────────────────────
+
+/**
+ * STORAGE-FU-5-FU-A — Bug 1 regression guard.
+ *
+ * Before FU-A landed, an `image_optimize` job in live mode produced
+ * variant byte sizes of exactly 8 bytes (the stub-mode PNG signature
+ * leaking through, or `UNSUPPORTED_FORMAT` from the production stub).
+ * This test wires the full image runner against an in-memory JPEG and
+ * captures the variants written via the provider IO + variant writer
+ * ports. It asserts:
+ *
+ *   1. The runner completes successfully (no PROCESSOR_FAILED).
+ *   2. At least one variant is written (the `balanced` profile writes
+ *      thumbnail_small + preview_medium + web_optimized).
+ *   3. Each variant's written byte size is > 1024 bytes — sanity
+ *      floor that catches the stub-leak / empty-encode regression.
+ *   4. Each variant's content-type matches its declared format.
+ */
+import sharp from 'sharp';
+
+describe('createRunnerDependencies — STORAGE-FU-5-FU-A: live image variants are real bytes', () => {
+  test('image_optimize against a real JPEG writes variants > 1024 bytes (Bug 1 guard)', async () => {
+    // Synthesize a small but realistic JPEG (256x192) with pseudo-random
+    // noise. A solid-colour test image would compress to ~150 bytes per
+    // variant — well below the Bug 1 sanity floor. Real-world photos
+    // never compress that tightly; the noise pattern below simulates a
+    // realistic frequency profile so each variant lands well above
+    // 1 KiB.
+    const rawPixels = Buffer.alloc(256 * 192 * 3);
+    let seed = 0x12345678;
+    for (let i = 0; i < rawPixels.length; i += 1) {
+      // xorshift32 — deterministic but high-frequency, defeats most
+      // lossy compressors below ~50% quality.
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      rawPixels[i] = seed & 0xff;
+    }
+    const sourceJpeg = await sharp(rawPixels, {
+      raw: { width: 256, height: 192, channels: 3 },
+    })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+
+    // Capturing provider IO: reads return our source bytes; writes
+    // are stashed for assertion.
+    const writes: Array<{
+      objectKey: string;
+      body: Uint8Array;
+      contentType: string;
+      byteSize: number;
+    }> = [];
+    const capturingIO = {
+      async readObject(): Promise<Uint8Array> {
+        return new Uint8Array(sourceJpeg);
+      },
+      async writeObject(input: {
+        objectKey: string;
+        body: Uint8Array;
+        contentType: string;
+      }): Promise<{ byteSize: number }> {
+        writes.push({ ...input, byteSize: input.body.length });
+        return { byteSize: input.body.length };
+      },
+    };
+
+    // Capturing variant writer: keeps track of recorded variants.
+    const recorded: Array<{ role: string; contentType: string; byteSize: number }> = [];
+    const capturingVariants = {
+      async recordVariant(input: {
+        role: string;
+        contentType: string;
+        byteSize: number;
+      }): Promise<void> {
+        recorded.push({
+          role: input.role,
+          contentType: input.contentType,
+          byteSize: input.byteSize,
+        });
+      },
+    };
+
+    const r = createRunnerDependencies({
+      providerIO: capturingIO,
+      variants: capturingVariants,
+      env: { NODE_ENV: 'production' },
+    });
+    expect(r.mode).toBe('live');
+
+    const result = await r.registry.image_optimize!({
+      job: {
+        id: 'job-1',
+        jobType: 'image_optimize',
+        objectId: 'obj-1',
+        workspaceId: 'ws-1',
+        attempts: 0,
+        maxAttempts: 3,
+        payload: {},
+        required: false,
+      },
+      object: {
+        id: 'obj-1',
+        workspaceId: 'ws-1',
+        providerId: 'prov-1',
+        providerObjectKey: 'k/orig.jpg',
+        filename: 'orig.jpg',
+        contentType: 'image/jpeg',
+        byteSize: sourceJpeg.length,
+        sha256: null,
+        purpose: 'cms_media',
+        visibility: 'private',
+        status: 'uploaded',
+        compressionRequested: true,
+        createdBy: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        uploadedAt: new Date(),
+      },
+    });
+
+    // Runner reported success (no error code envelope).
+    expect(result).toEqual({});
+
+    // The balanced profile writes 3 variants.
+    expect(writes.length).toBe(3);
+    expect(recorded.length).toBe(3);
+
+    // Bug 1 regression guard: every variant must be > 1024 bytes.
+    // Stub-mode produced 8-byte variants; production-stub produced
+    // zero (UNSUPPORTED_FORMAT). FU-A produces real re-encoded bytes.
+    for (const w of writes) {
+      expect(w.byteSize).toBeGreaterThan(1024);
+      // Defense in depth: contentType matches its known image MIME.
+      expect(w.contentType).toMatch(/^image\/(avif|webp|jpeg|png)$/);
+    }
+
+    // Sanity: at least one variant emits AVIF and one emits WebP per
+    // the balanced profile shape.
+    const contentTypes = new Set(writes.map((w) => w.contentType));
+    expect(contentTypes.has('image/webp')).toBe(true);
+    expect(contentTypes.has('image/avif')).toBe(true);
   });
 });

@@ -946,7 +946,16 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-3 | ✅ Landed 2026-05-15 (Provider resolver + secret-manager interface) |
 | STORAGE-FU-4 | ✅ Landed 2026-05-15 (Composition root — handler registration + ready event) |
 | STORAGE-FU-5 | ✅ Landed 2026-05-15 (Production runners — stub-mode default + S3 IO + variant writer + production-stub processors) |
+| STORAGE-FU-5-FU-A | ✅ Landed 2026-05-28 (Sharp-backed `ImageProcessor` — closes Bug 1 for image variants; EXIF stripping mandatory; libvips cache disabled) |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
+| STORAGE-LIVE-1 | ✅ Landed 2026-05-16 (R2 dev bucket + lifecycle + CORS + credential reference) |
+| STORAGE-LIVE-2 | ✅ Landed 2026-05-16 (`platform.workspace_storage_providers` R2 dev seed migration + bootstrap wiring) |
+| STORAGE-LIVE-3 | ✅ Landed 2026-05-27 (Live `--full` smoke evidence: PASS 13 / FAIL 0 against R2 dev) |
+| STORAGE-LIVE-4 | ✅ Landed 2026-05-27 (CMS editor browser smoke: PASS 9 / FAIL 0 against R2 dev; render-loop + dragdrop/paste objectId fixes shipped on the same branch) |
+| STORAGE-LIVE-5 | ✅ Landed 2026-05-27 (`cms_editor_storage_uploads` feature flag — gateway-architecture via `@xynes/auth-sdk` + `posthog-node` server-side) |
+| STORAGE-LIVE-6 | ❌ Deferred 2026-05-27 — Hosted-alternate runbook (B2 / iDrive e2). Not MVP-blocking. Re-open as a separate plan when a workspace requests B2 or e2 residency. |
+| STORAGE-LIVE-7 | ❌ Deferred 2026-05-27 — MinIO ad-hoc smoke. Operator-discretionary. STORAGE-12 rollout checklist §3.1 MinIO recipe + `bash scripts/smoke-universal-storage.sh --provider minio` is the canonical procedure. |
+| STORAGE-LIVE epic | ✅ Closed + archived 2026-05-27 (`xynes/xynes-infra/docs/plans/archive/2026-05-14-storage-live-provider-rollout.md`) |
 
 ## Drizzle Schema Mirror (STORAGE-FU-1)
 
@@ -1599,6 +1608,91 @@ const runnerDeps = createRunnerDependencies({
   `worker.start()` — the polling loop is deliberately deferred.
 - **Live integration smoke against R2.** That's the live-rollout
   plan (`xynes/xynes-infra/docs/plans/2026-05-14-storage-live-provider-rollout.md`).
+
+
+## Sharp-backed Image Processor (STORAGE-FU-5-FU-A)
+
+STORAGE-FU-5-FU-A closes the gap between STORAGE-FU-5's safe-fail
+`ProductionImageProcessorStub` (which throws `UNSUPPORTED_FORMAT` on
+every call) and a real image processor backed by `sharp` (libvips).
+After this story, an `image_optimize` job in live mode produces real
+variant bytes (`> 1024` bytes per variant) instead of the 8-byte stub
+artefact OR the production-stub `PROCESSOR_FAILED` envelope. Closes
+**Bug 1 (image variants)** from the
+`2026-05-27-storage-followups-combined.md` plan.
+
+### Source
+
+| File | Role |
+|---|---|
+| `src/infra/processors/sharp-image-processor.ts` | `SharpImageProcessor` — sharp/libvips-backed `ImageProcessor` implementing STORAGE-8's port. |
+| `src/infra/processors/runner-dependencies.ts` | Extended: `buildLiveImageProcessor()` constructs `SharpImageProcessor` in live mode, falls back to the safe-fail stub with a single startup WARN if construction throws. |
+| `package.json` | Adds `sharp@^0.34.5` as a runtime dependency. |
+
+### Security invariants (asserted by tests)
+
+1. **EXIF / GPS metadata stripping is MANDATORY.** Asserted at JPEG,
+   WebP, AVIF output formats by re-probing and checking
+   `metadata().exif` is `undefined`. The processor relies on sharp's
+   default "strip on re-encode" posture — never calls
+   `.withMetadata()` (which would opt INTO preservation).
+2. **Defense-in-depth dimension cap.** Re-validates probe dimensions
+   against `MAX_IMAGE_DIMENSION` (16k pixels) before re-encode.
+   `OVER_MAX_DIMENSIONS` is non-retryable.
+3. **No filesystem temporary files.** Sharp processes bytes in
+   memory only — a crash mid-encode cannot leak partial bytes.
+4. **libvips global pixel cache is disabled** via `sharp.cache(false)`
+   at module load. Prevents cross-tenant pixel residue across worker
+   invocations.
+5. **Closed-set runner errors only.** Sharp / libvips error messages
+   NEVER reach the caller. Decode-time failure →
+   `RunnerInputError('UNSUPPORTED_FORMAT')` (non-retryable);
+   encode-time failure →
+   `RunnerExecutionError('PROCESSOR_FAILED', retryable: true)`.
+6. **No upscaling.** `.resize({ fit: 'inside', withoutEnlargement: true })`
+   preserves source dimensions when variant caps are larger.
+
+### Format mapping
+
+| `ImageVariantSpec.format` | Wire `format` | Wire `contentType` |
+|---|---|---|
+| `avif` | `avif` | `image/avif` |
+| `webp` | `webp` | `image/webp` |
+| `jpeg` | `jpeg` | `image/jpeg` |
+| `original` | `jpeg` | `image/jpeg` |
+
+`original` falls back to broadest-compat JPEG re-encode per STORAGE-8
+contract.
+
+### Live-mode fallback posture
+
+`buildLiveImageProcessor()` tries to construct `new SharpImageProcessor()`.
+On success, returns it. On failure (corrupted libvips binding,
+unsupported platform), logs ONE `WARN` line at startup and returns
+`ProductionImageProcessorStub` — image jobs dead-letter with
+`PROCESSOR_FAILED` after `maxAttempts`. The worker keeps running;
+only the image leg is affected. WARN message carries NO library hint
+(STORAGE-9 redaction posture).
+
+### Tests
+
+- **`tests/infra/processors/sharp-image-processor.test.ts`** (NEW,
+  26 unit tests, 66 expects) — probe / render / EXIF stripping at
+  JPEG/WebP/AVIF / dimension hard cap / error mapping / wire shape /
+  libvips cache state / defensive branches.
+- **`tests/infra/processors/runner-dependencies.test.ts`** (+1 Bug 1
+  regression guard, "live image variants are real bytes") — wires
+  the full image runner against an in-memory deterministic-noise
+  JPEG, captures variant writes, asserts each variant > 1024 bytes.
+
+### Out of scope (deferred)
+
+- Real-world camera/phone JPEG fixtures (synthetic test bytes
+  exercise every code path; STORAGE-FU-5-FU-F adds the
+  fixture-based integration suite).
+- Animated GIF / WebP (single-frame only in MVP).
+- CMYK / wide-gamut output (sRGB only in MVP).
+- Live integration smoke against R2 (live-rollout plan).
 
 ## Worker Lifecycle (STORAGE-FU-6)
 
