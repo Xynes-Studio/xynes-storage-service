@@ -1238,5 +1238,77 @@ describeIf(
         await fx.cleanup();
       }
     });
+
+    test('PK collision (duplicate id within a batch) MUST NOT be translated to DuplicateActiveJobError (Codex P2 regression guard)', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        // Reuse the SAME `id` for two DIFFERENT `(object_id, job_kind)`
+        // pairs in a single batch. The in-tx pre-check looks at the
+        // `(object_id, job_kind)` pair — these are distinct, so it
+        // doesn't fire. The actual INSERT then raises 23505 against
+        // `storage_processing_jobs_pkey` (the PRIMARY KEY constraint),
+        // NOT the FU-1 partial unique index.
+        //
+        // Before the Codex P2 fix, the catch block matched any
+        // constraint name that started with `storage_processing_jobs_`,
+        // so the PK collision would be silently translated to
+        // `DuplicateActiveJobError`. That would mask a genuine
+        // write-failure bug (bad job id, duplicate batch entry).
+        //
+        // The fix tightens the match to the exact FU-1 index name.
+        // PK violations now propagate as raw `unique_violation`
+        // (or whatever Drizzle surfaces them as) so callers see the
+        // real failure.
+        const sharedId = randomUUID();
+        let caught: Error | null = null;
+        try {
+          await queue.enqueueBatch([
+            {
+              id: sharedId,
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'scan_validation',
+              required: true,
+              payload: {},
+              scheduledAt: new Date(),
+            },
+            {
+              id: sharedId, // <- intentional PK collision within the batch
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'image_optimize',
+              required: false,
+              payload: {},
+              scheduledAt: new Date(),
+            },
+          ]);
+        } catch (err) {
+          caught = err as Error;
+        }
+        expect(caught).not.toBeNull();
+        const code = (caught as { code?: string }).code;
+        // MUST NOT be `DUPLICATE_ACTIVE_JOB` — this is a PK collision,
+        // NOT an active-job duplicate. The repo's FU-1 catch must
+        // match ONLY the canonical FU-1 index name.
+        expect(code).not.toBe('DUPLICATE_ACTIVE_JOB');
+        // Belt-and-braces: confirm no `image_optimize` row survived
+        // — the whole transaction must have rolled back.
+        const jobs = await queue.listForObject({
+          objectId,
+          workspaceId: fx.workspaceId,
+        });
+        expect(jobs.filter((j) => j.jobType === 'image_optimize').length).toBe(0);
+      } finally {
+        await fx.cleanup();
+      }
+    });
   },
 );

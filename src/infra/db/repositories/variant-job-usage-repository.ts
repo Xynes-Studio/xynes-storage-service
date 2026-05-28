@@ -133,12 +133,20 @@ const PG_UNIQUE_VIOLATION = '23505';
 /**
  * Name of the STORAGE-FU-2-FU-1 partial unique index on
  * `platform.storage_processing_jobs (object_id, job_kind) WHERE
- * status IN ('queued', 'running')`. Tracked here so a regression
- * that renames the index in the canonical migration is caught at
- * runtime (the catch block falls back to the column-based check
- * defensively when the constraint name doesn't match, so a rename
- * still translates correctly — but a mismatch is a signal to update
- * this constant).
+ * status IN ('queued', 'running')`. The catch block in `enqueueBatch`
+ * matches this constraint name EXACTLY when translating SQLSTATE
+ * 23505 into `DuplicateActiveJobError`. Matching by exact name (not
+ * by `startsWith('storage_processing_jobs_')`) is intentional: a
+ * loose match would also catch `storage_processing_jobs_pkey` and
+ * translate a genuine PK collision into a duplicate-active-job
+ * envelope, masking a real write-failure bug.
+ *
+ * Drift detection lives in:
+ *   - `bun run db:check` — fail-loud assertion on the canonical
+ *     migration.
+ *   - `tests/infra/db/schema.test.ts` — mirror parity test.
+ * If a future migration ever renames the FU-1 index, both gates
+ * fail loud before this constant ever needs to change.
  */
 const FU_1_ACTIVE_JOB_INDEX = 'storage_processing_jobs_active_unique_uidx';
 
@@ -303,16 +311,18 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
         // duplicate `(object_id, job_kind)` INSERT for a row already
         // in `queued` / `running` status. Translate into the same
         // closed-set `DuplicateActiveJobError` the pre-check raises.
+        //
+        // Match ONLY the canonical FU-1 index name (Codex P2 fix):
+        // a loose `startsWith('storage_processing_jobs_')` would
+        // also match `storage_processing_jobs_pkey` and translate a
+        // genuine PK collision (bad `job.id` or duplicate id within
+        // the batch) into `DuplicateActiveJobError`, masking a real
+        // write-failure bug. Drift detection is already covered by
+        // `bun run db:check` + the schema-mirror parity test in
+        // `tests/infra/db/schema.test.ts` — both fail loud if a
+        // future migration renames the FU-1 index.
         const pg = extractPgError(err);
-        if (
-          pg?.code === PG_UNIQUE_VIOLATION &&
-          // Match either the canonical FU-1 index name, or any unique
-          // index on `storage_processing_jobs` whose constraint name is
-          // unrecognised (defense in depth — a future rename in the
-          // canonical migration still translates correctly).
-          (pg.constraint_name === FU_1_ACTIVE_JOB_INDEX ||
-            (pg.constraint_name && pg.constraint_name.startsWith('storage_processing_jobs_')))
-        ) {
+        if (pg?.code === PG_UNIQUE_VIOLATION && pg.constraint_name === FU_1_ACTIVE_JOB_INDEX) {
           // We don't know which input pair tripped the index without
           // querying the DB again. Report the FIRST batch entry so the
           // error message is deterministic + doesn't leak the contents
