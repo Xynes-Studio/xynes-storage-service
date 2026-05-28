@@ -86,11 +86,19 @@
  *      base64-encoded bytes; nothing from the input reaches the
  *      URL.
  *
- *   9. **Output bytes are copied into a fresh `Uint8Array`.** Callers
+ *   9. **No 3xx redirect following.** `defaultFetchSidecarClient`
+ *      sets `redirect: 'manual'` so a sidecar (or an intermediate
+ *      proxy) that returns 3xx with a `Location` header CANNOT cause
+ *      `fetch` to re-POST the JSON body (including the base64
+ *      document bytes) to the redirected URL. The 3xx response
+ *      surfaces locally and is classified as `PROCESSOR_FAILED` by
+ *      the processor's status-code branch. Closes Codex P2 (SEC).
+ *
+ *  10. **Output bytes are copied into a fresh `Uint8Array`.** Callers
  *      never observe the underlying `ArrayBuffer` that the response
  *      reader owned.
  *
- *  10. **Document properties NEVER survive.** The output PNG/JPEG
+ *  11. **Document properties NEVER survive.** The output PNG/JPEG
  *      MUST NOT carry the source document's metadata (author,
  *      title, comments, EXIF, etc.). This is the SIDECAR's
  *      responsibility (`soffice` strips by default when converting
@@ -305,6 +313,19 @@ export const defaultFetchSidecarClient: DocumentSidecarClient = {
         headers: { 'Content-Type': 'application/json' },
         body,
         signal: controller.signal,
+        // Spec-compliant `fetch` defaults to `redirect: 'follow'`.
+        // If the sidecar (or an intermediate proxy) returns 3xx with
+        // a `Location` header, the default follower would re-send
+        // this JSON body — INCLUDING the base64-encoded document
+        // bytes — to the redirected URL BEFORE our 3xx → PROCESSOR_FAILED
+        // branch downstream ever sees the response. That is an
+        // SSRF / document-exfiltration vector against a hostile or
+        // misconfigured sidecar.
+        //
+        // `redirect: 'manual'` forces fetch to surface the 3xx
+        // response as-is so the processor's status-code branch can
+        // classify it locally. Closes Codex #1 (P2, SEC) on PR #22.
+        redirect: 'manual',
       });
 
       const contentType = response.headers.get('content-type');

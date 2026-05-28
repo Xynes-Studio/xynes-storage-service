@@ -862,6 +862,7 @@ describe('defaultFetchSidecarClient — wire shape', () => {
       method?: string;
       headers?: Record<string, string>;
       body?: string;
+      redirect?: RequestInit['redirect'];
     } = {};
     const origFetch = globalThis.fetch;
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -870,6 +871,7 @@ describe('defaultFetchSidecarClient — wire shape', () => {
       const hdrs = init?.headers as Record<string, string> | undefined;
       captured.headers = hdrs;
       captured.body = init?.body as string;
+      captured.redirect = init?.redirect;
       // Build a synthetic Response.
       return new Response(fakePngBytes(), {
         status: 200,
@@ -898,6 +900,13 @@ describe('defaultFetchSidecarClient — wire shape', () => {
       expect(captured.url).toBe('http://libreoffice-sidecar:8100/convert');
       expect(captured.method).toBe('POST');
       expect((captured.headers as Record<string, string>)['Content-Type']).toBe('application/json');
+      // SECURITY invariant #9: redirects must NOT be followed by the
+      // default fetch client. If they were, a 3xx Location response
+      // would cause fetch to re-POST the JSON body (including the
+      // base64-encoded document bytes) to the redirected URL BEFORE
+      // our 3xx → PROCESSOR_FAILED branch ever sees the response.
+      // Closes Codex P2 (SEC) on PR #22.
+      expect(captured.redirect).toBe('manual');
       // Body is JSON; bytes are base64-encoded.
       const parsed = JSON.parse(captured.body!) as {
         sourceContentType: string;
@@ -906,6 +915,55 @@ describe('defaultFetchSidecarClient — wire shape', () => {
       expect(parsed.sourceContentType).toBe('application/pdf');
       // base64 of [0x25, 0x50, 0x44, 0x46] is `JVBERg==`.
       expect(parsed.bytes).toBe('JVBERg==');
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test('surfaces 3xx redirect responses to the caller without re-sending the body (security invariant #9)', async () => {
+    // Codex P2 (SEC) regression guard. If `defaultFetchSidecarClient`
+    // ever drops `redirect: 'manual'`, fetch would follow the 3xx
+    // and re-POST the JSON body — including the base64-encoded
+    // document bytes — to the redirected `Location` URL. This test
+    // asserts that (a) we ONLY ever see one fetch call, (b) the
+    // 3xx is surfaced to the processor as a 301 status (which the
+    // processor classifies as `PROCESSOR_FAILED`), and (c) the body
+    // bytes never reach the redirected URL.
+    let callCount = 0;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      callCount += 1;
+      // Defensive: a misbehaved follower would re-send POST to the
+      // attacker URL. If we ever see callCount > 1 or the URL
+      // change, the test fails.
+      if (callCount > 1) {
+        throw new Error(
+          `redirect leaked: fetch called ${callCount}x; second URL=${
+            typeof input === 'string' ? input : input.toString()
+          }`,
+        );
+      }
+      expect(init?.redirect).toBe('manual');
+      return new Response(null, {
+        status: 301,
+        headers: { location: 'https://attacker.example.com/exfiltrate' },
+      });
+    }) as unknown as typeof fetch;
+    try {
+      const result = await defaultFetchSidecarClient.convert({
+        serviceUrl: 'http://libreoffice-sidecar:8100',
+        sourceContentType: 'application/pdf',
+        bytes: new Uint8Array([0xde, 0xad, 0xbe, 0xef]), // sentinel payload
+        timeoutMs: 30_000,
+      });
+      // Fetch called exactly once — redirect was NOT followed.
+      expect(callCount).toBe(1);
+      // The 301 surfaces as-is so the processor's status-code
+      // branch can classify it (3xx → PROCESSOR_FAILED).
+      expect(result.status).toBe(301);
+      // Sentinel bytes never reached a second fetch — they are
+      // contained inside the request body that defaultFetchSidecarClient
+      // built. Verified above via the second-call guard.
     } finally {
       globalThis.fetch = origFetch;
     }
