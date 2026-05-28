@@ -121,6 +121,61 @@ export class PostgresStorageProcessingJobRepository implements StorageProcessing
 // ── PostgresProcessingJobQueueRepository (STORAGE-7) ──────────────────────
 
 /**
+ * SQLSTATE for `unique_violation`. We catch this on the INSERT inside
+ * `enqueueBatch` to translate the new STORAGE-FU-2-FU-1 partial unique
+ * index violation into the same closed-set `DuplicateActiveJobError`
+ * envelope that the in-transaction pre-check raises. Callers see ONE
+ * consistent error shape regardless of which layer detected the
+ * duplicate.
+ */
+const PG_UNIQUE_VIOLATION = '23505';
+
+/**
+ * Name of the STORAGE-FU-2-FU-1 partial unique index on
+ * `platform.storage_processing_jobs (object_id, job_kind) WHERE
+ * status IN ('queued', 'running')`. The catch block in `enqueueBatch`
+ * matches this constraint name EXACTLY when translating SQLSTATE
+ * 23505 into `DuplicateActiveJobError`. Matching by exact name (not
+ * by `startsWith('storage_processing_jobs_')`) is intentional: a
+ * loose match would also catch `storage_processing_jobs_pkey` and
+ * translate a genuine PK collision into a duplicate-active-job
+ * envelope, masking a real write-failure bug.
+ *
+ * Drift detection lives in:
+ *   - `bun run db:check` — fail-loud assertion on the canonical
+ *     migration.
+ *   - `tests/infra/db/schema.test.ts` — mirror parity test.
+ * If a future migration ever renames the FU-1 index, both gates
+ * fail loud before this constant ever needs to change.
+ */
+const FU_1_ACTIVE_JOB_INDEX = 'storage_processing_jobs_active_unique_uidx';
+
+/**
+ * Drizzle wraps driver errors and re-throws a plain `Error` whose
+ * `cause` is the underlying `PostgresError` from `postgres-js`. The
+ * `PostgresError` carries `.code` (SQLSTATE) and `.constraint_name`.
+ *
+ * Returns `null` when the error doesn't look like a PG error so the
+ * caller can fall through and re-throw the original.
+ */
+interface PgErrorLike {
+  readonly code?: string;
+  readonly constraint_name?: string;
+  readonly table_name?: string;
+}
+function extractPgError(err: unknown): PgErrorLike | null {
+  if (err == null || typeof err !== 'object') return null;
+  // Drizzle path: { cause: PostgresError }.
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause && typeof cause === 'object' && 'code' in cause) {
+    return cause as PgErrorLike;
+  }
+  // Direct path (some drivers don't wrap): the error itself has `.code`.
+  if ('code' in err) return err as PgErrorLike;
+  return null;
+}
+
+/**
  * Thrown by `enqueueBatch` when a non-terminal (`queued` / `running`)
  * row already exists for one of the requested `(objectId, jobType)`
  * pairs. Callers should treat this as an idempotency signal: the prior
@@ -133,9 +188,18 @@ export class PostgresStorageProcessingJobRepository implements StorageProcessing
  * `failed` / `succeeded` / `cancelled` rows are intentionally allowed
  * to be superseded so retries land.
  *
+ * STORAGE-FU-2-FU-1: the same error envelope is now raised when the
+ * partial unique index `storage_processing_jobs_active_unique_uidx`
+ * rejects a duplicate INSERT under multi-worker race (a narrow window
+ * the transactional pre-check cannot cover). Callers see ONE error
+ * shape regardless of which layer detected the duplicate.
+ *
  * The error message intentionally surfaces only the first colliding
  * pair so a hostile caller cannot probe active jobs via trial-and-error
- * batches.
+ * batches. The DB-side variant deliberately reports the colliding pair
+ * as the FIRST input pair we attempted to insert (the precise pair
+ * the partial unique index rejected is in `err.constraint_name` only,
+ * not in the message, by design).
  */
 export class DuplicateActiveJobError extends Error {
   public readonly code = 'DUPLICATE_ACTIVE_JOB';
@@ -167,15 +231,19 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
     //    pairs already in the queue UNLESS the existing row is in a
     //    terminal state".
     //
-    // Why per-row check (not a unique partial index): the canonical
-    // STORAGE-2 migration deliberately does NOT carry a unique index
-    // covering this rule because retries after terminal `failed` /
-    // `succeeded` / `cancelled` rows MUST be allowed. We enforce the
-    // "no duplicate ACTIVE row" rule in-transaction here. Once a
-    // future migration adds an expression index like
-    //   CREATE UNIQUE INDEX ... ON storage_processing_jobs (object_id, job_kind)
-    //   WHERE status IN ('queued','running');
-    // this transaction-level check becomes belt-and-braces.
+    // Two-layer enforcement (defense in depth):
+    //   (a) Transaction-level pre-check below — runs a `SELECT … status
+    //       IN ('queued','running')` against the requested batch and
+    //       raises `DuplicateActiveJobError` BEFORE the INSERT. This
+    //       gives the caller a clean closed-set error envelope without
+    //       wasting an INSERT round-trip on the obvious case.
+    //   (b) STORAGE-FU-2-FU-1 partial unique index
+    //       `storage_processing_jobs_active_unique_uidx` — covers the
+    //       narrow race window where two workers in different
+    //       transactions both pass the pre-check before either INSERTs.
+    //       The DB-side rejection is caught below and translated into
+    //       the same `DuplicateActiveJobError` envelope so callers see
+    //       ONE error shape regardless of detection layer.
     return this.db.transaction(async (tx) => {
       // Build a uniqueness probe over the requested batch. Drizzle's
       // `inArray` would collapse the AND on `(object_id IN ..., job_kind
@@ -220,22 +288,52 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
         }
       }
 
-      const inserted = await tx
-        .insert(storageProcessingJobs)
-        .values(
-          input.map((job) => ({
-            id: job.id,
-            objectId: job.objectId,
-            workspaceId: job.workspaceId,
-            // DB column: job_kind.
-            jobKind: job.jobType,
-            status: 'queued' as const,
-            attempts: 0,
-            scheduledAt: job.scheduledAt,
-          })),
-        )
-        .returning();
-      return inserted.map(mapProcessingJobRow);
+      try {
+        const inserted = await tx
+          .insert(storageProcessingJobs)
+          .values(
+            input.map((job) => ({
+              id: job.id,
+              objectId: job.objectId,
+              workspaceId: job.workspaceId,
+              // DB column: job_kind.
+              jobKind: job.jobType,
+              status: 'queued' as const,
+              attempts: 0,
+              scheduledAt: job.scheduledAt,
+            })),
+          )
+          .returning();
+        return inserted.map(mapProcessingJobRow);
+      } catch (err) {
+        // STORAGE-FU-2-FU-1 race-window catch: the partial unique index
+        // `storage_processing_jobs_active_unique_uidx` rejected a
+        // duplicate `(object_id, job_kind)` INSERT for a row already
+        // in `queued` / `running` status. Translate into the same
+        // closed-set `DuplicateActiveJobError` the pre-check raises.
+        //
+        // Match ONLY the canonical FU-1 index name (Codex P2 fix):
+        // a loose `startsWith('storage_processing_jobs_')` would
+        // also match `storage_processing_jobs_pkey` and translate a
+        // genuine PK collision (bad `job.id` or duplicate id within
+        // the batch) into `DuplicateActiveJobError`, masking a real
+        // write-failure bug. Drift detection is already covered by
+        // `bun run db:check` + the schema-mirror parity test in
+        // `tests/infra/db/schema.test.ts` — both fail loud if a
+        // future migration renames the FU-1 index.
+        const pg = extractPgError(err);
+        if (pg?.code === PG_UNIQUE_VIOLATION && pg.constraint_name === FU_1_ACTIVE_JOB_INDEX) {
+          // We don't know which input pair tripped the index without
+          // querying the DB again. Report the FIRST batch entry so the
+          // error message is deterministic + doesn't leak the contents
+          // of unrelated active jobs.
+          const c = input[0];
+          throw new DuplicateActiveJobError(c.objectId, c.jobType);
+        }
+        // Unrelated error — re-throw unchanged so the caller sees the
+        // original failure.
+        throw err;
+      }
     });
   }
 

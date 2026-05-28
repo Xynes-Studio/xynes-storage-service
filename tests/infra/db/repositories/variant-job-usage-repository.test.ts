@@ -1021,3 +1021,294 @@ describeIf('PostgresStorageUsageRepository.readDailyForWorkspace', () => {
     }
   });
 });
+
+// ============================================================================
+// STORAGE-FU-2-FU-1 — DB-side partial unique index as belt-and-braces
+// ============================================================================
+describeIf(
+  'PostgresProcessingJobQueueRepository.enqueueBatch — STORAGE-FU-2-FU-1 DB-side guard',
+  () => {
+    test('concurrent enqueueBatch races result in EXACTLY ONE active row + N-1 DuplicateActiveJobError', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        const now = new Date();
+        const CONCURRENT = 10;
+        const promises = Array.from({ length: CONCURRENT }, () =>
+          queue.enqueueBatch([
+            {
+              id: randomUUID(),
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'scan_validation',
+              required: true,
+              payload: {},
+              scheduledAt: now,
+            },
+          ]),
+        );
+        const results = await Promise.allSettled(promises);
+        const fulfilled = results.filter((r) => r.status === 'fulfilled');
+        const rejected = results.filter((r) => r.status === 'rejected');
+        expect(fulfilled.length).toBe(1);
+        expect(rejected.length).toBe(CONCURRENT - 1);
+        for (const r of rejected) {
+          if (r.status !== 'rejected') continue;
+          const err = r.reason as { code?: string; statusHint?: number; name?: string };
+          expect(err.code).toBe('DUPLICATE_ACTIVE_JOB');
+          expect(err.statusHint).toBe(409);
+          expect(err.name).toBe('DuplicateActiveJobError');
+        }
+        const jobs = await queue.listForObject({
+          objectId,
+          workspaceId: fx.workspaceId,
+        });
+        const active = jobs.filter(
+          (j) =>
+            j.jobType === 'scan_validation' && (j.status === 'queued' || j.status === 'running'),
+        );
+        expect(active.length).toBe(1);
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('STORAGE-FU-2 pre-check still wins the obvious-case race (one caller, one batch)', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        const now = new Date();
+        await queue.enqueueBatch([
+          {
+            id: randomUUID(),
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'image_optimize',
+            required: false,
+            payload: {},
+            scheduledAt: now,
+          },
+        ]);
+        let caught: Error | null = null;
+        try {
+          await queue.enqueueBatch([
+            {
+              id: randomUUID(),
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'image_optimize',
+              required: false,
+              payload: {},
+              scheduledAt: now,
+            },
+          ]);
+        } catch (err) {
+          caught = err as Error;
+        }
+        expect(caught).not.toBeNull();
+        const e = caught as DuplicateActiveJobError;
+        expect(e.code).toBe('DUPLICATE_ACTIVE_JOB');
+        expect(e.statusHint).toBe(409);
+        expect(e.objectId).toBe(objectId);
+        expect(e.jobType).toBe('image_optimize');
+        const msg = String(e.message);
+        expect(msg).not.toContain('credential');
+        expect(msg).not.toContain('endpoint');
+        expect(msg).not.toContain('region');
+        expect(msg).not.toContain('bucket');
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('retries after a TERMINAL row still land (partial predicate excludes terminal status)', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        await ctx.current.db.execute(sql`
+          INSERT INTO platform.storage_processing_jobs
+            (id, object_id, workspace_id, job_kind, status, attempts,
+             scheduled_at, finished_at, error_code, created_at)
+          VALUES (${randomUUID()}, ${objectId}, ${fx.workspaceId}, 'image_optimize',
+                  'failed', 3, now(), now(), 'PROCESSOR_FAILED', now())
+        `);
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        const inserted = await queue.enqueueBatch([
+          {
+            id: randomUUID(),
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'image_optimize',
+            required: false,
+            payload: {},
+            scheduledAt: new Date(),
+          },
+        ]);
+        expect(inserted.length).toBe(1);
+        const jobs = await queue.listForObject({
+          objectId,
+          workspaceId: fx.workspaceId,
+        });
+        const filtered = jobs.filter((j) => j.jobType === 'image_optimize');
+        expect(filtered.length).toBe(2);
+        const byStatus = filtered.map((j) => j.status).sort();
+        expect(byStatus).toEqual(['failed', 'queued']);
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('the FU-1 partial unique index exists with the documented predicate (DB-side invariant)', async () => {
+      if (!ctx.current) return;
+      const rows = (await ctx.current.db.execute(sql`
+        SELECT indexdef
+          FROM pg_indexes
+         WHERE schemaname = 'platform'
+           AND indexname = 'storage_processing_jobs_active_unique_uidx'
+      `)) as unknown as Array<{ indexdef: string }>;
+      expect(rows.length).toBe(1);
+      const def = rows[0].indexdef;
+      expect(def).toContain('UNIQUE');
+      expect(def).toContain('platform.storage_processing_jobs');
+      expect(def).toContain('btree (object_id, job_kind)');
+      // Postgres normalises `status IN (...)` to `status = ANY (ARRAY[...])`.
+      expect(def).toMatch(/status\s*=\s*ANY\s*\(ARRAY\[/);
+      expect(def).toContain("'queued'");
+      expect(def).toContain("'running'");
+      // The predicate MUST exclude every terminal status.
+      expect(def).not.toContain("'succeeded'");
+      expect(def).not.toContain("'failed'");
+      expect(def).not.toContain("'cancelled'");
+    });
+
+    test('errors unrelated to the FU-1 index propagate unchanged (FK violation regression guard)', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        let caught: Error | null = null;
+        try {
+          await queue.enqueueBatch([
+            {
+              id: randomUUID(),
+              objectId,
+              workspaceId: '00000000-0000-0000-0000-000000000000', // FK miss
+              jobType: 'scan_validation',
+              required: true,
+              payload: {},
+              scheduledAt: new Date(),
+            },
+          ]);
+        } catch (err) {
+          caught = err as Error;
+        }
+        expect(caught).not.toBeNull();
+        const code = (caught as { code?: string }).code;
+        // MUST NOT be a `DuplicateActiveJobError` — this is a FK
+        // violation, not a duplicate. The repo's FU-1 catch must only
+        // translate the unique-violation on the FU-1 index.
+        expect(code).not.toBe('DUPLICATE_ACTIVE_JOB');
+      } finally {
+        await fx.cleanup();
+      }
+    });
+
+    test('PK collision (duplicate id within a batch) MUST NOT be translated to DuplicateActiveJobError (Codex P2 regression guard)', async () => {
+      if (!ctx.current) return;
+      const fx = await seedWorkspaceFixture(ctx.current.db);
+      try {
+        const objectId = await insertObject(
+          ctx.current.db,
+          fx.workspaceId,
+          fx.providerId,
+          fx.userId,
+        );
+        const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+        // Reuse the SAME `id` for two DIFFERENT `(object_id, job_kind)`
+        // pairs in a single batch. The in-tx pre-check looks at the
+        // `(object_id, job_kind)` pair — these are distinct, so it
+        // doesn't fire. The actual INSERT then raises 23505 against
+        // `storage_processing_jobs_pkey` (the PRIMARY KEY constraint),
+        // NOT the FU-1 partial unique index.
+        //
+        // Before the Codex P2 fix, the catch block matched any
+        // constraint name that started with `storage_processing_jobs_`,
+        // so the PK collision would be silently translated to
+        // `DuplicateActiveJobError`. That would mask a genuine
+        // write-failure bug (bad job id, duplicate batch entry).
+        //
+        // The fix tightens the match to the exact FU-1 index name.
+        // PK violations now propagate as raw `unique_violation`
+        // (or whatever Drizzle surfaces them as) so callers see the
+        // real failure.
+        const sharedId = randomUUID();
+        let caught: Error | null = null;
+        try {
+          await queue.enqueueBatch([
+            {
+              id: sharedId,
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'scan_validation',
+              required: true,
+              payload: {},
+              scheduledAt: new Date(),
+            },
+            {
+              id: sharedId, // <- intentional PK collision within the batch
+              objectId,
+              workspaceId: fx.workspaceId,
+              jobType: 'image_optimize',
+              required: false,
+              payload: {},
+              scheduledAt: new Date(),
+            },
+          ]);
+        } catch (err) {
+          caught = err as Error;
+        }
+        expect(caught).not.toBeNull();
+        const code = (caught as { code?: string }).code;
+        // MUST NOT be `DUPLICATE_ACTIVE_JOB` — this is a PK collision,
+        // NOT an active-job duplicate. The repo's FU-1 catch must
+        // match ONLY the canonical FU-1 index name.
+        expect(code).not.toBe('DUPLICATE_ACTIVE_JOB');
+        // Belt-and-braces: confirm no `image_optimize` row survived
+        // — the whole transaction must have rolled back.
+        const jobs = await queue.listForObject({
+          objectId,
+          workspaceId: fx.workspaceId,
+        });
+        expect(jobs.filter((j) => j.jobType === 'image_optimize').length).toBe(0);
+      } finally {
+        await fx.cleanup();
+      }
+    });
+  },
+);

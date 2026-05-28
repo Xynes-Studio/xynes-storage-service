@@ -943,6 +943,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-12 | ✅ Landed 2026-05-14 |
 | STORAGE-FU-1 | ✅ Landed 2026-05-15 (Drizzle schema mirror + DB client + drift check) |
 | STORAGE-FU-2 | ✅ Landed 2026-05-15 (Postgres repositories) |
+| STORAGE-FU-2-FU-1 | ✅ Landed 2026-05-28 (Partial unique index `storage_processing_jobs_active_unique_uidx` on `(object_id, job_kind) WHERE status IN ('queued','running')` as belt-and-braces for `enqueueBatch` — DB-side 23505 translated to `DuplicateActiveJobError`) |
 | STORAGE-FU-3 | ✅ Landed 2026-05-15 (Provider resolver + secret-manager interface) |
 | STORAGE-FU-4 | ✅ Landed 2026-05-15 (Composition root — handler registration + ready event) |
 | STORAGE-FU-5 | ✅ Landed 2026-05-15 (Production runners — stub-mode default + S3 IO + variant writer + production-stub processors) |
@@ -1855,8 +1856,6 @@ with no options is the canonical path.
   Postgres-polling worker is sufficient per STORAGE-7 §"Out of scope".
 - **Live integration smoke against the running storage stack.** That's
   the successor plan (`xynes/xynes-infra/docs/plans/2026-05-14-storage-live-provider-rollout.md`).
-
-
 
 
 ## Content-Hash Dedup Schema (DEDUP-1)

@@ -61,12 +61,14 @@ const DEFAULT_MIGRATION_PATH = resolve(
 );
 
 /**
- * DEDUP-1 adds a second canonical migration alongside the STORAGE-2 base
- * schema. The drift check reads BOTH and concatenates the SQL so table /
- * CHECK / forbidden-column assertions work uniformly.
+ * DEDUP-1 + STORAGE-FU-2-FU-1 add additional canonical migrations
+ * alongside the STORAGE-2 base schema. The drift check reads them all
+ * and concatenates the SQL so table / CHECK / forbidden-column /
+ * required-index assertions work uniformly.
  *
  * Override the additional paths via `STORAGE_INFRA_EXTRA_MIGRATION_PATHS`
- * (colon-separated). Default is the DEDUP-1 migration's canonical path.
+ * (colon-separated). Defaults are the canonical paths of every storage
+ * follow-up migration the mirror depends on.
  */
 const DEFAULT_EXTRA_MIGRATION_PATHS = [
   resolve(
@@ -77,6 +79,15 @@ const DEFAULT_EXTRA_MIGRATION_PATHS = [
     'supabase',
     'migrations',
     '20260528090000_storage_object_references_and_dedup_index.sql',
+  ),
+  resolve(
+    import.meta.dir,
+    '..',
+    '..',
+    'xynes-infra',
+    'supabase',
+    'migrations',
+    '20260528100000_storage_processing_jobs_active_unique_index.sql',
   ),
 ] as const;
 
@@ -231,6 +242,23 @@ async function main(): Promise<void> {
       'DEDUP-1 invariant violated: missing partial unique index ' +
         '`storage_objects_workspace_sha256_uidx` on platform.storage_objects ' +
         '(workspace_id, sha256). Dedup MUST be workspace-scoped.',
+    );
+  }
+
+  // 3b. STORAGE-FU-2-FU-1 invariant: the partial unique index on
+  //     (object_id, job_kind) for ACTIVE (queued/running) processing
+  //     jobs MUST be present so duplicate active jobs are rejected at
+  //     the DB layer, not just by the transaction-level pre-check in
+  //     `PostgresProcessingJobQueueRepository.enqueueBatch`. The partial
+  //     predicate is critical: a global unique index would forever
+  //     block STORAGE-7 retries after terminal `failed` / `succeeded` /
+  //     `cancelled` outcomes.
+  if (!sql.includes('storage_processing_jobs_active_unique_uidx')) {
+    errors.push(
+      'STORAGE-FU-2-FU-1 invariant violated: missing partial unique index ' +
+        '`storage_processing_jobs_active_unique_uidx` on platform.storage_processing_jobs ' +
+        '(object_id, job_kind) WHERE status IN (queued, running). ' +
+        'Duplicate active processing jobs MUST be rejected at the DB layer.',
     );
   }
 
