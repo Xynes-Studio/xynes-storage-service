@@ -1,0 +1,7 @@
+# Sidecar build artefacts + node_modules
+node_modules/
+bun.lockb
+*.log
+*.tmp
+.DS_Store
+coverage/

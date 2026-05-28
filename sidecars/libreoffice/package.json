@@ -1,0 +1,21 @@
+{
+  "name": "xynes-libreoffice-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "STORAGE-FU-5-FU-G — LibreOffice headless + Bun HTTP shim for storage-service document previews.",
+  "scripts": {
+    "start": "bun run src/shim.ts",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage",
+    "typecheck": "bun x tsc --noEmit",
+    "lint": "eslint 'src/**/*.ts' 'tests/**/*.ts'"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.1.0",
+    "@typescript-eslint/eslint-plugin": "^8.49.0",
+    "@typescript-eslint/parser": "^8.49.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0"
+  }
+}
