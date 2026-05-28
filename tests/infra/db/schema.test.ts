@@ -17,6 +17,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   PROCESSING_JOB_STATUSES,
+  STORAGE_OBJECT_REFERENCE_OWNER_KINDS,
   STORAGE_OBJECT_STATUSES,
   STORAGE_OBJECT_VISIBILITIES,
   STORAGE_PROVIDER_KINDS,
@@ -24,6 +25,7 @@ import {
   STORAGE_VARIANT_STATUSES,
   UPLOAD_SESSION_METHODS,
   UPLOAD_SESSION_STATUSES,
+  storageObjectReferences,
   storageObjectVariants,
   storageObjects,
   storageProcessingJobs,
@@ -57,8 +59,28 @@ const MIGRATION_PATH =
     '20260513090000_universal_storage_platform_schema.sql',
   );
 
+// DEDUP-1 ships a second canonical migration. Cross-repo parity assertions
+// over `MIGRATION_SQL` need both files concatenated so table-existence,
+// CHECK-constraint, and forbidden-column checks see the full surface.
+const DEDUP_MIGRATION_PATH = resolve(
+  import.meta.dir,
+  '..',
+  '..',
+  '..',
+  '..',
+  'xynes-infra',
+  'supabase',
+  'migrations',
+  '20260528090000_storage_object_references_and_dedup_index.sql',
+);
+
 const MIGRATION_REACHABLE = existsSync(MIGRATION_PATH);
-const MIGRATION_SQL = MIGRATION_REACHABLE ? readFileSync(MIGRATION_PATH, 'utf-8') : '';
+const DEDUP_MIGRATION_REACHABLE = existsSync(DEDUP_MIGRATION_PATH);
+const MIGRATION_SQL = MIGRATION_REACHABLE
+  ? readFileSync(MIGRATION_PATH, 'utf-8') +
+    '\n-- END OF MIGRATION FILE --\n' +
+    (DEDUP_MIGRATION_REACHABLE ? readFileSync(DEDUP_MIGRATION_PATH, 'utf-8') : '')
+  : '';
 
 if (!MIGRATION_REACHABLE) {
   // eslint-disable-next-line no-console
@@ -144,17 +166,26 @@ describe.skipIf(!MIGRATION_REACHABLE)('schema mirror — closed-set CHECK parity
     const migrationValues = findCheckValues('storage_processing_jobs_status_check', 'status');
     expect(asStringSet(PROCESSING_JOB_STATUSES)).toEqual(migrationValues);
   });
+
+  test('STORAGE_OBJECT_REFERENCE_OWNER_KINDS matches storage_object_references_owner_kind_check (DEDUP-1)', () => {
+    const migrationValues = findCheckValues(
+      'storage_object_references_owner_kind_check',
+      'owner_kind',
+    );
+    expect(asStringSet(STORAGE_OBJECT_REFERENCE_OWNER_KINDS)).toEqual(migrationValues);
+  });
 });
 
 describe('schema mirror — table coverage', () => {
   // Mirror-only assertion: must always run, even on single-repo CI.
-  test('exports all six storage tables', () => {
+  test('exports all seven storage tables', () => {
     expect(workspaceStorageProviders).toBeDefined();
     expect(storageObjects).toBeDefined();
     expect(storageUploadSessions).toBeDefined();
     expect(storageObjectVariants).toBeDefined();
     expect(storageProcessingJobs).toBeDefined();
     expect(storageUsageDaily).toBeDefined();
+    expect(storageObjectReferences).toBeDefined();
   });
 
   // Cross-repo assertion: requires canonical migration file.
@@ -168,10 +199,22 @@ describe('schema mirror — table coverage', () => {
         'storage_object_variants',
         'storage_processing_jobs',
         'storage_usage_daily',
+        'storage_object_references',
       ];
       for (const name of required) {
         expect(MIGRATION_SQL).toContain(`platform.${name}`);
       }
+    },
+  );
+
+  test.skipIf(!MIGRATION_REACHABLE || !DEDUP_MIGRATION_REACHABLE)(
+    'DEDUP-1 workspace-scoped partial unique index is declared',
+    () => {
+      expect(MIGRATION_SQL).toContain('storage_objects_workspace_sha256_uidx');
+      // The index MUST be workspace-scoped (NOT global) and partial on
+      // active statuses only.
+      expect(MIGRATION_SQL).toContain('(workspace_id, sha256)');
+      expect(MIGRATION_SQL).toContain("status IN ('uploaded', 'processing', 'ready')");
     },
   );
 });
@@ -242,6 +285,7 @@ describe('schema mirror — closed-set type constants are frozen arrays', () => 
     ['UPLOAD_SESSION_STATUSES', UPLOAD_SESSION_STATUSES],
     ['STORAGE_VARIANT_STATUSES', STORAGE_VARIANT_STATUSES],
     ['PROCESSING_JOB_STATUSES', PROCESSING_JOB_STATUSES],
+    ['STORAGE_OBJECT_REFERENCE_OWNER_KINDS', STORAGE_OBJECT_REFERENCE_OWNER_KINDS],
   ];
 
   test.each(cases)('%s is a non-empty readonly array', (_name, values) => {

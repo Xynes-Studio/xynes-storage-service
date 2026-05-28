@@ -32,6 +32,7 @@ import {
   boolean,
   date,
   integer,
+  primaryKey,
   text,
   timestamp,
   uuid,
@@ -102,6 +103,27 @@ export const PROCESSING_JOB_STATUSES = [
   'cancelled',
 ] as const;
 export type ProcessingJobStatus = (typeof PROCESSING_JOB_STATUSES)[number];
+
+/**
+ * DEDUP-1 `storage_object_references.owner_kind` closed-set values.
+ *
+ * Mirrors the CHECK constraint in the canonical migration
+ * `20260528090000_storage_object_references_and_dedup_index.sql`.
+ *
+ * Adding a new owner kind requires (1) an additive Supabase migration
+ * that ALTERs the CHECK constraint, (2) updating this tuple in lockstep,
+ * (3) updating the `db-check` drift detector, and (4) updating the
+ * upstream handler that mints references of the new kind.
+ */
+export const STORAGE_OBJECT_REFERENCE_OWNER_KINDS = [
+  'cms_entry',
+  'comment',
+  'doc_service',
+  'user_avatar',
+  'workspace_logo',
+  'platform_generic',
+] as const;
+export type StorageObjectReferenceOwnerKind = (typeof STORAGE_OBJECT_REFERENCE_OWNER_KINDS)[number];
 
 // ─── platform.workspace_storage_providers ───────────────────────────────────
 // Stores credential REFERENCES only — see column comment in the canonical
@@ -230,6 +252,31 @@ export const storageUsageDaily = platformSchema.table('storage_usage_daily', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+// ─── platform.storage_object_references (DEDUP-1) ───────────────────────────
+// Reference-counting join table. One row per (object, owner_kind, owner_id)
+// triple. The composite PRIMARY KEY enforces idempotency at the DB layer —
+// re-inserting the same triple is a no-op via `ON CONFLICT … DO NOTHING`
+// in the upstream handler.
+//
+// `owner_id` deliberately has NO foreign key — different owner kinds target
+// different schemas (`cms.content_entries`, `cms.comments`, `docs.documents`,
+// `identity.users`). Validation of the owner identity is the upstream
+// handler's job.
+export const storageObjectReferences = platformSchema.table(
+  'storage_object_references',
+  {
+    objectId: uuid('object_id')
+      .notNull()
+      .references(() => storageObjects.id, { onDelete: 'cascade' }),
+    ownerKind: text('owner_kind').$type<StorageObjectReferenceOwnerKind>().notNull(),
+    ownerId: uuid('owner_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.objectId, t.ownerKind, t.ownerId] }),
+  }),
+);
+
 // ─── Row types — handy for repository implementations ───────────────────────
 export type WorkspaceStorageProviderRow = typeof workspaceStorageProviders.$inferSelect;
 export type WorkspaceStorageProviderInsert = typeof workspaceStorageProviders.$inferInsert;
@@ -248,3 +295,6 @@ export type StorageProcessingJobInsert = typeof storageProcessingJobs.$inferInse
 
 export type StorageUsageDailyRow = typeof storageUsageDaily.$inferSelect;
 export type StorageUsageDailyInsert = typeof storageUsageDaily.$inferInsert;
+
+export type StorageObjectReferenceRow = typeof storageObjectReferences.$inferSelect;
+export type StorageObjectReferenceInsert = typeof storageObjectReferences.$inferInsert;

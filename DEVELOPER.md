@@ -949,6 +949,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-5-FU-A | ✅ Landed 2026-05-28 (Sharp-backed `ImageProcessor` — closes Bug 1 for image variants; EXIF stripping mandatory; libvips cache disabled) |
 | STORAGE-FU-5-FU-E | ✅ Landed 2026-05-28 (Deployment posture decision — sharp + ffmpeg in-process, LibreOffice + clamav sidecars; Compose overlay + K8s draft manifests) |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
+| DEDUP-1 | ✅ Landed 2026-05-28 (Content-hash dedup schema — `platform.storage_object_references` reference-counting join table + workspace-scoped partial unique index on `storage_objects (workspace_id, sha256)`) |
 | STORAGE-LIVE-1 | ✅ Landed 2026-05-16 (R2 dev bucket + lifecycle + CORS + credential reference) |
 | STORAGE-LIVE-2 | ✅ Landed 2026-05-16 (`platform.workspace_storage_providers` R2 dev seed migration + bootstrap wiring) |
 | STORAGE-LIVE-3 | ✅ Landed 2026-05-27 (Live `--full` smoke evidence: PASS 13 / FAIL 0 against R2 dev) |
@@ -1853,6 +1854,135 @@ with no options is the canonical path.
   Postgres-polling worker is sufficient per STORAGE-7 §"Out of scope".
 - **Live integration smoke against the running storage stack.** That's
   the successor plan (`xynes/xynes-infra/docs/plans/2026-05-14-storage-live-provider-rollout.md`).
+
+
+## Content-Hash Dedup Schema (DEDUP-1)
+
+DEDUP-1 lands the **DB-layer half** of the storage dedup story. It adds:
+
+1. **`platform.storage_object_references`** — a reference-counting join
+   table. Each row marks one `(object_id, owner_kind, owner_id)`
+   reference. The DEDUP-2 handler reads this to decide when to
+   soft-delete (last reference removed) vs short-circuit
+   (`referencesRemaining > 0`).
+2. **`storage_objects_workspace_sha256_uidx`** — a workspace-scoped
+   PARTIAL UNIQUE INDEX on `platform.storage_objects (workspace_id,
+   sha256)` covering active statuses only (`uploaded` / `processing` /
+   `ready`). The DEDUP-2 upload-create handler probes this index to
+   short-circuit duplicate uploads: same workspace + same `sha256` →
+   return the existing `objectId` instead of minting a new provider URL.
+
+DEDUP-1 ships **only** the schema + Drizzle mirror + DB-level tests. The
+handler-layer dedup short-circuit + reference-counted delete handler +
+storage-client behaviour lands with **DEDUP-2** (`xynes-storage-service` +
+`xynes-front-end/xynes-cms-console-web`).
+
+### Canonical migration
+
+- **File:** `xynes/xynes-infra/supabase/migrations/20260528090000_storage_object_references_and_dedup_index.sql`
+- **Contract test:** `xynes/xynes-infra/scripts/test/universal-storage-dedup-schema.test.sh` — auto-wired into `scripts/test/run.sh`. 57 assertions / 0 failures.
+- **Drizzle mirror update:** `src/infra/db/schema.ts` declares `storageObjectReferences` + `STORAGE_OBJECT_REFERENCE_OWNER_KINDS` closed-set.
+- **Drift detector:** `bun run db:check` now loads BOTH the STORAGE-2 base migration AND this DEDUP-1 migration via concatenation; the closed-set parity check covers the new `owner_kind` CHECK constraint, and a dedicated invariant assertion locks the workspace-scoped partial unique index in place.
+
+### Security invariants
+
+1. **Workspace scoping at the DB layer.** The partial unique index keys
+   on `(workspace_id, sha256)`, NOT on `sha256` alone. Cross-workspace
+   dedup is structurally impossible — a hostile workspace cannot probe
+   content existence in another workspace via timing or response-size
+   differences. The contract test fails the build if anyone adds a
+   `CREATE UNIQUE INDEX … (sha256)` (sha256-only) line.
+2. **Closed-set `owner_kind`.** Only six values are accepted:
+   `cms_entry`, `comment`, `doc_service`, `user_avatar`, `workspace_logo`,
+   `platform_generic`. Adding a new value requires (a) a new additive
+   migration that `ALTER`s the CHECK constraint, (b) an in-lockstep
+   update to `STORAGE_OBJECT_REFERENCE_OWNER_KINDS` in `schema.ts`,
+   (c) an update to the `db-check` drift detector, (d) an update to the
+   upstream handler that mints references of the new kind.
+3. **No FK on `owner_id`.** Different owner kinds target different
+   schemas (`cms.content_entries`, `cms.comments`, `docs.documents`,
+   `identity.users`). Validation of the owner identity is the upstream
+   handler's job — never a DB FK. The contract test fails the build if
+   anyone adds a `REFERENCES` clause to `owner_id`.
+4. **No provider material on `storage_object_references`.** The row has
+   exactly four columns: `object_id`, `owner_kind`, `owner_id`,
+   `created_at`. No `provider_object_key`, no signed URLs, no
+   credentials. The contract test sweeps the migration for the standard
+   forbidden-column list.
+5. **Predicate excludes terminal statuses.** The partial unique index
+   predicate is `WHERE sha256 IS NOT NULL AND status IN ('uploaded',
+   'processing', 'ready')`. Terminal statuses (`pending_upload` /
+   `failed` / `deleted`) are excluded so legitimate retries after an
+   aborted multipart, after a failure, or after a soft-delete still
+   succeed.
+
+### Integration tests
+
+`tests/infra/db/repositories/dedup-schema.integration.test.ts` runs
+against the live dev Supabase stack (soft-skips when DB is unreachable —
+same posture as STORAGE-FU-2 repository integration tests). **15 tests,
+22 expects**:
+
+- Partial unique index rejects duplicate `(workspace_id, sha256)` when
+  both rows are `status='ready'` (asserts the unique-violation code
+  `23505` + `constraint_name='storage_objects_workspace_sha256_uidx'`).
+- Partial index allows duplicate `(workspace_id, sha256)` when one row
+  is `pending_upload` or `failed`.
+- Soft-deleting a row unblocks a fresh insert.
+- Cross-workspace: same `sha256` in two workspaces is allowed.
+- Legacy rows with `NULL sha256` do not block fresh inserts.
+- `storage_object_references` composite PK rejects duplicate triples
+  (code `23505`).
+- `ON CONFLICT (object_id, owner_kind, owner_id) DO NOTHING` is
+  idempotent across N calls.
+- Multiple references per object across different `(owner_kind, owner_id)`
+  triples are allowed.
+- Unknown `owner_kind` rejected via CHECK constraint (code `23514`).
+- `ON DELETE CASCADE` on `object_id` clears reference rows when the
+  parent is hard-deleted.
+- Workspace cascade transitively clears reference rows.
+
+### DB safety
+
+- **Strictly additive.** No destructive DDL (no table removal, no
+  column removal, no constraint removal, no truncation, no `DELETE
+  FROM`).
+- **`IF NOT EXISTS` everywhere** → reset-safe + replay-safe. Verified
+  live: re-applying the migration against a populated DB emits
+  `NOTICE: relation already exists, skipping` for every existing object
+  and exits cleanly.
+- **`sha256` column NOT made `NOT NULL`.** Pre-existing rows uploaded
+  without a hash are preserved as-is and excluded from the partial
+  index via the predicate.
+- **Rollback:** drop the index + table. No app-side rollback required —
+  the DEDUP-2 handler change (not yet shipped) is gated on the index's
+  presence via try/catch, so absence means dedup is silently disabled
+  (fail-open). The worst case is "we miss a dedup hit," not a
+  correctness bug.
+
+### Out of scope (deferred to DEDUP-2 + DEDUP-3)
+
+- **DEDUP-2** — handler short-circuit on the upload-create path
+  (probe `(workspace_id, sha256)`, return existing `objectId` +
+  `dedupHit: true` instead of minting a new provider URL); reference-counted
+  soft-delete in the delete handler; CMS Console storage-client behaviour
+  (skip the direct-provider PUT on `dedupHit: true`); optional
+  `ownerKind` / `ownerId` payload fields.
+- **DEDUP-3** (deferred) — server-side `sha256` verification on
+  `complete-upload`. The complete handler should hash the bytes the
+  provider actually received and verify against the client-claimed
+  `sha256`. On mismatch: drop the dedup reference + flip the row to
+  `failed`. Tightens DEDUP-1/2's "client-claimed sha256 is trusted"
+  gap. Filed in plan §21.
+- **Reference-counting analytics dashboard** — visibility into "what
+  objects have N references." Out of scope per plan §21.
+- **Cross-workspace dedup with explicit sharing semantics** — defer
+  until a customer asks. The partial unique index would need to widen
+  to a per-organisation key with explicit ACL semantics; out of scope
+  per plan §21.
+- **Sharing-aware UX in CMS Console** — `dedupHit: true` is
+  deliberately silent in the UI. If product asks for a toast ("same
+  file already exists"), it's an additive UI follow-up.
 
 
 ## Deployment Posture (STORAGE-FU-5-FU-E)
