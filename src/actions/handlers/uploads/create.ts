@@ -33,6 +33,9 @@ const MIN_SESSION_TTL_SECONDS = 60;
 const MAX_SESSION_TTL_SECONDS = 24 * 60 * 60;
 const DEFAULT_MULTIPART_THRESHOLD = 100 * 1024 * 1024; // 100 MB (AWS guidance).
 
+/** DEDUP-2 default owner kind for callers that omit `ownerKind`. */
+const DEFAULT_OWNER_KIND = 'platform_generic' as const;
+
 function clampTtlSeconds(ttl: number): number {
   if (!Number.isFinite(ttl)) return DEFAULT_SESSION_TTL_SECONDS;
   if (ttl < MIN_SESSION_TTL_SECONDS) return MIN_SESSION_TTL_SECONDS;
@@ -74,6 +77,63 @@ export function createCreateUploadHandler(deps: UploadHandlerDependencies) {
       throw new ValidationError(parseResult.error.issues[0]?.message ?? 'Invalid payload');
     }
     const input: CreateUploadPayload = parseResult.data;
+
+    // DEDUP-2 — content-hash dedup short-circuit.
+    //
+    // When the caller supplies a `sha256` AND the service is wired with
+    // a `references` repository, we probe `platform.storage_objects` for
+    // an existing row in this workspace with the same content hash whose
+    // status is `uploaded` / `processing` / `ready`. On a hit, we attach
+    // a reference row (idempotent on the composite PK) and return the
+    // EXISTING object with `dedupHit: true`. The provider URL is NEVER
+    // minted — the bytes are already there.
+    //
+    // Security: the probe is workspace-scoped at the SQL layer
+    // (`findExistingByWorkspaceSha256`). Cross-workspace dedup is
+    // structurally impossible — the DEDUP-1 partial unique index keys
+    // on `(workspace_id, sha256)`, never on `sha256` alone, so two
+    // workspaces with the same content do NOT see each other.
+    //
+    // Backward compatibility: a caller without `sha256` (legacy
+    // STORAGE-5 path) bypasses the probe entirely. A service without
+    // `deps.references` wired bypasses it too — STORAGE-5 / STORAGE-6
+    // tests stay green byte-for-byte.
+    if (input.sha256 !== undefined && deps.references !== undefined) {
+      const existing = await deps.objects.findExistingByWorkspaceSha256({
+        workspaceId: ctx.workspaceId,
+        sha256: input.sha256,
+      });
+      if (existing !== null) {
+        const ownerKind = input.ownerKind ?? DEFAULT_OWNER_KIND;
+        const ownerId = input.ownerId ?? idFactory();
+        // Idempotent reference insert — composite PK collision -> no-op.
+        await deps.references.addReference({
+          objectId: existing.id,
+          workspaceId: ctx.workspaceId,
+          ownerKind,
+          ownerId,
+        });
+        return {
+          // Reuse the EXISTING object's id as the response identifier.
+          // No new session row is created — there's nothing to complete
+          // or abort. Callers detect this via `dedupHit: true` and skip
+          // the provider PUT + the `complete` round-trip.
+          uploadId: existing.id,
+          objectId: existing.id,
+          uploadMethod: 'single',
+          uploadUrl: null,
+          uploadHeaders: {},
+          parts: [],
+          // `expiresAt` is still a string for shape parity with the
+          // fresh-upload path. We surface the existing object's
+          // `updatedAt` so the field is always meaningful, never a
+          // bogus "now + 15min" that hints at a non-existent session.
+          expiresAt: existing.updatedAt.toISOString(),
+          object: toPublicObject(existing),
+          dedupHit: true,
+        };
+      }
+    }
 
     const provider = await deps.providers.resolveDefaultForWorkspace(ctx.workspaceId);
     if (!provider) {
@@ -181,6 +241,30 @@ export function createCreateUploadHandler(deps: UploadHandlerDependencies) {
       throw err;
     }
 
+    // DEDUP-2 — when a fresh upload completes the create flow AND the
+    // caller supplied owner metadata, attach a reference row so the
+    // delete handler can decrement it later. The insert is idempotent
+    // (composite PK on `(object_id, owner_kind, owner_id)`); failures
+    // are swallowed so a reference-table outage cannot block a
+    // legitimate upload (worst case: the object is created without a
+    // reference and behaves like a legacy STORAGE-6 object).
+    if (deps.references !== undefined) {
+      const ownerKind = input.ownerKind ?? DEFAULT_OWNER_KIND;
+      const ownerId = input.ownerId ?? idFactory();
+      try {
+        await deps.references.addReference({
+          objectId: created.object.id,
+          workspaceId: ctx.workspaceId,
+          ownerKind,
+          ownerId,
+        });
+      } catch {
+        // Best-effort: a transient FK / write failure must NOT undo the
+        // already-persisted object + session. The reference can be
+        // re-attached lazily by a future call (idempotent insert).
+      }
+    }
+
     return {
       uploadId: created.session.id,
       objectId: created.object.id,
@@ -190,6 +274,7 @@ export function createCreateUploadHandler(deps: UploadHandlerDependencies) {
       parts,
       expiresAt: created.session.expiresAt.toISOString(),
       object: toPublicObject(created.object),
+      dedupHit: false,
     };
   };
 }

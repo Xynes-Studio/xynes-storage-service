@@ -19,6 +19,7 @@
  * verify the handler never echoes provider config back to the caller.
  */
 import {
+  FakeReferencesRepository,
   FakeStorageAdapter,
   TEST_WORKSPACE_ID,
   TEST_USER_ID,
@@ -45,6 +46,7 @@ import type {
 
 // Re-export STORAGE-5 primitives so test files import from one place.
 export {
+  FakeReferencesRepository,
   FakeStorageAdapter,
   TEST_WORKSPACE_ID,
   TEST_USER_ID,
@@ -352,6 +354,7 @@ export interface DepsOverrides {
   readonly jobs?: FakeProcessingJobRepository;
   readonly usage?: FakeUsageRepository;
   readonly providers?: ExtendedFakeProviderResolver;
+  readonly references?: FakeReferencesRepository | null;
   readonly now?: () => Date;
   readonly defaultDownloadTtlSeconds?: number;
   readonly defaultListLimit?: number;
@@ -363,20 +366,33 @@ export function makeObjectsDeps(overrides: DepsOverrides = {}): ObjectsHandlerDe
   jobs: FakeProcessingJobRepository;
   usage: FakeUsageRepository;
   providers: ExtendedFakeProviderResolver;
+  /**
+   * Test-only accessor for the references fake. Separate name from the
+   * `ObjectsHandlerDependencies.references?` slot so the handler still
+   * sees `undefined` when callers pass `references: null` (legacy
+   * STORAGE-6 path).
+   */
+  referencesFake: FakeReferencesRepository | null;
 } {
   const objects = overrides.objects ?? new ExtendedFakeObjectRepository();
   const variants = overrides.variants ?? new FakeVariantRepository();
   const jobs = overrides.jobs ?? new FakeProcessingJobRepository();
   const usage = overrides.usage ?? new FakeUsageRepository();
   const providers = overrides.providers ?? new ExtendedFakeProviderResolver();
+  // DEDUP-2: default to `null` so STORAGE-6 tests keep their byte-for-byte
+  // posture. Tests that exercise reference-counted delete pass an explicit
+  // `FakeReferencesRepository` instance.
+  const references = overrides.references === undefined ? null : overrides.references;
   return {
     objects,
     variants,
     jobs,
     usage,
     providers,
+    references: references ?? undefined,
     now: overrides.now,
     defaultDownloadTtlSeconds: overrides.defaultDownloadTtlSeconds,
     defaultListLimit: overrides.defaultListLimit,
+    referencesFake: references,
   };
 }

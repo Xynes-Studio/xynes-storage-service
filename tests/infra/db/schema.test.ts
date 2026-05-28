@@ -298,3 +298,16 @@ describe('schema mirror — closed-set type constants are frozen arrays', () => 
     }
   });
 });
+
+// DEDUP-2 parity guard: the handler-side mirror of the owner-kind closed set
+// (in `src/actions/handlers/uploads/types.ts`) MUST equal the schema-side
+// declaration byte-for-byte. Without this guard, the two could drift on the
+// next migration that widens the set.
+describe('STORAGE_OBJECT_REFERENCE_OWNER_KINDS handler-side parity (DEDUP-2)', () => {
+  test('handler mirror equals schema declaration byte-for-byte', async () => {
+    const handlerModule = await import('../../../src/actions/handlers/uploads/types');
+    expect([...handlerModule.STORAGE_OBJECT_REFERENCE_OWNER_KINDS]).toEqual([
+      ...STORAGE_OBJECT_REFERENCE_OWNER_KINDS,
+    ]);
+  });
+});

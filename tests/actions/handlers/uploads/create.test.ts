@@ -294,6 +294,7 @@ describe('createUploadHandler — response shape redaction', () => {
     const responseKeys = Object.keys(res).sort();
     expect(responseKeys).toEqual(
       [
+        'dedupHit',
         'expiresAt',
         'object',
         'objectId',

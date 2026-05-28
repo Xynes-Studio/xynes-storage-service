@@ -950,6 +950,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-5-FU-E | ✅ Landed 2026-05-28 (Deployment posture decision — sharp + ffmpeg in-process, LibreOffice + clamav sidecars; Compose overlay + K8s draft manifests) |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
 | DEDUP-1 | ✅ Landed 2026-05-28 (Content-hash dedup schema — `platform.storage_object_references` reference-counting join table + workspace-scoped partial unique index on `storage_objects (workspace_id, sha256)`) |
+| DEDUP-2 | ✅ Landed 2026-05-28 (Content-hash dedup handler short-circuit + reference-counted soft-delete + CMS Console storage-client wiring) |
 | STORAGE-LIVE-1 | ✅ Landed 2026-05-16 (R2 dev bucket + lifecycle + CORS + credential reference) |
 | STORAGE-LIVE-2 | ✅ Landed 2026-05-16 (`platform.workspace_storage_providers` R2 dev seed migration + bootstrap wiring) |
 | STORAGE-LIVE-3 | ✅ Landed 2026-05-27 (Live `--full` smoke evidence: PASS 13 / FAIL 0 against R2 dev) |
@@ -1856,6 +1857,8 @@ with no options is the canonical path.
   the successor plan (`xynes/xynes-infra/docs/plans/2026-05-14-storage-live-provider-rollout.md`).
 
 
+
+
 ## Content-Hash Dedup Schema (DEDUP-1)
 
 DEDUP-1 lands the **DB-layer half** of the storage dedup story. It adds:
@@ -2022,6 +2025,191 @@ same posture as STORAGE-FU-2 repository integration tests). **15 tests,
 - **Sharing-aware UX in CMS Console** — `dedupHit: true` is
   deliberately silent in the UI. If product asks for a toast ("same
   file already exists"), it's an additive UI follow-up.
+
+
+## Content-Hash Dedup Handler + Reference-Counted Delete (DEDUP-2)
+
+DEDUP-2 closes the **handler-layer half** of the storage dedup story.
+It extends the schema landed by DEDUP-1 with:
+
+- **Upload-create short-circuit** — when `sha256` is supplied AND a row
+  with the same `(workspace_id, sha256)` already exists in `uploaded` /
+  `processing` / `ready` state, the handler returns the EXISTING object
+  id + `{ dedupHit: true, uploadUrl: null, uploadHeaders: {}, parts: [] }`
+  WITHOUT minting a provider URL. The provider adapter is NEVER called
+  on the dedup path. A `storage_object_references` row is inserted via
+  the new `StorageObjectReferenceRepository` so subsequent deletes know
+  not to soft-delete the parent until the last reference is dropped.
+- **Reference-counted soft-delete** — `delete` action accepts optional
+  `ownerKind` + `ownerId` payload pair. When supplied, the handler
+  removes that specific reference row and only soft-deletes the parent
+  object when `count(references) == 0`. When omitted, preserves the
+  pre-DEDUP-2 force-delete behaviour byte-for-byte (soft-delete
+  immediately, leave reference rows in place — `ON DELETE CASCADE` from
+  the schema cleans them on hard-delete).
+- **Closed-set `ownerKind`** — `cms_entry` / `comment` / `doc_service` /
+  `user_avatar` / `workspace_logo` / `platform_generic`. Mirrors the
+  canonical migration's CHECK constraint byte-for-byte. The closed-set
+  union `StorageObjectReferenceOwnerKind` is exported from
+  `src/actions/handlers/uploads/types.ts` for handler code and from
+  `src/infra/db/schema.ts` for repo code; `bun run db:check` enforces
+  parity with the canonical migration.
+
+### Source layout
+
+- `src/actions/handlers/uploads/types.ts` — extended `StorageObjectRepository`
+  with `findExistingByWorkspaceSha256`; new `StorageObjectReferenceRepository`
+  contract (`addReference`, `removeReference`, `countReferences`); both
+  added optionally to `UploadHandlerDependencies` so legacy callers see
+  zero behavioural change.
+- `src/actions/handlers/uploads/schemas.ts` — `createUploadPayloadSchema`
+  gained optional `ownerKind` + `ownerId` fields (paired: both or neither).
+- `src/actions/handlers/uploads/responses.ts` — `CreateUploadSessionResponse`
+  gained required `dedupHit: boolean` (defaults to `false` for fresh uploads).
+- `src/actions/handlers/uploads/create.ts` — probes
+  `findExistingByWorkspaceSha256` BEFORE minting any provider URL; on hit,
+  calls `addReference` and returns the existing object. On miss, falls
+  through to the existing STORAGE-5 flow; `addReference` is called AFTER
+  the atomic object+session insert so a reference is always present
+  when a caller eventually deletes the parent.
+- `src/actions/handlers/objects/types.ts` — `ObjectsHandlerDependencies`
+  gained optional `references: StorageObjectReferenceRepository`.
+- `src/actions/handlers/objects/schemas.ts` — `deleteObjectPayloadSchema`
+  gained optional paired `ownerKind` + `ownerId` fields.
+- `src/actions/handlers/objects/responses.ts` — `DeleteObjectResponse`
+  gained optional `referencesRemaining?: number` (omitted when the
+  object is actually soft-deleted).
+- `src/actions/handlers/objects/delete.ts` — when `ownerKind`/`ownerId`
+  are supplied, removes that specific reference, counts remaining, and
+  only soft-deletes the parent when `count == 0`.
+- `src/infra/db/repositories/object-and-session-repository.ts` — added
+  `findExistingByWorkspaceSha256` to `PostgresStorageObjectRepository`.
+  Filters by workspace + sha256 + `status IN ('uploaded','processing','ready')`
+  — matches the DEDUP-1 partial unique index predicate byte-for-byte.
+- `src/infra/db/repositories/object-references-repository.ts` (NEW) —
+  `PostgresStorageObjectReferenceRepository`. `addReference` uses `ON
+  CONFLICT … DO NOTHING` for idempotency; `removeReference` issues the
+  DELETE + `SELECT count(*)` in a single transaction.
+
+### Security invariants
+
+- **Workspace scoping at every layer.** `findExistingByWorkspaceSha256`
+  filters on `workspace_id` as the first WHERE clause. Cross-workspace
+  dedup probes return `null` (NOT a leak of "exists in another workspace").
+  Verified by an integration test that seeds the same sha256 in workspace
+  A + workspace B and asserts the probe in B returns the B-owned row,
+  NEVER the A-owned row.
+- **Closed-set `ownerKind` enforced at DB.** Hostile `ownerKind` like
+  `'attacker_owned'` is rejected with a 23514 CHECK violation by the
+  DEDUP-1 schema CHECK constraint. `addReference` does NOT pre-filter
+  the kind; the DB constraint is the canonical guard so a future migration
+  that widens the set automatically lifts the limit without code changes.
+- **No identity leak in `dedupHit: true`.** The response is identical
+  in shape to a fresh upload response; only the `dedupHit` flag
+  distinguishes the two. `createdBy` flows through as a documented
+  STORAGE-6 field (not new identity exposure).
+- **No provider material in the reference table.** The
+  `storage_object_references` row carries `object_id` + `owner_kind` +
+  `owner_id` + `created_at` — nothing else. Regression-guarded by the
+  STORAGE-4 / DEDUP-1 forbidden-column contract tests.
+- **Client-claimed sha256 is NEVER trusted for security decisions.**
+  Dedup is a storage-cost optimisation, not an access-control
+  mechanism. A malicious sha256 claim within a workspace gets the
+  caller a reference to bytes they already have access to within their
+  workspace boundary. Cross-workspace dedup is structurally impossible
+  because the partial unique index keys on `(workspace_id, sha256)`,
+  not on `(sha256)` alone. DEDUP-3 (server-side verification on
+  complete-upload) tightens this further — out of scope for DEDUP-2 per
+  plan §21.
+- **Reference-counted soft-delete never under-counts.** The
+  `addReference` call in the handler runs AFTER the atomic
+  object+session insert so a reference row is always present when a
+  caller eventually deletes the parent. Even on the dedup-hit path the
+  reference is minted (otherwise the parent would be deletable by the
+  legacy force-delete path that doesn't decrement references).
+
+### Backward compatibility
+
+- Pre-DEDUP-2 callers that don't send `sha256` see zero behavioural
+  change — `findExistingByWorkspaceSha256` is only called when sha256
+  is present in the payload.
+- Pre-DEDUP-2 callers that don't send `ownerKind`/`ownerId` get the
+  default `platform_generic` owner kind + a freshly-generated UUID for
+  `owner_id`. Their references accumulate but never block their own
+  re-uploads (their re-upload hits dedup and adds another reference
+  under the same owner kind).
+- The new `dedupHit` response field is required on the wire (no
+  `?:` optionality at the schema level) so consumers can branch
+  confidently. CMS Console storage-client clients parse `dedupHit ===
+  true` strictly (any other value collapses to `false`) for backwards
+  compatibility with old storage-service builds.
+- The new `referencesRemaining` response field on delete is OMITTED
+  when the object is actually soft-deleted — existing client code that
+  only checks `object.status === 'deleted'` is unaffected.
+- `UploadHandlerDependencies.references` and
+  `ObjectsHandlerDependencies.references` are BOTH optional. When
+  omitted, the handlers fall through to the legacy non-dedup path
+  byte-for-byte (uploads always mint a fresh session; deletes always
+  soft-delete immediately). This preserves the STORAGE-5 / STORAGE-6
+  test posture where existing tests pre-DEDUP-2 don't have to be
+  rewritten to inject a references-repository fake.
+
+### Tests
+
+- `tests/actions/handlers/uploads/create-dedup.test.ts` — 21 unit tests:
+  dedup hit on `ready` / `processing` / `uploaded` rows; no hit on
+  `pending_upload` / `failed` / `deleted` / missing sha256; cross-workspace
+  isolation; owner_kind default vs explicit; ownerId default vs explicit;
+  `dedupHit: true` response shape (no provider config leak); `addReference`
+  idempotency; api_key actor parity; createdBy is the EXISTING uploader.
+- `tests/actions/handlers/uploads/references-fake.test.ts` — 12 tests on
+  the in-memory `FakeReferencesRepository` covering addReference idempotency,
+  removeReference returning correct remaining counts, countReferences,
+  composite-PK semantics.
+- `tests/actions/handlers/objects/delete-references.test.ts` — 13 unit tests:
+  reference-counted delete (last reference removed soft-deletes; remaining
+  references leave `status='ready'`); legacy force-delete mode (no
+  ownerKind/ownerId provided) preserves byte-for-byte; schema
+  validation (paired ownerKind/ownerId).
+- `tests/infra/db/repositories/object-references-repository.integration.test.ts`
+  — 16 integration tests against live Postgres: addReference happy path
+  + idempotency + cross-workspace defense + FK CASCADE; removeReference
+  remaining count accuracy; countReferences; closed-set ownerKind
+  rejected at DB; CASCADE on object hard-delete clears references.
+- `tests/infra/db/repositories/object-and-session-repository.test.ts` (+9 cases)
+  — integration tests for the new `findExistingByWorkspaceSha256` method:
+  hit on every active status; miss on `pending_upload` / `failed` /
+  `deleted`; miss on cross-workspace; miss on null sha256.
+
+### Quality gates (2026-05-28)
+
+- `bun run lint` exit 0.
+- `bun run typecheck` exit 0.
+- `bun run db:check` exit 0 (Drizzle mirror in sync with both canonical
+  migrations).
+- `bun test` → **1167 / 1167 pass / 2934 expects / 66 files** (baseline
+  before DEDUP-2: 1100 / 2790 / 62 — delta +67 tests + 4 files).
+- `bun run test:coverage` → overall **funcs=97.23% / lines=99.52%**
+  (above ADR-001 80% floor). Per touched file:
+  * `src/actions/handlers/uploads/create.ts`: **87.50% funcs / 100% lines**.
+  * `src/actions/handlers/objects/delete.ts`: **100% funcs / 98.51% lines**.
+  * `src/infra/db/repositories/object-references-repository.ts`: **100% / 100%**.
+  * `src/infra/db/repositories/object-and-session-repository.ts`: 93.94% / 95.40%.
+
+### CMS Console wiring
+
+The FE half of DEDUP-2 lands on `xynes-front-end/xynes-cms-console-web`
+branch `feature/DEDUP-2-storage-client-dedup-hit`:
+
+- `storage-client.ts`:
+  - `CreateUploadSessionResult` gains `dedupHit: boolean`.
+  - `CreateUploadSessionFileInput` gains optional `ownerKind` / `ownerId`.
+  - `directProviderUpload` no-ops when `session.dedupHit === true`.
+  - Strict-boolean parse — anything other than `true` collapses to `false`.
+- `use-storage-upload-adapter.ts`: on `dedupHit: true`, skip BOTH
+  `directProviderUpload` and `completeStorageUploadSession`; mint the
+  display URL against `session.object.id`.
+- Tests: +22 new tests (storage-client 18 + adapter 4); 588 / 588 pass.
 
 
 ## Deployment Posture (STORAGE-FU-5-FU-E)

@@ -140,6 +140,20 @@ export interface CreateDownloadUrlResponse {
 
 export interface DeleteObjectResponse {
   readonly object: PublicStorageObject;
+  /**
+   * DEDUP-2 — when present, the delete handler did NOT soft-delete the
+   * object because other references still hold it. The caller removed
+   * THEIR reference (via the `ownerKind`/`ownerId` payload pair) but
+   * the underlying bytes are still in use by `referencesRemaining`
+   * other consumers.
+   *
+   * Omitted on the legacy STORAGE-6 force-soft-delete path (no
+   * `ownerKind`/`ownerId` supplied) and on the "last reference removed"
+   * path where the object IS soft-deleted. Pre-DEDUP-2 callers that
+   * don't read this field continue to work — they see the soft-deleted
+   * object DTO as before.
+   */
+  readonly referencesRemaining?: number;
 }
 
 // ── Usage read response ───────────────────────────────────────────────────

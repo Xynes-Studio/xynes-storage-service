@@ -32,6 +32,7 @@ export {
   PostgresStorageUsageRepository,
   DuplicateActiveJobError,
 } from './variant-job-usage-repository';
+export { PostgresStorageObjectReferenceRepository } from './object-references-repository';
 export {
   deriveJobRequired,
   mapStorageObjectRow,
