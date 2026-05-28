@@ -74,12 +74,30 @@ const DEDUP_MIGRATION_PATH = resolve(
   '20260528090000_storage_object_references_and_dedup_index.sql',
 );
 
+// STORAGE-FU-2-FU-1 ships a third canonical migration that adds the partial
+// unique index `storage_processing_jobs_active_unique_uidx`. Same posture as
+// DEDUP-1 above — concatenate when the file is reachable.
+const FU_1_MIGRATION_PATH = resolve(
+  import.meta.dir,
+  '..',
+  '..',
+  '..',
+  '..',
+  'xynes-infra',
+  'supabase',
+  'migrations',
+  '20260528100000_storage_processing_jobs_active_unique_index.sql',
+);
+
 const MIGRATION_REACHABLE = existsSync(MIGRATION_PATH);
 const DEDUP_MIGRATION_REACHABLE = existsSync(DEDUP_MIGRATION_PATH);
+const FU_1_MIGRATION_REACHABLE = existsSync(FU_1_MIGRATION_PATH);
 const MIGRATION_SQL = MIGRATION_REACHABLE
   ? readFileSync(MIGRATION_PATH, 'utf-8') +
     '\n-- END OF MIGRATION FILE --\n' +
-    (DEDUP_MIGRATION_REACHABLE ? readFileSync(DEDUP_MIGRATION_PATH, 'utf-8') : '')
+    (DEDUP_MIGRATION_REACHABLE ? readFileSync(DEDUP_MIGRATION_PATH, 'utf-8') : '') +
+    '\n-- END OF MIGRATION FILE --\n' +
+    (FU_1_MIGRATION_REACHABLE ? readFileSync(FU_1_MIGRATION_PATH, 'utf-8') : '')
   : '';
 
 if (!MIGRATION_REACHABLE) {
@@ -215,6 +233,37 @@ describe('schema mirror — table coverage', () => {
       // active statuses only.
       expect(MIGRATION_SQL).toContain('(workspace_id, sha256)');
       expect(MIGRATION_SQL).toContain("status IN ('uploaded', 'processing', 'ready')");
+    },
+  );
+
+  test.skipIf(!MIGRATION_REACHABLE || !FU_1_MIGRATION_REACHABLE)(
+    'STORAGE-FU-2-FU-1 partial unique index for active jobs is declared',
+    () => {
+      expect(MIGRATION_SQL).toContain('storage_processing_jobs_active_unique_uidx');
+      // The index MUST be PARTIAL on (object_id, job_kind) covering ONLY
+      // non-terminal status values. A global unique index would break
+      // STORAGE-7's retry-after-terminal contract.
+      expect(MIGRATION_SQL).toContain('(object_id, job_kind)');
+      expect(MIGRATION_SQL).toContain("status IN ('queued', 'running')");
+      // The predicate MUST NOT cover any terminal status — assert each
+      // terminal value never appears alongside the active list.
+      // (Substring check is sufficient because the FU-1 migration's
+      // predicate appears on one line — see canonical migration source.)
+      const predicateLine = MIGRATION_SQL.match(
+        /WHERE status IN \([^)]+\)[\s\S]*?storage_processing_jobs_active_unique_uidx/,
+      );
+      // The reverse-order regex above tolerates either ordering.
+      // For the canonical migration where the predicate follows the
+      // index name, use a forward-direction match:
+      const forward = MIGRATION_SQL.match(
+        /storage_processing_jobs_active_unique_uidx[\s\S]*?WHERE status IN \(([^)]+)\)/,
+      );
+      const inClause = forward?.[1] ?? predicateLine?.[0] ?? '';
+      expect(inClause).toContain("'queued'");
+      expect(inClause).toContain("'running'");
+      expect(inClause).not.toContain("'succeeded'");
+      expect(inClause).not.toContain("'failed'");
+      expect(inClause).not.toContain("'cancelled'");
     },
   );
 });
