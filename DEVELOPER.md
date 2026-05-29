@@ -813,7 +813,7 @@ worker.start();
 For STORAGE-8 the action registry remains empty in `src/index.ts` —
 the unit tests register handlers and runners against in-memory fakes.
 The `createRunnerRegistry` factory is exported so production wiring
-is a one-liner once sharp / ffmpeg / libreoffice bindings (or remote
+is a one-liner once sharp / ffmpeg / libreoffice / clamav bindings (or remote
 sidecars) plus the Drizzle variant writer land.
 
 ## Security, Privacy, and Abuse Controls (STORAGE-9)
@@ -950,6 +950,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-5-FU-A | ✅ Landed 2026-05-28 (Sharp-backed `ImageProcessor` — closes Bug 1 for image variants; EXIF stripping mandatory; libvips cache disabled) |
 | STORAGE-FU-5-FU-B | ✅ Landed 2026-05-28 (ffmpeg-backed `VideoProcessor` — closes Bug 1 for video variants; `-map_metadata -1` strips embedded metadata; pipe-only I/O with no temp files; `STORAGE_FFMPEG_TIMEOUT_MS` per-job timeout; in-process Bun.spawn against `ffmpeg-static`) |
 | STORAGE-FU-5-FU-C | ✅ Landed 2026-05-28 (LibreOffice-backed `DocumentProcessor` — closes Bug 1 for document preview variants; HTTP client to pod-local sidecar via `LIBREOFFICE_SERVICE_URL`; `STORAGE_SOFFICE_TIMEOUT_MS` per-job timeout; safe-fail to production stub when URL unset) |
+| STORAGE-FU-5-FU-D | ✅ Landed 2026-05-29 (ClamAV-backed `MalwareScanner` — closes STORAGE-9 §3.6 malware-scan gate; clamd INSTREAM over TCP (`CLAMD_HOST`/`CLAMD_PORT`) or unix socket (`CLAMD_SOCKET`); pooled persistent socket with reconnect-on-close; `unknown` NEVER coerced to `clean`; safe-fail to unknown scanner when ctor throws) |
 | STORAGE-FU-5-FU-E | ✅ Landed 2026-05-28 (Deployment posture decision — sharp + ffmpeg in-process, LibreOffice + clamav sidecars; Compose overlay + K8s draft manifests) |
 | STORAGE-FU-5-FU-G | ✅ Code landed 2026-05-28 (LibreOffice sidecar Bun HTTP shim image — closes Bug 1 (document) production gap. Source lives at `sidecars/libreoffice/` in this repo; Compose overlay + K8s manifests in `xynes-infra` pin to `xynes/libreoffice-sidecar:0.1.0`. Image build + live R2 smoke deferred to operator per plan §12.5 acceptance criteria.) |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
@@ -2007,8 +2008,8 @@ above.
 - Multi-page preview rendering (single first-page only).
 - OCR for image-only PDFs.
 - Office encryption / password-protected document handling.
-- Streaming responses (sidecar buffers the full PNG/JPEG in memory
-  before responding; payloads stay under `MAX_DOCUMENT_BYTES`).
+- Streaming responses (the shim currently buffers the full PNG before
+  responding; payloads stay well under `MAX_DOCUMENT_BYTES`).
 - The Bun HTTP shim that actually serves `POST /convert` on the
   sidecar container — STORAGE-FU-5-FU-E flagged it as the LibreOffice
   sidecar implementation gap. The placeholder image
@@ -2020,6 +2021,114 @@ above.
   documented above) — exactly the posture FU-E §3 commits to.
 - Fixture-based integration suite against a real `soffice` binary
   (STORAGE-FU-5-FU-F).
+- Live integration smoke against R2 (live-rollout plan).
+
+## ClamAV-backed Malware Scanner (STORAGE-FU-5-FU-D)
+
+STORAGE-FU-5-FU-D closes the gap between STORAGE-FU-5's `noopMalwareScanner`
+default (always returns `clean`) and a real malware scanner backed by
+[ClamAV](https://www.clamav.net/)'s clamd daemon. STORAGE-9 §3.6 mandates
+that hosted environments inject a real scanner; scanner outages MUST surface
+as `SCANNER_INCONCLUSIVE` and MUST NEVER be silently coerced to `clean`.
+
+### Files
+
+- `src/infra/processors/clamav-scanner.ts` — `ClamavMalwareScanner` class.
+  Speaks the clamd `zINSTREAM` protocol over either TCP (`host` + `port`)
+  or a unix socket path (`socketPath`, takes precedence). Maintains a
+  single pooled persistent connection per scanner instance with
+  reconnect-on-close. Exposes a `__forTesting__` seam (`parseClamdResponse`).
+- `src/infra/processors/index.ts` — barrel re-exports
+  `ClamavMalwareScanner`, `ClamavMalwareScannerOptions`,
+  `DEFAULT_CLAMD_HOST`, `DEFAULT_CLAMD_PORT`, `DEFAULT_CLAMD_TIMEOUT_MS`.
+- `src/infra/processors/runner-dependencies.ts` — `createRunnerDependencies`
+  selects the scanner per mode: `stub` ⇒ `noopMalwareScanner`; `live` ⇒
+  `buildLiveMalwareScanner(env, loader)` which constructs
+  `ClamavMalwareScanner`. A failed constructor falls back to an
+  internal `unknownScanner` (always returns `{ verdict: 'unknown' }`) with
+  a single startup WARN; the worker keeps running and FU-A/B/C jobs are
+  unaffected. New env helpers: `resolveClamdHost`, `resolveClamdPort`,
+  `resolveClamdSocket`, `resolveClamdTimeoutMs`.
+
+### Env contract
+
+| Env | Default | Notes |
+|---|---|---|
+| `CLAMD_HOST` | `clamav-clamd` | Sidecar hostname per FU-E §4. Trimmed; blank falls back to default. |
+| `CLAMD_PORT` | `3310` | Strict positive-integer parse; malformed → default. |
+| `CLAMD_SOCKET` | unset | When set, takes precedence over TCP. Pod-local unix socket path. |
+| `CLAMD_TIMEOUT_MS` | `10000` | Strict positive-integer parse; malformed → default. |
+
+### Security invariants (proven by tests)
+
+1. **`unknown` is NEVER coerced to `clean`.** clamd responses other than
+   `OK` / `… FOUND` map to `{ verdict: 'unknown' }`. The runner contract
+   (STORAGE-8 `scan-validation`) flips parents to `failed` on the required
+   `scan_validation` job when verdict is `unknown` after retries.
+2. **No raw signature names in error envelopes.** `parseClamdResponse`
+   extracts the signature into the typed result; the runner forwards
+   `{ verdict: 'infected', signature }` as structured fields, never as
+   user-visible error message text.
+3. **Bytes are streamed via `INSTREAM`** — never written to a temp file.
+4. **Clamd-only upstream** — no external scanning APIs reached from this
+   processor.
+5. **Connection failures don't leak transport details.** The scanner
+   catches every error from `getSocket()` / `sendInstream()` /
+   `readResponse()` and returns `{ verdict: 'unknown' }`. The underlying
+   `clamd socket closed` / `clamd socket error` / `clamd response timeout`
+   strings stay inside the scanner.
+6. **Pooled-socket reuse is workspace-agnostic.** The scanner owns ONE
+   socket per worker; no per-workspace caching of bytes or signatures.
+
+### Test plan
+
+`tests/infra/processors/clamav-scanner.test.ts` (10 tests):
+- `parseClamdResponse` happy / infected / unknown / empty.
+- `ClamavMalwareScanner.scan` against a deterministic fake socket factory:
+  - Clean verdict + payload bytes verified end-to-end through `zINSTREAM`
+    framing (4-byte length prefix + 4-byte terminator).
+  - Infected verdict with signature extraction.
+  - One persistent socket reused across sequential scans.
+  - Reconnect on `closeAfterResponse` (one socket per scan when the
+    response stream closes).
+  - Timeout returns `unknown` without leaking transport text.
+  - `socketPath` takes precedence over `host`/`port` in connection options.
+
+`tests/infra/processors/runner-dependencies.test.ts` adds 5 FU-D tests:
+- `stub` mode keeps `noopMalwareScanner` (clean verdict).
+- `live` mode wires the clamd scanner by default; scanner failures
+  (e.g. unreachable clamd) surface as `SCANNER_INCONCLUSIVE` via the
+  STORAGE-8 `scan-validation` runner.
+- `resolveClamdHost` / `resolveClamdPort` / `resolveClamdSocket` /
+  `resolveClamdTimeoutMs` env-helper coverage.
+- `buildLiveMalwareScanner` falls back to the internal unknown scanner
+  when the loader throws — single WARN, message contains
+  `clamd unavailable` but NEVER the underlying ctor error text or any
+  credential pattern.
+
+### Quality gates
+
+- `bun run lint` exit 0.
+- `bun run typecheck` exit 0.
+- `bun run db:check` exit 0 — no schema impact.
+- `bun test` → **1441 / 1441 pass / 3799 expects / 78 files**
+  (baseline before FU-D: 1424 / 3658 / 77 — delta +17 tests + 1 file).
+- `bun run test:coverage` → overall **funcs=96.72% / lines=99.27%**
+  (above ADR-001 80% floor). Per-touched file: `clamav-scanner.ts` at
+  **85.71% funcs / 94.61% lines** (uncovered: defensive socket-factory
+  fallback + the `clearSocket`/`resetSocket` edge where socket is null);
+  `runner-dependencies.ts` at
+  **100% / 100%**; `index.ts` at
+  **100% / 100%**.
+
+### Out of scope (deferred follow-ups)
+
+- STORAGE-FU-5-FU-F (fixture-based integration suite with the EICAR
+  antivirus test vector against a live `clamd` binary).
+- Multi-engine scanning (YARA, custom rule sets).
+- Scanner-result caching by content hash (job-level dedup via DEDUP-1/2
+  handles this already).
+- Scanner load balancing across multiple clamd instances.
 - Live integration smoke against R2 (live-rollout plan).
 
 ## Worker Lifecycle (STORAGE-FU-6)

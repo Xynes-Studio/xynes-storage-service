@@ -13,15 +13,11 @@
  *     for `image_optimize`.
  *     STORAGE-FU-5-FU-B: wires `FfmpegVideoProcessor` (ffmpeg-static)
  *     for `video_probe` / `video_thumbnail` / `video_transcode`.
- *     Document still uses the safe-fail production stub that throws
- *     `UNSUPPORTED_FORMAT` until STORAGE-FU-5-FU-C (LibreOffice)
- *     lands. This is a deliberate fail-safe: a hosted environment
- *     that flips `live` without the per-family adapter wired sees
- *     clean closed-set runner failures, not opaque crashes.
+ *     STORAGE-FU-5-FU-C: wires `LibreOfficeDocumentProcessor` for
+ *     `document_preview` via the pod-local sidecar contract.
  *
- *     Sharp or ffmpeg-static import failure (corrupted binding /
- *     binary, unsupported platform) falls back to the production
- *     stubs with a single startup WARN per family — image / video
+ *     Sharp / ffmpeg / LibreOffice construction failures fall back to
+ *     the production stubs with a single startup WARN per family —
  *     jobs dead-letter cleanly instead of crashing the worker.
  *
  * Override via `STORAGE_PROCESSOR_MODE` env. `live` requires every
@@ -31,8 +27,10 @@
  * Scanner posture:
  *
  *   - Stub mode → `noopMalwareScanner` (verdict always `clean`).
- *   - Live mode → also `noopMalwareScanner` for now; wiring clamav (or
- *     a clamav-rest sidecar) is STORAGE-FU-5-FU-D.
+ *   - Live mode → `ClamavMalwareScanner` (INSTREAM over clamd TCP/
+ *     socket). If construction fails, falls back to a scanner that
+ *     returns `unknown` with a single startup WARN (never coerces
+ *     to clean).
  *
  * The composition root constructs ONE `createRunnerDependencies`
  * result and passes the registry to `ProcessingWorker`. The scan
@@ -56,6 +54,12 @@ import {
   ProductionImageProcessorStub,
   ProductionVideoProcessorStub,
 } from './production-processors';
+import {
+  ClamavMalwareScanner,
+  DEFAULT_CLAMD_HOST,
+  DEFAULT_CLAMD_PORT,
+  DEFAULT_CLAMD_TIMEOUT_MS,
+} from './clamav-scanner';
 // Type-only imports — does NOT pull in `sharp` or `ffmpeg-static` at
 // module load. The runtime values are lazy-loaded inside
 // `buildLiveImageProcessor()` / `buildLiveVideoProcessor()` via
@@ -270,6 +274,7 @@ function buildLiveVideoProcessor(
  * deterministic sidecar client.
  */
 let libreofficeFallbackLogged = false;
+let clamdFallbackLogged = false;
 type LibreOfficeProcessorCtor = new (
   deps: LibreOfficeDocumentProcessorDeps,
 ) => LibreOfficeDocumentProcessorType;
@@ -331,6 +336,85 @@ function buildLiveDocumentProcessor(
   }
 }
 
+function resolveClamdHost(env: NodeJS.ProcessEnv): string {
+  const raw = env.CLAMD_HOST;
+  if (typeof raw !== 'string') return DEFAULT_CLAMD_HOST;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : DEFAULT_CLAMD_HOST;
+}
+
+function resolveClamdPort(env: NodeJS.ProcessEnv): number {
+  const raw = env.CLAMD_PORT;
+  if (typeof raw !== 'string' || raw.length === 0) return DEFAULT_CLAMD_PORT;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    return DEFAULT_CLAMD_PORT;
+  }
+  return parsed;
+}
+
+function resolveClamdSocket(env: NodeJS.ProcessEnv): string | undefined {
+  const raw = env.CLAMD_SOCKET;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function resolveClamdTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.CLAMD_TIMEOUT_MS;
+  if (typeof raw !== 'string' || raw.length === 0) return DEFAULT_CLAMD_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    return DEFAULT_CLAMD_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
+const unknownScanner: MalwareScanner = Object.freeze({
+  async scan() {
+    return { verdict: 'unknown' as const };
+  },
+});
+
+function warnClamdFallback(reason: 'ctor-failed'): void {
+  if (clamdFallbackLogged) return;
+  clamdFallbackLogged = true;
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[runner-dependencies] clamd unavailable (${reason}); scan_validation will emit SCANNER_INCONCLUSIVE until adapter is wired`,
+  );
+}
+
+type ClamavScannerCtor = new (options?: {
+  host?: string;
+  port?: number;
+  socketPath?: string;
+  timeoutMs?: number;
+}) => MalwareScanner;
+
+function defaultClamdLoader(): ClamavScannerCtor {
+  return ClamavMalwareScanner;
+}
+
+function buildLiveMalwareScanner(
+  env: NodeJS.ProcessEnv,
+  loader: () => ClamavScannerCtor = defaultClamdLoader,
+): MalwareScanner {
+  try {
+    const Ctor = loader();
+    return new Ctor({
+      host: resolveClamdHost(env),
+      port: resolveClamdPort(env),
+      socketPath: resolveClamdSocket(env),
+      timeoutMs: resolveClamdTimeoutMs(env),
+    });
+  } catch (err) {
+    warnClamdFallback('ctor-failed');
+    void err;
+    return unknownScanner;
+  }
+}
+
 /**
  * Test-only seam for STORAGE-FU-5-FU-A / FU-B / FU-C fallback
  * regression tests.
@@ -349,9 +433,14 @@ export const __forTesting__ = {
   buildLiveImageProcessor,
   buildLiveVideoProcessor,
   buildLiveDocumentProcessor,
+  buildLiveMalwareScanner,
   resolveFfmpegTimeoutMs,
   resolveSofficeTimeoutMs,
   resolveLibreOfficeServiceUrl,
+  resolveClamdHost,
+  resolveClamdPort,
+  resolveClamdSocket,
+  resolveClamdTimeoutMs,
   resetSharpFallbackLogged(): void {
     sharpFallbackLogged = false;
   },
@@ -360,6 +449,9 @@ export const __forTesting__ = {
   },
   resetLibreOfficeFallbackLogged(): void {
     libreofficeFallbackLogged = false;
+  },
+  resetClamdFallbackLogged(): void {
+    clamdFallbackLogged = false;
   },
 };
 
@@ -381,7 +473,8 @@ export function createRunnerDependencies(
   const document: DocumentProcessor =
     options.document ??
     (mode === 'stub' ? new StubDocumentProcessor() : buildLiveDocumentProcessor(env));
-  const scanner: MalwareScanner = options.scanner ?? noopMalwareScanner;
+  const scanner: MalwareScanner =
+    options.scanner ?? (mode === 'stub' ? noopMalwareScanner : buildLiveMalwareScanner(env));
 
   const registry = createRunnerRegistry({
     providerIO: options.providerIO,
