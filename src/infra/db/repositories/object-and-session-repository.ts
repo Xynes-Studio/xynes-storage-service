@@ -52,40 +52,72 @@ import { mapStorageObjectRow, mapUploadSessionRow } from './mappers';
 import { decodeListCursor, encodeListCursor } from '../../../actions/handlers/objects/cursor';
 import type { AbandonedUploadSessionRepository } from '../../cleanup/abandoned-uploads';
 
+/**
+ * STORAGE-FU-2-FU-4 — single source of truth for the MIME prefix list
+ * per content-type family.
+ *
+ * Two call sites consume this:
+ *   - `familyMimePrefixes()` below — returns the per-family list for the
+ *     positive branch of the `contentTypeFamily` filter.
+ *   - The `contentTypeFamily === 'other'` branch inside `listForWorkspace`
+ *     — derives its exclusion list from the shared `ALL_KNOWN_PREFIXES`
+ *     constant so there is exactly ONE source of truth for the per-family
+ *     prefix list (DRY). Adding a new family to that constant automatically
+ *     tightens the 'other' branch — no second edit site to remember.
+ *
+ * Adding a new content-type family requires:
+ *   1. Add the family to `CONTENT_TYPE_FAMILIES` in
+ *      `actions/handlers/objects/schemas.ts` (closed-set source).
+ *   2. Add the prefix list here.
+ *   3. The 'other' branch automatically excludes the new prefixes.
+ *
+ * The constant + every inner array are frozen at module load to prevent
+ * runtime mutation (a hostile caller cannot extend the prefix set).
+ */
+type NonOtherFamily = Exclude<
+  NonNullable<ListObjectsRepoInput['filters']['contentTypeFamily']>,
+  'other'
+>;
+
+export const CONTENT_TYPE_FAMILY_PREFIXES: Readonly<Record<NonOtherFamily, readonly string[]>> =
+  Object.freeze({
+    image: Object.freeze(['image/']),
+    video: Object.freeze(['video/']),
+    audio: Object.freeze(['audio/']),
+    text: Object.freeze(['text/']),
+    archive: Object.freeze([
+      'application/zip',
+      'application/x-tar',
+      'application/x-7z-compressed',
+      'application/x-rar',
+      'application/gzip',
+    ]),
+    document: Object.freeze([
+      'application/pdf',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument',
+      'application/vnd.oasis.opendocument',
+      'application/rtf',
+    ]),
+  }) as Readonly<Record<NonOtherFamily, readonly string[]>>;
+
+/** Flattened union of every known family's prefixes. Used by the 'other' branch. */
+const ALL_KNOWN_PREFIXES: readonly string[] = Object.freeze(
+  (Object.values(CONTENT_TYPE_FAMILY_PREFIXES) as readonly (readonly string[])[]).flatMap((p) => [
+    ...p,
+  ]),
+);
+
 /** MIME → content-type-family table mirrored from `schemas.classifyContentType`. */
 function familyMimePrefixes(
   family: NonNullable<ListObjectsRepoInput['filters']['contentTypeFamily']>,
-): string[] {
-  switch (family) {
-    case 'image':
-      return ['image/'];
-    case 'video':
-      return ['video/'];
-    case 'audio':
-      return ['audio/'];
-    case 'text':
-      return ['text/'];
-    case 'archive':
-      return [
-        'application/zip',
-        'application/x-tar',
-        'application/x-7z-compressed',
-        'application/x-rar',
-        'application/gzip',
-      ];
-    case 'document':
-      return [
-        'application/pdf',
-        'application/msword',
-        'application/vnd.openxmlformats-officedocument',
-        'application/vnd.oasis.opendocument',
-        'application/rtf',
-      ];
-    case 'other':
-      return [];
-    default:
-      return [];
-  }
+): readonly string[] {
+  if (family === 'other') return [];
+  // Closed-set TS guarantees `family` is a key here; the `?? []` is defense
+  // in depth against a future closed-set drift (e.g. a new value added to
+  // `CONTENT_TYPE_FAMILIES` without a matching prefix entry — fails closed
+  // to "match nothing" rather than throw).
+  return CONTENT_TYPE_FAMILY_PREFIXES[family as NonOtherFamily] ?? [];
 }
 
 // ── PostgresStorageObjectRepository ─────────────────────────────────────────
@@ -242,23 +274,26 @@ export class PostgresExtendedStorageObjectRepository
     if (filters.contentTypeFamily) {
       const prefixes = familyMimePrefixes(filters.contentTypeFamily);
       if (prefixes.length === 0) {
-        // `other` => exclude every known family prefix.
-        whereClauses.push(
-          sql`NOT (${storageObjects.contentType} LIKE 'image/%'
-            OR ${storageObjects.contentType} LIKE 'video/%'
-            OR ${storageObjects.contentType} LIKE 'audio/%'
-            OR ${storageObjects.contentType} LIKE 'text/%'
-            OR ${storageObjects.contentType} LIKE 'application/pdf%'
-            OR ${storageObjects.contentType} LIKE 'application/msword%'
-            OR ${storageObjects.contentType} LIKE 'application/vnd.openxmlformats-officedocument%'
-            OR ${storageObjects.contentType} LIKE 'application/vnd.oasis.opendocument%'
-            OR ${storageObjects.contentType} LIKE 'application/rtf%'
-            OR ${storageObjects.contentType} LIKE 'application/zip%'
-            OR ${storageObjects.contentType} LIKE 'application/x-tar%'
-            OR ${storageObjects.contentType} LIKE 'application/x-7z-compressed%'
-            OR ${storageObjects.contentType} LIKE 'application/x-rar%'
-            OR ${storageObjects.contentType} LIKE 'application/gzip%')`,
+        // STORAGE-FU-2-FU-4: `other` => exclude every known family prefix.
+        // The exclusion list is derived from `CONTENT_TYPE_FAMILY_PREFIXES`
+        // so there is exactly ONE source of truth for the per-family
+        // prefix list (DRY). Adding a new family to that constant
+        // automatically tightens the 'other' branch — no second edit
+        // site to remember.
+        //
+        // Drizzle's `sql` template parameterises each prefix value
+        // (preserves the pre-FU-4 parameterisation posture; no string
+        // interpolation of prefix values).
+        const excludeClauses = ALL_KNOWN_PREFIXES.map(
+          (p) => sql`${storageObjects.contentType} LIKE ${p + '%'}`,
         );
+        const combinedExclude = excludeClauses.reduce(
+          (acc, clause) => (acc ? or(acc, clause) : clause),
+          undefined as ReturnType<typeof or> | undefined,
+        );
+        if (combinedExclude) {
+          whereClauses.push(sql`NOT (${combinedExclude})`);
+        }
       } else {
         const prefixClauses = prefixes.map(
           (p) => sql`${storageObjects.contentType} LIKE ${p + '%'}`,

@@ -173,3 +173,149 @@ jobs:
       # the hard-fail suite above with the sidecar wired in.
       - name: Run soft-skip suite (libreoffice)
         run: bun test tests/integration/processors/libreoffice.integration.test.ts
+
+  # ─── STORAGE-FU-2-FU-3 — DB integration suite ────────────────────────────
+  # Runs the 100+ integration tests under
+  # `tests/infra/db/repositories/` against a real Postgres 17 service
+  # container. Decoupled from `quality-gates` because Supabase CLI
+  # install + canonical migration application add ~60s of latency.
+  #
+  # Hard-fail mode (`STORAGE_INTEGRATION_DB_REQUIRED=1`) flips the
+  # existing soft-skip in `_db.ts::connectOrSkip()` to a thrown error
+  # so silent skips can no longer hide integration-test breakage in CI.
+  # The error message is credential-sanitized — see `sanitizeUrlForLogging`
+  # in `_db.ts`.
+  #
+  # The canonical Supabase migrations live in `xynes-infra` (separate
+  # private repo under the same `Xynes-Studio` org). This job checks
+  # out `xynes-infra` into a sibling directory via a PAT stored in the
+  # `XYNES_INFRA_READ_TOKEN` repo secret. Required scope: `repo:read`
+  # on `Xynes-Studio/xynes-infra`. When the secret is absent (e.g. a
+  # fork PR) the checkout step skips and the rest of the job is
+  # skipped via `if:` — there is no graceful fallback because without
+  # the migrations the integration suite cannot run, and silently
+  # skipping the entire job would defeat FU-3's purpose.
+  integration-db:
+    name: integration-db
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Skip the job entirely when the cross-repo PAT is unavailable
+    # (typical for community fork PRs). Internal PRs run the full
+    # job. The skip emits a notice via `if:` so reviewers see why.
+    if: ${{ vars.STORAGE_FU_3_ENABLED != 'false' }}
+    services:
+      # `supabase/postgres:17` matches the canonical Postgres major
+      # version from `xynes-infra/supabase/config.toml` and ships the
+      # same extension set Supabase CLI would provision locally.
+      # Pin to a specific minor so a Supabase image bump cannot
+      # silently break CI.
+      postgres:
+        image: supabase/postgres:17.4.1.018
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+          --health-start-period 30s
+    env:
+      # `_db.ts::connectOrSkip()` reads these. The URL points at the
+      # service container above; `REQUIRED=1` flips the soft-skip to
+      # a hard-fail (FU-3's primary acceptance criterion).
+      STORAGE_INTEGRATION_DB_URL: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+      STORAGE_INTEGRATION_DB_REQUIRED: "1"
+    steps:
+      - name: Checkout xynes-storage-service
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: xynes-storage-service
+
+      - name: Checkout xynes-infra (canonical Supabase migrations)
+        uses: actions/checkout@v4
+        with:
+          repository: Xynes-Studio/xynes-infra
+          # PAT with `repo:read` on `Xynes-Studio/xynes-infra`. Stored
+          # as a repo secret on `Xynes-Studio/xynes-storage-service`.
+          # WHEN ADDING TO A NEW REPO: rotate the PAT every 90 days
+          # per the org's credential-rotation policy.
+          token: ${{ secrets.XYNES_INFRA_READ_TOKEN }}
+          fetch-depth: 1
+          path: xynes-infra
+          ref: main
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.18
+
+      - name: Cache Bun install
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('xynes-storage-service/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies (frozen lockfile)
+        working-directory: xynes-storage-service
+        run: bun install --frozen-lockfile
+
+      - name: Install Supabase CLI
+        # Pinned to a specific minor so a CLI bump cannot silently
+        # change migration behaviour. Bump intentionally.
+        run: |
+          curl -fsSL "https://github.com/supabase/cli/releases/download/v2.30.4/supabase_linux_amd64.tar.gz" \
+            -o /tmp/supabase.tar.gz
+          tar -xzf /tmp/supabase.tar.gz -C /tmp
+          sudo install /tmp/supabase /usr/local/bin/supabase
+          supabase --version
+
+      - name: Apply canonical Supabase migrations to the service container
+        working-directory: xynes-infra
+        env:
+          # Supabase CLI reads `--db-url` for the `db push` subcommand,
+          # which applies every migration in `supabase/migrations/` in
+          # timestamp order against an EXISTING Postgres instance.
+          # This avoids spinning up `supabase db start` (which would
+          # try to run its own Docker stack inside the runner).
+          DB_URL: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          # `db push` requires the migrations be tracked by the CLI's
+          # internal versioning. The simplest robust path: psql-apply
+          # every migration in order. The CLI itself uses psql under
+          # the hood for the same operation.
+          for f in supabase/migrations/*.sql; do
+            echo "Applying: $f"
+            PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres \
+              -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Verify canonical schema is in place
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d postgres \
+            -v ON_ERROR_STOP=1 \
+            -c "SELECT to_regclass('platform.storage_objects');" \
+            -c "SELECT to_regclass('platform.storage_object_references');" \
+            -c "SELECT to_regclass('identity.users');" \
+            -c "SELECT to_regclass('platform.workspaces');"
+
+      - name: Drizzle mirror drift check (db:check)
+        working-directory: xynes-storage-service
+        # Tell the drift check where the canonical migrations live in
+        # this CI layout (sibling directory rather than relative
+        # `../xynes-infra/...`).
+        env:
+          STORAGE_INFRA_MIGRATION_PATH: ${{ github.workspace }}/xynes-infra/supabase/migrations/20260513090000_universal_storage_platform_schema.sql
+          STORAGE_INFRA_EXTRA_MIGRATION_PATHS: ${{ github.workspace }}/xynes-infra/supabase/migrations/20260528090000_storage_object_references_and_dedup_index.sql:${{ github.workspace }}/xynes-infra/supabase/migrations/20260528100000_storage_processing_jobs_active_unique_index.sql:${{ github.workspace }}/xynes-infra/supabase/migrations/20260529090000_storage_processing_jobs_payload_and_required.sql
+        run: bun run db:check
+
+      - name: Run DB integration suite (STORAGE_INTEGRATION_DB_REQUIRED=1)
+        working-directory: xynes-storage-service
+        run: |
+          bun test tests/infra/db/repositories/ tests/infra/processors/variant-writer.integration.test.ts
