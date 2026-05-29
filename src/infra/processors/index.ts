@@ -47,6 +47,14 @@ export {
 } from './libreoffice-document-processor';
 
 export {
+  ClamavMalwareScanner,
+  DEFAULT_CLAMD_HOST,
+  DEFAULT_CLAMD_PORT,
+  DEFAULT_CLAMD_TIMEOUT_MS,
+  type ClamavMalwareScannerOptions,
+} from './clamav-scanner';
+
+export {
   createRunnerDependencies,
   isProcessorMode,
   PROCESSOR_MODES,

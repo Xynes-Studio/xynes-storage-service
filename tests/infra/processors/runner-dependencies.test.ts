@@ -16,8 +16,9 @@
  *   - Caller-supplied processor overrides win against the env-selected
  *     defaults.
  */
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import {
+  __forTesting__,
   createRunnerDependencies,
   isProcessorMode,
   PROCESSOR_MODES,
@@ -261,6 +262,146 @@ describe('createRunnerDependencies — caller overrides', () => {
     void ProductionImageProcessorStub;
     void ProductionVideoProcessorStub;
     void ProductionDocumentProcessorStub;
+  });
+});
+
+describe('createRunnerDependencies — STORAGE-FU-5-FU-D scanner wiring', () => {
+  test('stub mode keeps noop scanner (clean verdict)', async () => {
+    const r = createRunnerDependencies({
+      providerIO: FAKE_IO,
+      variants: FAKE_VARIANTS,
+      mode: 'stub',
+    });
+
+    const out = await r.registry.scan_validation!({
+      job: {
+        id: 'job-1',
+        jobType: 'scan_validation',
+        objectId: 'obj-1',
+        workspaceId: 'ws-1',
+        attempts: 0,
+        maxAttempts: 3,
+        payload: {},
+        required: true,
+      },
+      object: {
+        id: 'obj-1',
+        workspaceId: 'ws-1',
+        providerId: 'prov-1',
+        providerObjectKey: 'k/x.bin',
+        filename: 'x.bin',
+        contentType: 'application/octet-stream',
+        byteSize: 4,
+        sha256: null,
+        purpose: 'cms_media',
+        visibility: 'private',
+        status: 'uploaded',
+        compressionRequested: true,
+        createdBy: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        uploadedAt: new Date(),
+      },
+    });
+
+    expect(out).toEqual({});
+  });
+
+  test('live mode wires clamd scanner by default and scanner failures surface as SCANNER_INCONCLUSIVE', async () => {
+    const r = createRunnerDependencies({
+      providerIO: FAKE_IO,
+      variants: FAKE_VARIANTS,
+      mode: 'live',
+      env: {
+        NODE_ENV: 'production',
+        CLAMD_HOST: '127.0.0.1',
+        CLAMD_PORT: '1',
+        CLAMD_TIMEOUT_MS: '10',
+      },
+    });
+
+    const out = await r.registry.scan_validation!({
+      job: {
+        id: 'job-1',
+        jobType: 'scan_validation',
+        objectId: 'obj-1',
+        workspaceId: 'ws-1',
+        attempts: 0,
+        maxAttempts: 3,
+        payload: {},
+        required: true,
+      },
+      object: {
+        id: 'obj-1',
+        workspaceId: 'ws-1',
+        providerId: 'prov-1',
+        providerObjectKey: 'k/x.bin',
+        filename: 'x.bin',
+        contentType: 'application/octet-stream',
+        byteSize: 4,
+        sha256: null,
+        purpose: 'cms_media',
+        visibility: 'private',
+        status: 'uploaded',
+        compressionRequested: true,
+        createdBy: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        uploadedAt: new Date(),
+      },
+    });
+
+    expect(out).toEqual({ errorCode: 'SCANNER_INCONCLUSIVE', retryable: true });
+  });
+});
+
+describe('runner-dependencies __forTesting__ — clamd env helpers', () => {
+  test('resolveClamdHost defaults and trims', () => {
+    expect(__forTesting__.resolveClamdHost({})).toBe('clamav-clamd');
+    expect(__forTesting__.resolveClamdHost({ CLAMD_HOST: '  clamd.local  ' })).toBe('clamd.local');
+    expect(__forTesting__.resolveClamdHost({ CLAMD_HOST: '   ' })).toBe('clamav-clamd');
+  });
+
+  test('resolveClamdPort defaults on invalid values', () => {
+    expect(__forTesting__.resolveClamdPort({})).toBe(3310);
+    expect(__forTesting__.resolveClamdPort({ CLAMD_PORT: '3311' })).toBe(3311);
+    expect(__forTesting__.resolveClamdPort({ CLAMD_PORT: '-1' })).toBe(3310);
+    expect(__forTesting__.resolveClamdPort({ CLAMD_PORT: '0' })).toBe(3310);
+    expect(__forTesting__.resolveClamdPort({ CLAMD_PORT: '1.5' })).toBe(3310);
+    expect(__forTesting__.resolveClamdPort({ CLAMD_PORT: 'abc' })).toBe(3310);
+  });
+
+  test('resolveClamdSocket returns undefined for blank input', () => {
+    expect(__forTesting__.resolveClamdSocket({})).toBeUndefined();
+    expect(__forTesting__.resolveClamdSocket({ CLAMD_SOCKET: '' })).toBeUndefined();
+    expect(__forTesting__.resolveClamdSocket({ CLAMD_SOCKET: '   ' })).toBeUndefined();
+    expect(__forTesting__.resolveClamdSocket({ CLAMD_SOCKET: '/tmp/clamd.sock' })).toBe(
+      '/tmp/clamd.sock',
+    );
+  });
+
+  test('resolveClamdTimeoutMs defaults on invalid values', () => {
+    expect(__forTesting__.resolveClamdTimeoutMs({})).toBe(10_000);
+    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '2500' })).toBe(2500);
+    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '-5' })).toBe(10_000);
+    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '0' })).toBe(10_000);
+    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '5.5' })).toBe(10_000);
+    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: 'abc' })).toBe(10_000);
+  });
+
+  test('buildLiveMalwareScanner falls back to unknown scanner when ctor throws', async () => {
+    __forTesting__.resetClamdFallbackLogged();
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
+    const scanner = __forTesting__.buildLiveMalwareScanner({ CLAMD_HOST: '127.0.0.1' }, () => {
+      throw new Error('bad scanner init');
+    });
+    const verdict = await scanner.scan({ bytes: new Uint8Array([1]) });
+    expect(verdict).toEqual({ verdict: 'unknown' });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const msg = String(warnSpy.mock.calls[0]?.[0] ?? '');
+    expect(msg).toContain('clamd unavailable');
+    expect(msg).not.toMatch(/bad scanner init|xynes_live|AKIA|X-Amz-Signature/i);
+    warnSpy.mockRestore();
   });
 });
 
