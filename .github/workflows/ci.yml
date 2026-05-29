@@ -173,3 +173,4 @@ jobs:
       # the hard-fail suite above with the sidecar wired in.
       - name: Run soft-skip suite (libreoffice)
         run: bun test tests/integration/processors/libreoffice.integration.test.ts
+

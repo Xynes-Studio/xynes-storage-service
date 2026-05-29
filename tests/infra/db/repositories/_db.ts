@@ -45,13 +45,74 @@ export interface IntegrationDb {
 }
 
 /**
+ * STORAGE-FU-2-FU-3 — credential-sanitized URL host for error messages.
+ *
+ * Strips `user:password@` from the URL so the CI error message never
+ * surfaces the DB password. Falls back to the literal string `<unknown>`
+ * if the URL is unparseable (e.g. a placeholder during ENV
+ * misconfiguration) so the error still surfaces a meaningful context
+ * without leaking material.
+ *
+ * Exported for unit testing — see `_db.unit.test.ts`.
+ */
+export function sanitizeUrlForLogging(url: string): string {
+  try {
+    const parsed = new URL(url);
+    // `URL.host` is `hostname[:port]` and does NOT carry userinfo.
+    return parsed.host || '<unknown>';
+  } catch {
+    return '<unparseable>';
+  }
+}
+
+/**
+ * STORAGE-FU-2-FU-3 — opt-in hard-fail mode for CI.
+ *
+ * When `STORAGE_INTEGRATION_DB_REQUIRED=1` is set, an unreachable DB
+ * causes `connectOrSkip()` to throw instead of returning `null`. CI
+ * sets this env var on the dedicated `integration-db` job so silent
+ * skips can no longer hide integration-test breakage in CI.
+ *
+ * Local-dev posture is preserved: on a clean laptop (env unset),
+ * `connectOrSkip()` still returns `null` and tests soft-skip cleanly.
+ *
+ * The closed-set comparison against `'1'` (NOT truthy coercion) keeps
+ * the contract narrow — `STORAGE_INTEGRATION_DB_REQUIRED=true` or
+ * `STORAGE_INTEGRATION_DB_REQUIRED=yes` will NOT enable hard-fail.
+ * This avoids surprising the operator who accidentally sets a truthy
+ * non-`'1'` value in `.env.localhost.local`.
+ *
+ * Exported for unit testing — see `_db.unit.test.ts`.
+ */
+export function isIntegrationDbRequired(): boolean {
+  return process.env.STORAGE_INTEGRATION_DB_REQUIRED === '1';
+}
+
+/**
  * Opens a connection and verifies `platform.storage_objects` exists.
  * Returns `null` when the DB is unreachable or the schema is not
  * applied — caller MUST skip the test in that case.
+ *
+ * When `STORAGE_INTEGRATION_DB_REQUIRED=1` is set in the environment,
+ * a `null` return is upgraded to a thrown `Error` (CI hard-fail mode —
+ * see STORAGE-FU-2-FU-3). The error message NEVER carries credentials:
+ * the URL is sanitized via `sanitizeUrlForLogging` which surfaces only
+ * the host:port pair.
  */
 export async function connectOrSkip(): Promise<IntegrationDb | null> {
   const url = getIntegrationDbUrl();
-  if (!url) return null;
+  const required = isIntegrationDbRequired();
+
+  if (!url) {
+    if (required) {
+      throw new Error(
+        'STORAGE_INTEGRATION_DB_REQUIRED=1 is set but no DB URL is configured. ' +
+          'Set STORAGE_INTEGRATION_DB_URL to a reachable Postgres instance.',
+      );
+    }
+    return null;
+  }
+
   let handle: StorageDbClient;
   try {
     handle = createStorageDb(url, { maxConnections: 2 });
@@ -60,10 +121,28 @@ export async function connectOrSkip(): Promise<IntegrationDb | null> {
     const rows = probe as unknown as Array<{ r: string | null }>;
     if (!rows[0] || rows[0].r === null) {
       await handle.close();
+      if (required) {
+        throw new Error(
+          `STORAGE_INTEGRATION_DB_REQUIRED=1 is set but the canonical schema is missing at ` +
+            `${sanitizeUrlForLogging(url)}. Apply the xynes-infra Supabase migrations before ` +
+            `running the integration suite.`,
+        );
+      }
       return null;
     }
     return { db: handle.db, handle };
-  } catch {
+  } catch (err) {
+    // Don't double-wrap the hard-fail error we just threw above.
+    if (err instanceof Error && err.message.startsWith('STORAGE_INTEGRATION_DB_REQUIRED=1')) {
+      throw err;
+    }
+    if (required) {
+      throw new Error(
+        `STORAGE_INTEGRATION_DB_REQUIRED=1 is set but Postgres is unreachable at ` +
+          `${sanitizeUrlForLogging(url)}. Check the CI service-container config or the ` +
+          `STORAGE_INTEGRATION_DB_URL env var.`,
+      );
+    }
     return null;
   }
 }
