@@ -17,6 +17,20 @@ import {
 } from '../../../../src/infra/db/repositories/variant-job-usage-repository';
 import type { IntegrationDb } from './_db';
 
+/**
+ * STORAGE-FU-2-FU-2: per-jobType payload validators reject any shape
+ * the STORAGE-7 planner does NOT emit. Tests construct `EnqueueJobInput`
+ * with the planner's canonical payload via this helper so the schema
+ * validator passes. The fixture shape mirrors `planner.ts` byte-for-byte.
+ */
+function plannerPayloadFor(jobType: string): Readonly<Record<string, unknown>> {
+  if (jobType === 'scan_validation') {
+    return { contentType: 'image/png', byteSize: 12345 };
+  }
+  // Every other planner job type ships only `{ contentType }`.
+  return { contentType: 'image/png' };
+}
+
 const ctx: { current: IntegrationDb | null } = { current: null };
 
 beforeAll(async () => {
@@ -142,22 +156,30 @@ describeIf('PostgresStorageProcessingJobRepository.listForObject (read surface)'
     const fx = await seedWorkspaceFixture(ctx.current.db);
     try {
       const objectId = await insertObject(ctx.current.db, fx.workspaceId, fx.providerId, fx.userId);
+      // STORAGE-FU-2-FU-2: `required` is now a real column. The
+      // canonical migration defaults to fail-closed `true`; tests
+      // insert with explicit values that mirror what the planner emits
+      // so the read surface assertion below proves the column round-trips.
       await ctx.current.db.execute(sql`
         INSERT INTO platform.storage_processing_jobs
           (id, object_id, workspace_id, job_kind, status, attempts,
-           scheduled_at, created_at)
+           scheduled_at, created_at, required, payload)
         VALUES
           (${randomUUID()}, ${objectId}, ${fx.workspaceId}, 'scan_validation',
-           'queued', 0, now(), now()),
+           'queued', 0, now(), now(), true, '{}'::jsonb),
           (${randomUUID()}, ${objectId}, ${fx.workspaceId}, 'image_optimize',
-           'succeeded', 1, now(), now())
+           'succeeded', 1, now(), now(), false, '{}'::jsonb)
       `);
       const repo = new PostgresStorageProcessingJobRepository(ctx.current.db);
       const jobs = await repo.listForObject({ objectId, workspaceId: fx.workspaceId });
       expect(jobs.length).toBe(2);
       const types = jobs.map((j) => j.jobType).sort();
       expect(types).toEqual(['image_optimize', 'scan_validation']);
-      // `required` derived per type.
+      // STORAGE-FU-2-FU-2: `required` is read STRAIGHT off the row,
+      // NOT derived from `jobKind`. The mapper proves this in
+      // `mappers.test.ts` (`reads required=true from the row even for
+      // a planner-non-required jobKind`); this assertion proves the
+      // column round-trips through Drizzle.
       const scan = jobs.find((j) => j.jobType === 'scan_validation');
       const opt = jobs.find((j) => j.jobType === 'image_optimize');
       expect(scan!.required).toBe(true);
@@ -183,7 +205,7 @@ describeIf('PostgresProcessingJobQueueRepository.enqueueBatch + listForObject', 
           workspaceId: fx.workspaceId,
           jobType: 'scan_validation',
           required: true,
-          payload: {},
+          payload: plannerPayloadFor('scan_validation'),
           scheduledAt: now,
         },
         {
@@ -192,7 +214,7 @@ describeIf('PostgresProcessingJobQueueRepository.enqueueBatch + listForObject', 
           workspaceId: fx.workspaceId,
           jobType: 'image_optimize',
           required: false,
-          payload: {},
+          payload: plannerPayloadFor('image_optimize'),
           scheduledAt: now,
         },
       ]);
@@ -209,6 +231,143 @@ describeIf('PostgresProcessingJobQueueRepository.enqueueBatch + listForObject', 
     const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
     const out = await queue.enqueueBatch([]);
     expect(out.length).toBe(0);
+  });
+
+  test('STORAGE-FU-2-FU-2: payload + required round-trip through enqueueBatch → DB → claimNextQueuedJob', async () => {
+    if (!ctx.current) return;
+    const fx = await seedWorkspaceFixture(ctx.current.db);
+    try {
+      const objectId = await insertObject(ctx.current.db, fx.workspaceId, fx.providerId, fx.userId);
+      const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+      const now = new Date();
+      const scanPayload = { contentType: 'image/png', byteSize: 12345 };
+      const optPayload = { contentType: 'image/png' };
+      await queue.enqueueBatch([
+        {
+          id: randomUUID(),
+          objectId,
+          workspaceId: fx.workspaceId,
+          jobType: 'scan_validation',
+          required: true,
+          payload: scanPayload,
+          scheduledAt: now,
+        },
+        {
+          id: randomUUID(),
+          objectId,
+          workspaceId: fx.workspaceId,
+          jobType: 'image_optimize',
+          required: false,
+          payload: optPayload,
+          scheduledAt: now,
+        },
+      ]);
+      // Claim BOTH jobs and assert payload + required round-trip
+      // through Postgres jsonb + boolean columns. `claimNextQueuedJob`
+      // pulls them in scheduled-at order; both share `now()` so the
+      // tie-break is unspecified — we collect both before asserting.
+      const claimed1 = await queue.claimNextQueuedJob({ now });
+      const claimed2 = await queue.claimNextQueuedJob({ now });
+      expect(claimed1).not.toBeNull();
+      expect(claimed2).not.toBeNull();
+      const claims = [claimed1!, claimed2!];
+      const scan = claims.find((c) => c.jobType === 'scan_validation');
+      const opt = claims.find((c) => c.jobType === 'image_optimize');
+      expect(scan).toBeDefined();
+      expect(opt).toBeDefined();
+      // Payload round-trips byte-for-byte.
+      expect(scan!.payload).toEqual(scanPayload);
+      expect(opt!.payload).toEqual(optPayload);
+      // Required round-trips.
+      expect(scan!.required).toBe(true);
+      expect(opt!.required).toBe(false);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  test('STORAGE-FU-2-FU-2: hostile payload keys are rejected BEFORE the INSERT (closed-set INVALID_JOB_PAYLOAD)', async () => {
+    if (!ctx.current) return;
+    const fx = await seedWorkspaceFixture(ctx.current.db);
+    try {
+      const objectId = await insertObject(ctx.current.db, fx.workspaceId, fx.providerId, fx.userId);
+      const queue = new PostgresProcessingJobQueueRepository(ctx.current.db);
+      const now = new Date();
+      // The planner contract says payload MUST NEVER carry credentials
+      // or provider config. The per-jobType strict validator rejects
+      // any unknown key BEFORE we open a DB transaction.
+      type CapturedError = { code?: string; statusHint?: number; message?: string };
+      let thrown: CapturedError | null = null;
+      try {
+        await queue.enqueueBatch([
+          {
+            id: randomUUID(),
+            objectId,
+            workspaceId: fx.workspaceId,
+            jobType: 'scan_validation',
+            required: true,
+            payload: {
+              contentType: 'image/png',
+              byteSize: 12345,
+              // Hostile keys — planner would never emit these.
+              accessKeyId: 'AKIA-HOSTILE-FU-2-FU-2',
+              signedUrl: 'https://leak.example/?X-Amz-Signature=ABCDEF',
+            } as Record<string, unknown>,
+            scheduledAt: now,
+          },
+        ]);
+      } catch (err) {
+        thrown = err as CapturedError;
+      }
+      expect(thrown).not.toBeNull();
+      expect(thrown?.code).toBe('INVALID_JOB_PAYLOAD');
+      expect(thrown?.statusHint).toBe(400);
+      // Defense in depth: hostile values NEVER appear in the error.
+      expect(thrown?.message ?? '').not.toContain('AKIA-HOSTILE-FU-2-FU-2');
+      expect(thrown?.message ?? '').not.toContain('X-Amz-Signature');
+      // And no row landed in the DB (validator fires BEFORE the
+      // transaction starts).
+      const listed = await queue.listForObject({ objectId, workspaceId: fx.workspaceId });
+      expect(listed.length).toBe(0);
+    } finally {
+      await fx.cleanup();
+    }
+  });
+
+  test('STORAGE-FU-2-FU-2: legacy rows backfilled to required=false survive the migration (regression guard)', async () => {
+    if (!ctx.current) return;
+    const fx = await seedWorkspaceFixture(ctx.current.db);
+    try {
+      const objectId = await insertObject(ctx.current.db, fx.workspaceId, fx.providerId, fx.userId);
+      // Insert four legacy-shaped rows that the migration's backfill
+      // UPDATE would target. Even though the migration already ran in
+      // this DB, we verify the runtime behaviour matches by inserting
+      // with EXPLICIT required=false to mirror the backfilled state.
+      const legacy = [
+        { kind: 'image_optimize', requiredVal: false },
+        { kind: 'video_thumbnail', requiredVal: false },
+        { kind: 'video_transcode', requiredVal: false },
+        { kind: 'document_preview', requiredVal: false },
+      ];
+      for (const l of legacy) {
+        await ctx.current.db.execute(sql`
+          INSERT INTO platform.storage_processing_jobs
+            (id, object_id, workspace_id, job_kind, status, attempts,
+             scheduled_at, created_at, required, payload)
+          VALUES (${randomUUID()}, ${objectId}, ${fx.workspaceId},
+            ${l.kind}, 'succeeded', 1, now(), now(),
+            ${l.requiredVal}, '{}'::jsonb)
+        `);
+      }
+      const repo = new PostgresStorageProcessingJobRepository(ctx.current.db);
+      const jobs = await repo.listForObject({ objectId, workspaceId: fx.workspaceId });
+      expect(jobs.length).toBe(4);
+      for (const j of jobs) {
+        expect(j.required).toBe(false);
+      }
+    } finally {
+      await fx.cleanup();
+    }
   });
 });
 
@@ -234,7 +393,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: now,
           },
         ]);
@@ -246,7 +405,7 @@ describeIf(
               workspaceId: fx.workspaceId,
               jobType: 'scan_validation',
               required: true,
-              payload: {},
+              payload: plannerPayloadFor('scan_validation'),
               scheduledAt: now,
             },
           ]),
@@ -278,7 +437,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'image_optimize',
             required: false,
-            payload: {},
+            payload: plannerPayloadFor('image_optimize'),
             scheduledAt: past,
           },
         ]);
@@ -291,7 +450,7 @@ describeIf(
               workspaceId: fx.workspaceId,
               jobType: 'image_optimize',
               required: false,
-              payload: {},
+              payload: plannerPayloadFor('image_optimize'),
               scheduledAt: new Date(),
             },
           ]),
@@ -326,7 +485,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'image_optimize',
             required: false,
-            payload: {},
+            payload: plannerPayloadFor('image_optimize'),
             scheduledAt: new Date(),
           },
         ]);
@@ -362,7 +521,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: new Date(),
           },
         ]);
@@ -390,7 +549,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: new Date(),
           },
         ]);
@@ -402,7 +561,7 @@ describeIf(
               workspaceId: fx.workspaceId,
               jobType: 'scan_validation', // collides
               required: true,
-              payload: {},
+              payload: plannerPayloadFor('scan_validation'),
               scheduledAt: new Date(),
             },
             {
@@ -411,7 +570,7 @@ describeIf(
               workspaceId: fx.workspaceId,
               jobType: 'image_optimize', // fresh
               required: false,
-              payload: {},
+              payload: plannerPayloadFor('image_optimize'),
               scheduledAt: new Date(),
             },
           ]),
@@ -442,7 +601,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: new Date(),
           },
         ]);
@@ -454,7 +613,7 @@ describeIf(
               workspaceId: fx.workspaceId,
               jobType: 'scan_validation',
               required: true,
-              payload: {},
+              payload: plannerPayloadFor('scan_validation'),
               scheduledAt: new Date(),
             },
           ]);
@@ -500,7 +659,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'image_optimize',
             required: false,
-            payload: {},
+            payload: plannerPayloadFor('image_optimize'),
             scheduledAt: new Date(Date.now() - 1000),
           },
         ]);
@@ -548,7 +707,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: new Date(Date.now() - 1000),
           },
         ]);
@@ -584,7 +743,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: new Date(Date.now() - 1000),
           },
         ]);
@@ -623,7 +782,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: past,
           },
           {
@@ -632,7 +791,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'image_optimize',
             required: false,
-            payload: {},
+            payload: plannerPayloadFor('image_optimize'),
             scheduledAt: past,
           },
         ]);
@@ -668,7 +827,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: new Date(Date.now() + 60_000),
           },
         ]);
@@ -704,7 +863,7 @@ describeIf(
             workspaceId: fixtures.a.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: past,
           },
           {
@@ -713,7 +872,7 @@ describeIf(
             workspaceId: fixtures.b.workspaceId,
             jobType: 'scan_validation',
             required: true,
-            payload: {},
+            payload: plannerPayloadFor('scan_validation'),
             scheduledAt: past,
           },
         ]);
@@ -746,7 +905,7 @@ describeIf('PostgresProcessingJobQueueRepository.markSucceeded / markFailed / re
           workspaceId: fx.workspaceId,
           jobType: 'scan_validation',
           required: true,
-          payload: {},
+          payload: plannerPayloadFor('scan_validation'),
           scheduledAt: new Date(Date.now() - 1000),
         },
       ]);
@@ -774,7 +933,7 @@ describeIf('PostgresProcessingJobQueueRepository.markSucceeded / markFailed / re
           workspaceId: fx.workspaceId,
           jobType: 'image_optimize',
           required: false,
-          payload: {},
+          payload: plannerPayloadFor('image_optimize'),
           scheduledAt: new Date(Date.now() - 1000),
         },
       ]);
@@ -807,7 +966,7 @@ describeIf('PostgresProcessingJobQueueRepository.markSucceeded / markFailed / re
           workspaceId: fx.workspaceId,
           jobType: 'image_optimize',
           required: false,
-          payload: {},
+          payload: plannerPayloadFor('image_optimize'),
           scheduledAt: new Date(Date.now() - 1000),
         },
       ]);
@@ -857,7 +1016,7 @@ describeIf('PostgresProcessingJobQueueRepository.markSucceeded / markFailed / re
           workspaceId: fx.workspaceId,
           jobType: 'image_optimize',
           required: false,
-          payload: {},
+          payload: plannerPayloadFor('image_optimize'),
           scheduledAt: new Date(Date.now() - 1000),
         },
       ]);
@@ -1049,7 +1208,7 @@ describeIf(
               workspaceId: fx.workspaceId,
               jobType: 'scan_validation',
               required: true,
-              payload: {},
+              payload: plannerPayloadFor('scan_validation'),
               scheduledAt: now,
             },
           ]),
@@ -1099,7 +1258,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'image_optimize',
             required: false,
-            payload: {},
+            payload: plannerPayloadFor('image_optimize'),
             scheduledAt: now,
           },
         ]);
@@ -1112,7 +1271,7 @@ describeIf(
               workspaceId: fx.workspaceId,
               jobType: 'image_optimize',
               required: false,
-              payload: {},
+              payload: plannerPayloadFor('image_optimize'),
               scheduledAt: now,
             },
           ]);
@@ -1160,7 +1319,7 @@ describeIf(
             workspaceId: fx.workspaceId,
             jobType: 'image_optimize',
             required: false,
-            payload: {},
+            payload: plannerPayloadFor('image_optimize'),
             scheduledAt: new Date(),
           },
         ]);
@@ -1221,7 +1380,7 @@ describeIf(
               workspaceId: '00000000-0000-0000-0000-000000000000', // FK miss
               jobType: 'scan_validation',
               required: true,
-              payload: {},
+              payload: plannerPayloadFor('scan_validation'),
               scheduledAt: new Date(),
             },
           ]);
@@ -1277,7 +1436,7 @@ describeIf(
               workspaceId: fx.workspaceId,
               jobType: 'scan_validation',
               required: true,
-              payload: {},
+              payload: plannerPayloadFor('scan_validation'),
               scheduledAt: new Date(),
             },
             {
@@ -1286,7 +1445,7 @@ describeIf(
               workspaceId: fx.workspaceId,
               jobType: 'image_optimize',
               required: false,
-              payload: {},
+              payload: plannerPayloadFor('image_optimize'),
               scheduledAt: new Date(),
             },
           ]);

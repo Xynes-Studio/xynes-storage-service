@@ -18,12 +18,15 @@
  *   - `storage_processing_jobs.job_kind` → DTO `jobType`
  *   - `storage_processing_jobs.started_at`/`finished_at` → derived
  *     `updatedAt` (we use `finished_at ?? started_at ?? created_at`).
- *   - `storage_processing_jobs.required` does NOT exist as a column in
- *     the canonical migration (STORAGE-2). The TS DTO requires it, so
- *     the repository derives `required` from a fixed `jobKind` → boolean
- *     table that mirrors the planner contract in STORAGE-7. Until a
- *     follow-up migration adds the column, this is the single source of
- *     truth for the `required` flag at read time.
+ *   - `storage_processing_jobs.required` is now a real column as of
+ *     STORAGE-FU-2-FU-2 — the mapper reads it straight off the row.
+ *     The previous TS-side `REQUIRED_BY_JOB_TYPE` derivation table was
+ *     removed in the same change set.
+ *   - `storage_processing_jobs.payload` is now a real column as of
+ *     STORAGE-FU-2-FU-2 — the queue repository projects it directly
+ *     into `ClaimedJob.payload`. The mapper does not include `payload`
+ *     in `StorageProcessingJobRecord` because that DTO is the public
+ *     surface and STORAGE-6 deliberately keeps payload off the wire.
  *
  * Security invariants enforced here:
  *   - Mappers NEVER spread row objects. Every DTO field is assigned
@@ -32,6 +35,12 @@
  *     `region` are NEVER mapped into any of the public DTOs. They live
  *     on the workspace-provider row, which is consumed by the provider
  *     resolver, not by the object DTO.
+ *   - `payload` is intentionally NOT mapped into
+ *     `StorageProcessingJobRecord` — the queue repo projects it onto
+ *     `ClaimedJob.payload` only, where it reaches the runner via the
+ *     STORAGE-8 `JobRunnerContext`. The STORAGE-6 GET-object handler
+ *     consumes `StorageProcessingJobRecord` and keeps payload off the
+ *     wire by construction.
  */
 import type {
   StorageObjectRow,
@@ -51,31 +60,6 @@ import type {
   VariantStatus,
 } from '../../../actions/handlers/objects/types';
 import type { ProcessingJobType } from '../../../actions/handlers/processing/types';
-
-/**
- * STORAGE-7 contract: `required` is per-job-type. Mirrors the planner
- * exactly so the worker's aggregator agrees with the planner. Job
- * types missing from this map default to `true` (fail-closed posture).
- *
- * NOTE: This is a TS-only derivation until a `required` column lands
- * on `platform.storage_processing_jobs`. When that column is added,
- * delete this table and read `required` straight off the row.
- */
-const REQUIRED_BY_JOB_TYPE: Record<string, boolean> = {
-  scan_validation: true,
-  image_optimize: false,
-  video_probe: true,
-  video_thumbnail: false,
-  video_transcode: false,
-  document_preview: false,
-};
-
-export function deriveJobRequired(jobKind: string): boolean {
-  // Default to required (fail-closed) for unknown job types so a new
-  // worker that hasn't been wired into this table cannot accidentally
-  // be treated as best-effort.
-  return REQUIRED_BY_JOB_TYPE[jobKind] ?? true;
-}
 
 // ── platform.storage_objects → StorageObjectRecord ─────────────────────────
 
@@ -158,7 +142,13 @@ export function mapProcessingJobRow(row: StorageProcessingJobRow): StorageProces
     // No `updated_at` column on the table. Derive from the lifecycle
     // timestamps: finished_at ?? started_at ?? created_at.
     updatedAt: row.finishedAt ?? row.startedAt ?? row.createdAt,
-    required: deriveJobRequired(row.jobKind),
+    // STORAGE-FU-2-FU-2: `required` is now a real column on
+    // `platform.storage_processing_jobs` (NOT NULL DEFAULT true,
+    // fail-closed). The previous `REQUIRED_BY_JOB_TYPE` TS-side
+    // derivation table was removed in the same change set. The
+    // canonical migration's backfill populated this column for every
+    // pre-FU-2-FU-2 row.
+    required: row.required,
   };
 }
 

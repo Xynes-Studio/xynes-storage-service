@@ -89,15 +89,34 @@ const FU_1_MIGRATION_PATH = resolve(
   '20260528100000_storage_processing_jobs_active_unique_index.sql',
 );
 
+// STORAGE-FU-2-FU-2 ships a fourth canonical migration that adds the
+// `payload jsonb` + `required boolean` columns to
+// `platform.storage_processing_jobs`. Same posture as FU-1 above —
+// concatenate when reachable.
+const FU_2_FU_2_MIGRATION_PATH = resolve(
+  import.meta.dir,
+  '..',
+  '..',
+  '..',
+  '..',
+  'xynes-infra',
+  'supabase',
+  'migrations',
+  '20260529090000_storage_processing_jobs_payload_and_required.sql',
+);
+
 const MIGRATION_REACHABLE = existsSync(MIGRATION_PATH);
 const DEDUP_MIGRATION_REACHABLE = existsSync(DEDUP_MIGRATION_PATH);
 const FU_1_MIGRATION_REACHABLE = existsSync(FU_1_MIGRATION_PATH);
+const FU_2_FU_2_MIGRATION_REACHABLE = existsSync(FU_2_FU_2_MIGRATION_PATH);
 const MIGRATION_SQL = MIGRATION_REACHABLE
   ? readFileSync(MIGRATION_PATH, 'utf-8') +
     '\n-- END OF MIGRATION FILE --\n' +
     (DEDUP_MIGRATION_REACHABLE ? readFileSync(DEDUP_MIGRATION_PATH, 'utf-8') : '') +
     '\n-- END OF MIGRATION FILE --\n' +
-    (FU_1_MIGRATION_REACHABLE ? readFileSync(FU_1_MIGRATION_PATH, 'utf-8') : '')
+    (FU_1_MIGRATION_REACHABLE ? readFileSync(FU_1_MIGRATION_PATH, 'utf-8') : '') +
+    '\n-- END OF MIGRATION FILE --\n' +
+    (FU_2_FU_2_MIGRATION_REACHABLE ? readFileSync(FU_2_FU_2_MIGRATION_PATH, 'utf-8') : '')
   : '';
 
 if (!MIGRATION_REACHABLE) {
@@ -266,6 +285,63 @@ describe('schema mirror — table coverage', () => {
       expect(inClause).not.toContain("'cancelled'");
     },
   );
+
+  test.skipIf(!MIGRATION_REACHABLE || !FU_2_FU_2_MIGRATION_REACHABLE)(
+    'STORAGE-FU-2-FU-2 `payload` jsonb column is declared with fail-closed default',
+    () => {
+      // The migration MUST add the column as `NOT NULL DEFAULT '{}'::jsonb`
+      // so existing rows auto-populate without violating NOT NULL.
+      expect(MIGRATION_SQL).toMatch(
+        /ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+payload\s+jsonb\s+NOT\s+NULL\s+DEFAULT\s+'\{\}'::jsonb/i,
+      );
+      // The COMMENT MUST call out the security contract (no credentials,
+      // Zod validator) so future maintainers don't relax the validator.
+      expect(MIGRATION_SQL).toContain('COMMENT ON COLUMN platform.storage_processing_jobs.payload');
+    },
+  );
+
+  test.skipIf(!MIGRATION_REACHABLE || !FU_2_FU_2_MIGRATION_REACHABLE)(
+    'STORAGE-FU-2-FU-2 `required` boolean column is declared with fail-closed default `true`',
+    () => {
+      // The default MUST be `true` (fail-closed). A `false` default
+      // would silently dead-letter unknown job kinds.
+      expect(MIGRATION_SQL).toMatch(
+        /ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+required\s+boolean\s+NOT\s+NULL\s+DEFAULT\s+true/i,
+      );
+      expect(MIGRATION_SQL).not.toMatch(
+        /ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+required\s+boolean\s+NOT\s+NULL\s+DEFAULT\s+false/i,
+      );
+      // The COMMENT MUST call out the fail-closed semantic.
+      expect(MIGRATION_SQL).toContain(
+        'COMMENT ON COLUMN platform.storage_processing_jobs.required',
+      );
+      expect(MIGRATION_SQL).toContain('fail-closed');
+    },
+  );
+
+  test.skipIf(!MIGRATION_REACHABLE || !FU_2_FU_2_MIGRATION_REACHABLE)(
+    'STORAGE-FU-2-FU-2 backfill flips ONLY the 4 known non-required job kinds',
+    () => {
+      // The UPDATE must reference all four documented non-required kinds
+      // and SET `required = false` for them.
+      expect(MIGRATION_SQL).toMatch(/UPDATE\s+platform\.storage_processing_jobs/i);
+      expect(MIGRATION_SQL).toMatch(/SET\s+required\s*=\s*false/i);
+      for (const kind of [
+        'image_optimize',
+        'video_thumbnail',
+        'video_transcode',
+        'document_preview',
+      ]) {
+        expect(MIGRATION_SQL).toContain(`'${kind}'`);
+      }
+      // Defense in depth: the backfill MUST NOT carry a `SET required = true`
+      // clause that would flip the required-by-default kinds.
+      expect(MIGRATION_SQL).not.toMatch(/SET\s+required\s*=\s*true/i);
+      // Idempotency: the WHERE clause MUST carry `IS DISTINCT FROM false`
+      // (or equivalent) so replay touches zero rows.
+      expect(MIGRATION_SQL).toMatch(/required\s+IS\s+DISTINCT\s+FROM\s+false/i);
+    },
+  );
 });
 
 describe('schema mirror — security invariants', () => {
@@ -318,6 +394,21 @@ describe('schema mirror — security invariants', () => {
   test('credential_ref is the only credential column declared', () => {
     expect(SCHEMA_SOURCE).toContain('credentialRef');
     expect(SCHEMA_SOURCE).toContain("text('credential_ref')");
+  });
+
+  test('STORAGE-FU-2-FU-2: mirror declares `payload` jsonb + `required` boolean columns on storage_processing_jobs', () => {
+    // The mirror MUST declare both new columns so the Postgres
+    // repositories can read + write them. Drift between mirror and
+    // canonical migration is caught structurally by `bun run db:check`,
+    // but this assertion gives a clearer error message when the mirror
+    // is the side that's stale.
+    expect(SCHEMA_SOURCE).toContain("jsonb('payload')");
+    expect(SCHEMA_SOURCE).toContain("boolean('required')");
+    // Fail-closed default on `required` MUST be `true` at the mirror
+    // level too — mismatch with the canonical migration would surface
+    // as a `db:check` drift, but this catches the regression earlier.
+    expect(SCHEMA_SOURCE).toMatch(/boolean\('required'\)\.notNull\(\)\.default\(true\)/);
+    expect(SCHEMA_SOURCE).toMatch(/jsonb\('payload'\)[\s\S]*?\.notNull\(\)\.default\(\{\}\)/);
   });
 });
 

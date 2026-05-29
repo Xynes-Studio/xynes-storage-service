@@ -89,6 +89,15 @@ const DEFAULT_EXTRA_MIGRATION_PATHS = [
     'migrations',
     '20260528100000_storage_processing_jobs_active_unique_index.sql',
   ),
+  resolve(
+    import.meta.dir,
+    '..',
+    '..',
+    'xynes-infra',
+    'supabase',
+    'migrations',
+    '20260529090000_storage_processing_jobs_payload_and_required.sql',
+  ),
 ] as const;
 
 const REQUIRED_TABLES = [
@@ -259,6 +268,38 @@ async function main(): Promise<void> {
         '`storage_processing_jobs_active_unique_uidx` on platform.storage_processing_jobs ' +
         '(object_id, job_kind) WHERE status IN (queued, running). ' +
         'Duplicate active processing jobs MUST be rejected at the DB layer.',
+    );
+  }
+
+  // 3c. STORAGE-FU-2-FU-2 invariant: the canonical migration MUST add a
+  //     `payload jsonb NOT NULL DEFAULT '{}'::jsonb` column AND a
+  //     `required boolean NOT NULL DEFAULT true` column to
+  //     `platform.storage_processing_jobs`. Both columns are read by
+  //     `PostgresProcessingJobQueueRepository.claimNextQueuedJob` and
+  //     mapped into `ClaimedJob.payload` + `ClaimedJob.required`. The
+  //     mirror declares both columns; this assertion catches a regression
+  //     where the canonical migration is reverted but the mirror is not.
+  if (!/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+payload\s+jsonb\s+NOT\s+NULL\s+DEFAULT/i.test(sql)) {
+    errors.push(
+      'STORAGE-FU-2-FU-2 invariant violated: missing `payload jsonb NOT NULL DEFAULT` ' +
+        'column on platform.storage_processing_jobs. The Drizzle mirror declares ' +
+        '`payload: jsonb(...).notNull().default({})` and reads `row.payload` straight; ' +
+        'the canonical migration MUST provide the column.',
+    );
+  }
+  // `required boolean NOT NULL DEFAULT true` is fail-closed by contract.
+  // The default MUST be `true` so unknown / new job kinds are treated as
+  // required and cannot silently dead-letter. Matches the TS-side
+  // `deriveJobRequired` fallback before STORAGE-FU-2-FU-2 deleted it.
+  if (
+    !/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+required\s+boolean\s+NOT\s+NULL\s+DEFAULT\s+true/i.test(
+      sql,
+    )
+  ) {
+    errors.push(
+      'STORAGE-FU-2-FU-2 invariant violated: missing `required boolean NOT NULL DEFAULT true` ' +
+        'column on platform.storage_processing_jobs. The default MUST be `true` (fail-closed) ' +
+        'so unknown job kinds are treated as required and cannot silently dead-letter.',
     );
   }
 
