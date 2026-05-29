@@ -221,6 +221,7 @@ export interface ServerHandle {
 export type ServeFn = (options: {
   port: number;
   hostname: string;
+  maxRequestBodySize?: number;
   fetch: (req: Request) => Promise<Response> | Response;
   error: (err: Error) => Response;
 }) => ServerHandle;
@@ -273,6 +274,7 @@ export function boot(options: BootOptions = {}): { stop: () => void; config: Shi
   const server = serve({
     port: config.port,
     hostname: config.hostname,
+    maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
     fetch: fetchHandler,
     error: () => jsonResponse(500, buildErrorBody(SHIM_ERROR_CODES.INTERNAL_ERROR)),
   });

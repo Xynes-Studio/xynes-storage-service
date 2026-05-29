@@ -11,6 +11,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { boot, defaultFs, type ServeFn, type ServerHandle } from '../src/shim';
+import { MAX_REQUEST_BODY_BYTES } from '../src/parse-request';
 
 // ── defaultFs adapter ───────────────────────────────────────────────────
 
@@ -66,6 +67,7 @@ describe('defaultFs', () => {
 interface FakeServerCapture {
   port: number;
   hostname: string;
+  maxRequestBodySize?: number;
   fetch: (req: Request) => Promise<Response> | Response;
   error: (err: Error) => Response;
 }
@@ -78,6 +80,7 @@ function makeFakeServe(): { serve: ServeFn; capture: FakeServerCapture[]; stopCa
     capture.push({
       port: options.port,
       hostname: options.hostname,
+      maxRequestBodySize: options.maxRequestBodySize,
       fetch: options.fetch,
       error: options.error,
     });
@@ -111,6 +114,7 @@ describe('boot()', () => {
     expect(capture).toHaveLength(1);
     expect(capture[0]!.port).toBe(9876);
     expect(capture[0]!.hostname).toBe('127.0.0.1');
+    expect(capture[0]!.maxRequestBodySize).toBe(MAX_REQUEST_BODY_BYTES);
     const bootLog = logs.find((l) => l.includes('shim.boot'));
     expect(bootLog).toBeDefined();
     const parsed = JSON.parse(bootLog!);
