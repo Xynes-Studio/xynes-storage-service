@@ -947,6 +947,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-2-FU-2 | ✅ Landed 2026-05-29 (Persisted `payload jsonb NOT NULL DEFAULT '{}'::jsonb` + `required boolean NOT NULL DEFAULT true` columns on `storage_processing_jobs`; deleted TS-side `REQUIRED_BY_JOB_TYPE` lookup; added per-jobType Zod `.strict()` payload validators that reject hostile keys BEFORE the INSERT) |
 | STORAGE-FU-2-FU-3 | 🟡 Code-side landed 2026-05-29 (`connectOrSkip()` honours `STORAGE_INTEGRATION_DB_REQUIRED=1` as a credential-sanitized hard-fail; `sanitizeUrlForLogging` + `isIntegrationDbRequired` helpers; unit tests). CI integration deferred to STORAGE-FU-2-FU-3-CI (blocked on `xynes-infra` being published to a GitHub remote so a cross-repo checkout can resolve the canonical Supabase migrations) |
 | STORAGE-FU-2-FU-4 | ✅ Landed 2026-05-29 (DRY content-type-family prefix mapping — extracted `CONTENT_TYPE_FAMILY_PREFIXES` constant + derived 'other' branch exclusion list from `Object.values(...).flat()`; pure refactor, behavioural lock via existing `contentTypeFamily=other` integration test) |
+| STORAGE-FU-2-FU-5 | ✅ Landed 2026-05-29 (Deterministic coverage of the `markUploaded` race-loss re-read branch — test-side `StorageDb` Proxy interposes a side-effect raw `UPDATE`/`DELETE` between the repo's initial SELECT and conditional UPDATE so the conditional matches 0 rows and the re-read path runs every time. No production code change. Lifted per-file coverage on `object-and-session-repository.ts` from 95.32% → 100% lines.) |
 | STORAGE-FU-3 | ✅ Landed 2026-05-15 (Provider resolver + secret-manager interface) |
 | STORAGE-FU-4 | ✅ Landed 2026-05-15 (Composition root — handler registration + ready event) |
 | STORAGE-FU-5 | ✅ Landed 2026-05-15 (Production runners — stub-mode default + S3 IO + variant writer + production-stub processors) |
@@ -1299,6 +1300,62 @@ Local-dev posture is preserved: on a clean laptop without the env
 var, `connectOrSkip()` still returns `null` and tests soft-skip
 cleanly.
 
+#### Deterministic race-loss interpose pattern (STORAGE-FU-2-FU-5)
+
+The `markUploaded` method in `PostgresStorageObjectRepository` carries
+a defensive race-loss re-read branch: when the conditional UPDATE
+matches 0 rows (because another worker won the race and flipped the
+row out of `pending_upload`), the method re-reads the canonical state
+and returns it. STORAGE-FU-2 covered this contract under concurrent
+traffic via a `Promise.all` chaos test, but Bun's coverage
+instrumentation could not credit lines as covered because both racing
+callers observe a non-null `uploaded` row on success — there is no
+way for the assertion to tell WHICH caller took the re-read branch.
+
+STORAGE-FU-2-FU-5 closes the gap with a **test-side `StorageDb`
+Proxy** that interposes between the repo's initial SELECT and its
+conditional UPDATE. The Proxy intercepts the first call to
+`db.update(...)`, wraps the returned chainable builder, and overrides
+the terminal `.returning()` / `.then(...)` to fire a side-effect raw
+`UPDATE` / `DELETE` BEFORE delegating to the real builder. The side
+effect flips the row out of `pending_upload` so the conditional
+predicate matches 0 rows and the re-read branch executes every time.
+After the first interpose, the Proxy unhooks itself so the subsequent
+SELECT re-read reaches the real driver and observes the canonical
+state.
+
+**No production code change.** The Proxy is constructed entirely from
+the public `StorageDb` surface (`update`, `select`, `execute`);
+`object-and-session-repository.ts` is byte-for-byte unchanged. No
+`__forTesting__` export was added.
+
+Three deterministic scenarios are covered in
+`tests/infra/db/repositories/markuploaded-reread-interpose.test.ts`:
+
+1. **Re-read sees `uploaded`** — the side effect flips the row to
+   `uploaded` with a canonical sha256. The losing worker's sha256 is
+   NEVER persisted; the canonical sha256 survives. Differentiating
+   the assertion on `sha256` value proves the repo took the re-read
+   path (NOT the conditional UPDATE return path).
+2. **Re-read sees `deleted`** — the side effect soft-deletes the
+   row; `markUploaded` returns `null` from the
+   `if (reread[0].status === 'deleted') return null;` branch.
+3. **Re-read sees the row vanished** — the side effect hard-deletes
+   the row (along with the dependent session row to avoid the FK
+   violation); `markUploaded` returns `null` from the defensive
+   `if (reread.length === 0) return null;` branch. This branch is
+   structurally unreachable in production because soft-delete is the
+   contract; the test exists as defense in depth.
+
+A companion describe block in the same file adds direct coverage for
+`PostgresStorageObjectRepository.findByIdForWorkspace` (workspace
+scoping + null-on-unknown + null-on-cross-workspace) which had no
+prior caller — production code uses `PostgresExtendedStorageObjectRepository`'s
+richer queries instead.
+
+Per-file coverage on `object-and-session-repository.ts` lifted from
+**95.32% → 100% lines**. Overall coverage rose from 96.29% / 98.57%
+(FU-3 + FU-4 baseline) to 96.32% / 98.62%.
 ### Out of scope (deferred to later STORAGE-FU-N stories)
 
 - **Composition root wiring.** That's STORAGE-FU-4. STORAGE-FU-2 ships
