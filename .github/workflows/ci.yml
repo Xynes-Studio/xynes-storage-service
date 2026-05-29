@@ -204,13 +204,16 @@ jobs:
     # job. The skip emits a notice via `if:` so reviewers see why.
     if: ${{ vars.STORAGE_FU_3_ENABLED != 'false' }}
     services:
-      # `supabase/postgres:17` matches the canonical Postgres major
-      # version from `xynes-infra/supabase/config.toml` and ships the
-      # same extension set Supabase CLI would provision locally.
-      # Pin to a specific minor so a Supabase image bump cannot
-      # silently break CI.
+      # Vanilla Postgres works because the canonical storage migrations
+      # only need the standard `postgres` role + `pgcrypto` / `uuid-ossp`
+      # extensions (already in the base image). The `supabase/postgres`
+      # image bundles a `docker-entrypoint-initdb.d/migrate.sh` that
+      # expects `supabase_admin` to pre-exist and is incompatible with
+      # GHA service-container usage (the init script hard-fails before
+      # the container becomes healthy). Pin the minor so a Postgres
+      # bump cannot silently break CI.
       postgres:
-        image: supabase/postgres:17.4.1.018
+        image: postgres:17.4
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_USER: postgres
