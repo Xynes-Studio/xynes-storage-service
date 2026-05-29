@@ -944,6 +944,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-1 | ✅ Landed 2026-05-15 (Drizzle schema mirror + DB client + drift check) |
 | STORAGE-FU-2 | ✅ Landed 2026-05-15 (Postgres repositories) |
 | STORAGE-FU-2-FU-1 | ✅ Landed 2026-05-28 (Partial unique index `storage_processing_jobs_active_unique_uidx` on `(object_id, job_kind) WHERE status IN ('queued','running')` as belt-and-braces for `enqueueBatch` — DB-side 23505 translated to `DuplicateActiveJobError`) |
+| STORAGE-FU-2-FU-2 | ✅ Landed 2026-05-29 (Persisted `payload jsonb NOT NULL DEFAULT '{}'::jsonb` + `required boolean NOT NULL DEFAULT true` columns on `storage_processing_jobs`; deleted TS-side `REQUIRED_BY_JOB_TYPE` lookup; added per-jobType Zod `.strict()` payload validators that reject hostile keys BEFORE the INSERT) |
 | STORAGE-FU-3 | ✅ Landed 2026-05-15 (Provider resolver + secret-manager interface) |
 | STORAGE-FU-4 | ✅ Landed 2026-05-15 (Composition root — handler registration + ready event) |
 | STORAGE-FU-5 | ✅ Landed 2026-05-15 (Production runners — stub-mode default + S3 IO + variant writer + production-stub processors) |
@@ -952,6 +953,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-5-FU-C | ✅ Landed 2026-05-28 (LibreOffice-backed `DocumentProcessor` — closes Bug 1 for document preview variants; HTTP client to pod-local sidecar via `LIBREOFFICE_SERVICE_URL`; `STORAGE_SOFFICE_TIMEOUT_MS` per-job timeout; safe-fail to production stub when URL unset) |
 | STORAGE-FU-5-FU-D | ✅ Landed 2026-05-29 (ClamAV-backed `MalwareScanner` — closes STORAGE-9 §3.6 malware-scan gate; clamd INSTREAM over TCP (`CLAMD_HOST`/`CLAMD_PORT`) or unix socket (`CLAMD_SOCKET`); pooled persistent socket with reconnect-on-close; `unknown` NEVER coerced to `clean`; safe-fail to unknown scanner when ctor throws) |
 | STORAGE-FU-5-FU-E | ✅ Landed 2026-05-28 (Deployment posture decision — sharp + ffmpeg in-process, LibreOffice + clamav sidecars; Compose overlay + K8s draft manifests) |
+| STORAGE-FU-5-FU-F | ✅ Landed 2026-05-29 (Fixture-based integration suite under `tests/integration/processors/` — committed `sample.jpg`/`sample.png`/`sample.mp4`/`sample.pdf`/`eicar.txt` fixtures + per-processor suites with `describeIfBinary`/`describeIfEnv` soft-skip gates + new `integration-processors` CI job with `STORAGE_INTEGRATION_PROCESSORS_REQUIRED=1`) |
 | STORAGE-FU-5-FU-G | ✅ Code landed 2026-05-28 (LibreOffice sidecar Bun HTTP shim image — closes Bug 1 (document) production gap. Source lives at `sidecars/libreoffice/` in this repo; Compose overlay + K8s manifests in `xynes-infra` pin to `xynes/libreoffice-sidecar:0.1.0`. Image build + live R2 smoke deferred to operator per plan §12.5 acceptance criteria.) |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
 | DEDUP-1 | ✅ Landed 2026-05-28 (Content-hash dedup schema — `platform.storage_object_references` reference-counting join table + workspace-scoped partial unique index on `storage_objects (workspace_id, sha256)`) |
@@ -1132,6 +1134,7 @@ specific onboarding gate (region MUST be enabled before bucket creation).
 - **CMS body validation that rejects nodes carrying provider config.**
   STORAGE-11's `stripTransientImageUrls` is the first line of defense;
   a future CMS Core validator is the second. Not part of STORAGE-12.
+
 ## Production Repositories (STORAGE-FU-2)
 
 ### What landed
@@ -2437,7 +2440,7 @@ same posture as STORAGE-FU-2 repository integration tests). **15 tests,
 ### Out of scope (deferred to DEDUP-2 + DEDUP-3)
 
 - **DEDUP-2** — handler short-circuit on the upload-create path
-  (probe `(workspace_id, sha256)`, return existing `objectId` +
+  (probe `(workspace_id, sha256)` , return existing `objectId` +
   `dedupHit: true` instead of minting a new provider URL); reference-counted
   soft-delete in the delete handler; CMS Console storage-client behaviour
   (skip the direct-provider PUT on `dedupHit: true`); optional
@@ -2897,3 +2900,182 @@ sequence.
 - Pre-warming one idle `soffice` process at boot to absorb cold-start
   latency under the first `/convert` (currently the `/health` probe
   serves that purpose by running an RTF conversion at startup).
+
+## Persisted Payload + Required Columns (STORAGE-FU-2-FU-2)
+
+### What landed
+
+The `platform.storage_processing_jobs` table gained two real columns
+that the TS layer previously had to derive:
+
+- **`payload jsonb NOT NULL DEFAULT '{}'::jsonb`** — the planner-emitted
+  payload (`{ contentType, byteSize? }`) is now persisted instead of
+  silently discarded. `claimNextQueuedJob` reads it straight off the
+  row into `ClaimedJob.payload`, where STORAGE-8 runners consume it
+  via `JobRunnerContext`.
+- **`required boolean NOT NULL DEFAULT true`** — the
+  `required`/best-effort discriminator the STORAGE-7 aggregator uses
+  to decide whether a terminal failure flips the parent object to
+  `failed`. Reading from the row makes the DB the canonical source of
+  truth; the previous TS-side `REQUIRED_BY_JOB_TYPE` lookup table was
+  removed in the same change.
+
+### Canonical migration
+
+`xynes-infra/supabase/migrations/20260529090000_storage_processing_jobs_payload_and_required.sql`
+
+- Additive only (`ADD COLUMN IF NOT EXISTS`).
+- **Fail-closed defaults.** `payload` defaults to `'{}'::jsonb`;
+  `required` defaults to `true`. New / unknown job kinds are treated
+  as required so they cannot silently dead-letter.
+- **Idempotent backfill.** A `UPDATE … SET required = false`
+  statement flips the 4 known non-required kinds (`image_optimize`,
+  `video_thumbnail`, `video_transcode`, `document_preview`) and is
+  guarded by `required IS DISTINCT FROM false` so replay touches
+  zero rows.
+- Documentation `COMMENT`s on both columns calling out the security
+  contract (no credentials, Zod strict validators) and the
+  fail-closed semantic.
+
+### Per-jobType payload validators
+
+`src/actions/handlers/processing/payload-schemas.ts` exports
+`validateJobPayload(jobType, payload)` plus a closed-set
+`JOB_PAYLOAD_SCHEMAS` map covering every `ProcessingJobType`. Each
+schema is a Zod `.strict()` object that rejects unknown keys:
+
+- `scan_validation` → `{ contentType, byteSize }`
+- `image_optimize`, `video_probe`, `video_thumbnail`,
+  `video_transcode`, `document_preview` → `{ contentType }`
+
+`PostgresProcessingJobQueueRepository.enqueueBatch` calls
+`validateJobPayload` for every input BEFORE opening a transaction.
+Rejections throw `PayloadValidationError` with a closed-set
+`INVALID_JOB_PAYLOAD` code + 400 status hint. The error message
+surfaces ONLY the rejected key names (collected from the Zod
+`unrecognized_keys` / `path` issue shapes); hostile values NEVER
+appear in the message (regression-guarded by a dedicated test that
+injects `AKIA*` / `xynes_live_*` / `X-Amz-Signature=` substrings).
+
+### Drizzle mirror + drift check
+
+`src/infra/db/schema.ts` declares both columns on
+`storageProcessingJobs` with branded types
+(`jsonb(...).$type<Record<string, unknown>>()` for payload,
+`boolean(...)` for required). `scripts/db-check.ts` extends
+`DEFAULT_EXTRA_MIGRATION_PATHS` with the FU-2-FU-2 migration and
+adds fail-loud assertions for both columns + the canonical
+`NOT NULL DEFAULT` shapes.
+
+### Backward compatibility
+
+- Pre-FU-2-FU-2 callers that never set `payload`/`required` get the
+  canonical fail-closed defaults via the column DEFAULT clauses.
+- The 4 non-required job kinds are backfilled to match the previous
+  `deriveJobRequired` output exactly.
+- Old replicas during a rolling deploy never reference the new
+  columns and continue to function — the migration is additive so the
+  pre-FU-2-FU-2 schema is a strict subset of the post-FU-2-FU-2
+  schema.
+
+### Quality gates
+
+- `bun run lint` exit 0; `bun run typecheck` exit 0; `bun run db:check` exit 0.
+- `bun test` → **1488 / 1488 pass / 3935 expects / 83 files** (was
+  1443 baseline on `develop`; delta exactly +45 from FU-2-FU-2 +
+  FU-5-FU-F combined: 24 new payload-schemas tests + ~7 new
+  mapper/repo tests + ~14 new fixture-based integration tests).
+- `bun run test:coverage` overall **funcs=96.77% / lines=99.29%**
+  (above ADR-001 80% floor). Per-touched file: `payload-schemas.ts` **100% / 100%**,
+  `variant-job-usage-repository.ts` **100% / 100%**,
+  `mappers.ts` **100% / 100%**.
+
+## Fixture-based Integration Suite (STORAGE-FU-5-FU-F)
+
+### What landed
+
+A new `tests/integration/processors/` directory holds per-processor
+integration suites that exercise the live runners (sharp, ffmpeg,
+LibreOffice, clamav) against committed binary fixtures.
+
+### Fixtures
+
+Five fixtures under `tests/integration/processors/fixtures/`:
+
+| File | Generator | Notes |
+|---|---|---|
+| `sample.jpg` | sharp + hand-spliced APP1 EXIF | 256×192 deterministic-noise JPEG carrying the standard `0x8825` GPS sub-IFD pointer |
+| `sample.png` | sharp | 256×192 deterministic-noise PNG (control fixture) |
+| `sample.mp4` | ffmpeg `testsrc` + `sine` | 2-second H.264/AAC at 160×120 with embedded `comment=STORAGE_FU_5_FU_F_FIXTURE_CANARY` |
+| `sample.pdf` | hand-rolled minimal PDF | 3 pages + `/Title` + `/Author` + `/Creator` document Info dictionary |
+| `eicar.txt` | static string | Standard EICAR antivirus test vector (NOT real malware) |
+
+The deterministic-noise generator (`xorshift32`) is shared with the
+FU-A unit-suite Bug 1 regression guard so fixture + unit test stay
+aligned on what compresses to a realistic byte size.
+
+A `_generate.ts` script regenerates the corpus idempotently:
+
+```bash
+bun run tests/integration/processors/fixtures/_generate.ts
+```
+
+The script is documentation-grade — the integration suite reads the
+committed binaries only.
+
+### Suite gates
+
+Helper utilities in `tests/integration/processors/_helpers.ts`
+provide three gate primitives:
+
+- `loadFixture(name)` / `loadFixtureText(name)` — read a committed
+  fixture into a `Uint8Array` / UTF-8 string. Throws loudly if
+  missing (a fixture is part of the committed corpus; absence is a
+  configuration bug, not a skip condition).
+- `describeIfBinary(binary, label, fn)` — runs the `fn` body when
+  the named CLI binary is on `PATH`. Soft-skips locally when
+  missing; **hard-fails** when
+  `STORAGE_INTEGRATION_PROCESSORS_REQUIRED=1`. Critically, the
+  soft-skip path does NOT evaluate `fn` so processor constructors
+  that throw on missing config (e.g. an empty sidecar URL) do not
+  crash the runner on a clean laptop.
+- `describeIfEnv(envVar, label, fn)` — same posture but gated on a
+  service-URL env var (`LIBREOFFICE_SERVICE_URL`, `CLAMD_HOST`,
+  etc.) rather than a binary on PATH.
+
+### Per-processor suites
+
+| File | Gate | Suite |
+|---|---|---|
+| `sharp.integration.test.ts` | always (sharp ships libvips) | Probe JPEG + PNG fixtures; Bug 1 regression guard (variant > 1 KiB for JPEG/WebP/AVIF outputs); GPS EXIF strip invariant for JPEG → JPEG + JPEG → WebP re-encode; dimension-cap defense in depth |
+| `ffmpeg.integration.test.ts` | `describeIfBinary('ffmpeg', ...)` | Probe MP4 fixture; Bug 1 regression guard for poster JPEG + transcode fMP4; metadata strip invariant (comment + title NOT in transcode bytes; comment + title NOT in poster bytes) |
+| `libreoffice.integration.test.ts` | `describeIfEnv('LIBREOFFICE_SERVICE_URL', ...)` | Bug 1 regression guard for first-page PNG preview; document properties NOT in preview bytes (Title/Author/Creator); unsupported MIME rejection at processor layer |
+| `clamav.integration.test.ts` | `CLAMD_HOST` or `CLAMD_SOCKET` set | EICAR detection as `infected` with signature containing `eicar`; clean verdict on benign PDF/PNG fixtures; STORAGE-9 §3.6 invariant (`clean` results carry no signature field) |
+
+### CI integration
+
+New job `integration-processors` in `.github/workflows/ci.yml`:
+
+- Decoupled from the `quality-gates` job so binary-install latency
+  does not block fast PR feedback on unit-test failures.
+- Sets `STORAGE_INTEGRATION_PROCESSORS_REQUIRED=1` to upgrade the
+  soft-skip path to a hard failure (so a CI misconfiguration
+  cannot silently hide integration coverage).
+- Installs `ffmpeg` via `apt-get install` for the FU-B integration
+  suite.
+- Runs `clamav/clamav:1.3` as a service container with a
+  120-second health-check window for the freshclam signature
+  download; the FU-D suite points at it via `CLAMD_HOST=127.0.0.1
+  CLAMD_PORT=3310`.
+- The libreoffice integration suite is intentionally NOT wired in
+  this CI iteration — `LIBREOFFICE_SERVICE_URL` is left unset so
+  the suite soft-skips. A future iteration can add a sidecar
+  container as a service.
+
+### Out of scope (deferred)
+
+- libreoffice sidecar container in CI (requires the FU-G image to
+  be published to a registry CI can pull from).
+- Performance benchmarking suite.
+- Cross-platform CI matrix (macOS + Windows).
+- Visual-regression testing of image / document previews.

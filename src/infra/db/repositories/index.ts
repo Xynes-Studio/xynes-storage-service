@@ -34,7 +34,6 @@ export {
 } from './variant-job-usage-repository';
 export { PostgresStorageObjectReferenceRepository } from './object-references-repository';
 export {
-  deriveJobRequired,
   mapStorageObjectRow,
   mapUploadSessionRow,
   mapVariantRow,

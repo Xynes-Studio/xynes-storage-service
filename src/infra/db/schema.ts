@@ -32,6 +32,7 @@ import {
   boolean,
   date,
   integer,
+  jsonb,
   primaryKey,
   text,
   timestamp,
@@ -231,6 +232,21 @@ export const storageProcessingJobs = platformSchema.table('storage_processing_jo
   errorCode: text('error_code'),
   errorMessage: text('error_message'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  // STORAGE-FU-2-FU-2: persisted planner payload.
+  // Canonical source: 20260529090000_storage_processing_jobs_payload_and_required.sql.
+  // Must NEVER carry credentials, provider config, or signed URLs — the
+  // planner (`src/actions/handlers/processing/planner.ts`) only emits
+  // `{ contentType, byteSize? }`. Per-jobType Zod `.strict()` validators
+  // in `src/actions/handlers/processing/payload-schemas.ts` enforce this
+  // before INSERT.
+  payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default({}),
+  // STORAGE-FU-2-FU-2: required-job flag for the STORAGE-7 aggregator.
+  // Required jobs that fail terminally flip the parent object to
+  // `failed`; non-required (best-effort) failures do not. Closed-set
+  // discriminator via boolean. Defaults to `true` (fail-closed) so a
+  // future job kind not yet wired to the planner cannot accidentally be
+  // treated as best-effort and silently dead-letter.
+  required: boolean('required').notNull().default(true),
 });
 
 // ─── platform.storage_usage_daily ───────────────────────────────────────────

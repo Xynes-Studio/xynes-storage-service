@@ -4,8 +4,10 @@
  * Coverage focuses on:
  *   - field-by-field mapping correctness for every shape
  *   - column-name divergence (`variant_kind` → `variantKey`, etc.)
- *   - `required` derivation per `jobType`
- *   - defensive defaults (unknown job type → required=true)
+ *   - STORAGE-FU-2-FU-2: `required` + `payload` are read STRAIGHT off
+ *     the row (no TS-side derivation). Asserted by injecting hostile
+ *     row values that disagree with the planner's defaults — the mapper
+ *     MUST surface what the DB says, not what the lookup table used to.
  *   - bigint → number coercion
  *   - non-leakage of provider material (no spread of row).
  */
@@ -16,7 +18,6 @@ import {
   mapVariantRow,
   mapProcessingJobRow,
   mapUsageRow,
-  deriveJobRequired,
 } from '../../../../src/infra/db/repositories/mappers';
 import type {
   StorageObjectRow,
@@ -203,8 +204,8 @@ describe('mapVariantRow', () => {
   });
 });
 
-describe('mapProcessingJobRow + deriveJobRequired', () => {
-  test('maps job_kind → jobType and derives required for scan_validation', () => {
+describe('mapProcessingJobRow', () => {
+  test('maps job_kind → jobType and reads required straight off the row', () => {
     const row: StorageProcessingJobRow = {
       id: '00000000-0000-4000-8000-000000000060',
       objectId: '00000000-0000-4000-8000-000000000001',
@@ -218,6 +219,9 @@ describe('mapProcessingJobRow + deriveJobRequired', () => {
       errorCode: null,
       errorMessage: null,
       createdAt: NOW,
+      // STORAGE-FU-2-FU-2: required + payload are real columns.
+      required: true,
+      payload: { contentType: 'image/png', byteSize: 12345 },
     } as StorageProcessingJobRow;
     const dto = mapProcessingJobRow(row);
     expect(dto.jobType).toBe('scan_validation');
@@ -227,21 +231,47 @@ describe('mapProcessingJobRow + deriveJobRequired', () => {
     expect(dto.updatedAt).toBe(NOW); // no started/finished, falls back to createdAt
   });
 
-  test('derives required=false for best-effort jobs', () => {
-    expect(deriveJobRequired('image_optimize')).toBe(false);
-    expect(deriveJobRequired('video_thumbnail')).toBe(false);
-    expect(deriveJobRequired('video_transcode')).toBe(false);
-    expect(deriveJobRequired('document_preview')).toBe(false);
+  test('STORAGE-FU-2-FU-2: reads required=false from the row even for a planner-required jobKind', () => {
+    // The mapper MUST surface what the DB says, not what the
+    // planner's lookup table used to derive. Asserts the TS-side
+    // derivation is fully removed.
+    const dto = mapProcessingJobRow({
+      id: 'x',
+      objectId: 'y',
+      workspaceId: 'z',
+      jobKind: 'scan_validation', // planner says required
+      status: 'queued',
+      attempts: 0,
+      scheduledAt: NOW,
+      startedAt: null,
+      finishedAt: null,
+      errorCode: null,
+      errorMessage: null,
+      createdAt: NOW,
+      required: false, // DB says NOT required → mapper MUST honour
+      payload: {},
+    } as StorageProcessingJobRow);
+    expect(dto.required).toBe(false);
   });
 
-  test('derives required=true for required jobs', () => {
-    expect(deriveJobRequired('scan_validation')).toBe(true);
-    expect(deriveJobRequired('video_probe')).toBe(true);
-  });
-
-  test('fail-closed for unknown job types — defaults required=true', () => {
-    expect(deriveJobRequired('unknown_job_kind')).toBe(true);
-    expect(deriveJobRequired('')).toBe(true);
+  test('STORAGE-FU-2-FU-2: reads required=true from the row even for a planner-non-required jobKind', () => {
+    const dto = mapProcessingJobRow({
+      id: 'x',
+      objectId: 'y',
+      workspaceId: 'z',
+      jobKind: 'image_optimize', // planner says NOT required
+      status: 'queued',
+      attempts: 0,
+      scheduledAt: NOW,
+      startedAt: null,
+      finishedAt: null,
+      errorCode: null,
+      errorMessage: null,
+      createdAt: NOW,
+      required: true, // DB says required → mapper MUST honour
+      payload: {},
+    } as StorageProcessingJobRow);
+    expect(dto.required).toBe(true);
   });
 
   test('updatedAt prefers finishedAt over startedAt over createdAt', () => {
@@ -260,6 +290,8 @@ describe('mapProcessingJobRow + deriveJobRequired', () => {
       errorCode: null,
       errorMessage: null,
       createdAt: NOW,
+      required: false,
+      payload: {},
     } as StorageProcessingJobRow);
     expect(dtoFinished.updatedAt).toBe(finishedAt);
 
@@ -276,6 +308,8 @@ describe('mapProcessingJobRow + deriveJobRequired', () => {
       errorCode: null,
       errorMessage: null,
       createdAt: NOW,
+      required: false,
+      payload: {},
     } as StorageProcessingJobRow);
     expect(dtoStarted.updatedAt).toBe(startedAt);
   });
@@ -294,11 +328,42 @@ describe('mapProcessingJobRow + deriveJobRequired', () => {
       errorCode: 'PROCESSOR_FAILED',
       errorMessage: 'sharp: input file contains unsupported image format',
       createdAt: NOW,
+      required: false,
+      payload: {},
     } as StorageProcessingJobRow);
     expect(dto.errorCode).toBe('PROCESSOR_FAILED');
     const serialised = JSON.stringify(dto);
     expect(serialised).not.toContain('sharp:');
     expect(serialised).not.toContain('unsupported image format');
+  });
+
+  test('STORAGE-FU-2-FU-2: payload is NOT projected into the public DTO (kept on ClaimedJob only)', () => {
+    // `StorageProcessingJobRecord` is the STORAGE-6 GET-object surface.
+    // Payload deliberately stays off the wire so the planner's bytes
+    // never leak via the public read path. The queue repo projects
+    // payload onto `ClaimedJob.payload` instead, where it reaches the
+    // runner via `JobRunnerContext`.
+    const dto = mapProcessingJobRow({
+      id: 'x',
+      objectId: 'y',
+      workspaceId: 'z',
+      jobKind: 'scan_validation',
+      status: 'queued',
+      attempts: 0,
+      scheduledAt: NOW,
+      startedAt: null,
+      finishedAt: null,
+      errorCode: null,
+      errorMessage: null,
+      createdAt: NOW,
+      required: true,
+      payload: { contentType: 'image/png', byteSize: 12345, leakedKey: 'do-not-leak' },
+    } as StorageProcessingJobRow);
+    const serialised = JSON.stringify(dto);
+    expect(serialised).not.toContain('contentType');
+    expect(serialised).not.toContain('byteSize');
+    expect(serialised).not.toContain('leakedKey');
+    expect(serialised).not.toContain('do-not-leak');
   });
 });
 

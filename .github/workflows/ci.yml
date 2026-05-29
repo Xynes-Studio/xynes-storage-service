@@ -55,3 +55,121 @@ jobs:
 
       - name: Coverage gate (>= 80% per ADR-001)
         run: bun run scripts/test-coverage-gate.ts
+
+  # ─── STORAGE-FU-5-FU-F — fixture-based integration suite ────────────────
+  # Runs the per-processor integration suites under
+  # `tests/integration/processors/*.integration.test.ts` against real
+  # binaries (ffmpeg, libreoffice, clamav). Decoupled from the
+  # `quality-gates` job because the binary installs + clamav definition
+  # download add ~2 minutes of latency that should not block fast PR
+  # feedback on unit-test failures.
+  #
+  # Hard-fail mode (`STORAGE_INTEGRATION_PROCESSORS_REQUIRED=1`) is
+  # applied PER-STEP only on the suites whose dependencies this job
+  # actually provisions (sharp + ffmpeg + clamav). The libreoffice
+  # suite is invoked separately WITHOUT the hard-fail flag so it
+  # soft-skips cleanly when `LIBREOFFICE_SERVICE_URL` is unset
+  # (covered by the future sidecar-rollout step, see FU-G).
+  integration-processors:
+    name: integration-processors
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      clamd:
+        # Pin to the current LTS family (1.4). The 1.3 family is no
+        # longer published by Cisco-Talos on Docker Hub; only the
+        # last two minor families ship as plain tags.
+        image: clamav/clamav:1.4
+        ports:
+          - 3310:3310
+        options: >-
+          --health-cmd "echo PING | nc -w 2 localhost 3310 | grep -q PONG"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+          --health-start-period 120s
+    env:
+      CLAMD_HOST: "127.0.0.1"
+      CLAMD_PORT: "3310"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.18
+
+      - name: Cache Bun install
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      # The fixtures are committed binaries — the integration suite
+      # reads them directly. The `apt-get` step below installs ffmpeg
+      # (the sharp + ffmpeg processors run in-process per FU-E §2)
+      # and libreoffice-core (the FU-C processor speaks to a sidecar
+      # but the CI smoke runs against a local soffice binary; the
+      # FU-C runner falls back to the sidecar URL only when set, and
+      # `LIBREOFFICE_SERVICE_URL` is intentionally NOT set on this
+      # job so the libreoffice integration suite soft-skips. A
+      # future CI iteration can add a sidecar container as a service
+      # to exercise the suite end-to-end).
+      - name: Install processor binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          # `clamav-daemon` is provided by the `clamd` service container above.
+          # `libreoffice-core` is NOT installed — the libreoffice suite
+          # requires the FU-G sidecar URL (LIBREOFFICE_SERVICE_URL),
+          # which is filed as a separate rollout step.
+
+      - name: Wait for clamd signature database
+        run: |
+          # clamd needs the signature DB to be loaded before it
+          # accepts INSTREAM requests. The `freshclam` baked into the
+          # `clamav/clamav` image downloads the DB at container start.
+          # The healthcheck above waits up to 120s; we add a final
+          # bounded retry here to surface a clear error if it still
+          # hasn't loaded.
+          for i in {1..60}; do
+            if echo PING | nc -w 2 127.0.0.1 3310 | grep -q PONG; then
+              echo "clamd is responsive"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "clamd did not become responsive within 5 minutes" >&2
+          exit 1
+
+      # ─── Hard-fail suites (Codex P1 fix) ─────────────────────────────
+      # Sharp + ffmpeg + clamav all have their dependencies provisioned
+      # by this job. `STORAGE_INTEGRATION_PROCESSORS_REQUIRED=1` is
+      # scoped to this step ONLY so silent skips on these three
+      # processors would fail the build. The libreoffice suite is
+      # deliberately excluded because `LIBREOFFICE_SERVICE_URL` is not
+      # set on this job (the FU-G sidecar is a separate rollout step).
+      - name: Run hard-fail suites (sharp + ffmpeg + clamav)
+        env:
+          STORAGE_INTEGRATION_PROCESSORS_REQUIRED: "1"
+        run: |
+          bun test \
+            tests/integration/processors/sharp.integration.test.ts \
+            tests/integration/processors/ffmpeg.integration.test.ts \
+            tests/integration/processors/clamav.integration.test.ts
+
+      # ─── Soft-skip suite (libreoffice) ───────────────────────────────
+      # Runs WITHOUT `STORAGE_INTEGRATION_PROCESSORS_REQUIRED=1` so a
+      # missing `LIBREOFFICE_SERVICE_URL` soft-skips cleanly. When the
+      # FU-G sidecar rollout lands, this step will be merged back into
+      # the hard-fail suite above with the sidecar wired in.
+      - name: Run soft-skip suite (libreoffice)
+        run: bun test tests/integration/processors/libreoffice.integration.test.ts

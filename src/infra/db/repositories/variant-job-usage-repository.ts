@@ -49,8 +49,8 @@ import type {
   ProcessingJobQueueRepository,
   ProcessingJobType,
 } from '../../../actions/handlers/processing/types';
+import { validateJobPayload } from '../../../actions/handlers/processing/payload-schemas';
 import {
-  deriveJobRequired,
   mapProcessingJobRow,
   mapUsageRow,
   mapVariantRow,
@@ -221,6 +221,19 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
     input: ReadonlyArray<EnqueueJobInput>,
   ): Promise<ReadonlyArray<StorageProcessingJobRecord>> {
     if (input.length === 0) return [];
+
+    // STORAGE-FU-2-FU-2 — payload validation BEFORE any DB I/O.
+    // Per-jobType `z.strict()` schemas reject any key the planner did
+    // NOT emit. The planner contract already excludes credentials and
+    // provider config; this is a second line of defense so a hostile
+    // / buggy caller cannot smuggle data through the `payload` jsonb
+    // column. Raised errors carry a closed-set code
+    // (`INVALID_JOB_PAYLOAD`, statusHint=400) and never echo the
+    // offending values.
+    for (const job of input) {
+      validateJobPayload(job.jobType, job.payload);
+    }
+
     // One transaction so:
     //   1. The duplicate-check against currently-active rows
     //      (`queued` / `running`) is consistent with the insert.
@@ -301,6 +314,13 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
               status: 'queued' as const,
               attempts: 0,
               scheduledAt: job.scheduledAt,
+              // STORAGE-FU-2-FU-2: persist the planner-emitted payload
+              // + required flag. The planner already excludes
+              // credentials / provider config; per-jobType Zod strict
+              // validators in `payload-schemas.ts` add defense-in-depth
+              // BEFORE this INSERT runs.
+              payload: job.payload as Record<string, unknown>,
+              required: job.required,
             })),
           )
           .returning();
@@ -428,13 +448,21 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
         objectId: row.objectId,
         workspaceId: row.workspaceId,
         jobType: row.jobKind as ProcessingJobType,
-        required: deriveJobRequired(row.jobKind),
-        // Payload is not yet persisted (no column on STORAGE-2 schema).
-        // The runner contract from STORAGE-8 receives the parent object
-        // record via `JobRunnerContext.object`, so an empty payload is
-        // safe today. When a `payload jsonb` column lands, this becomes
-        // a straight column projection.
-        payload: {},
+        // STORAGE-FU-2-FU-2: `required` is now a real column on
+        // `platform.storage_processing_jobs`. Read it straight off the
+        // row instead of deriving from `jobKind` via a TS-only lookup.
+        // The canonical migration's NOT NULL DEFAULT true means even
+        // pre-FU-2-FU-2 rows resolve to a sensible fail-closed value
+        // after the backfill.
+        required: row.required,
+        // STORAGE-FU-2-FU-2: `payload` is now a real column. The
+        // queue repo projects it straight onto `ClaimedJob.payload`
+        // so STORAGE-8 runners see what the planner emitted. The
+        // Drizzle `jsonb()` column round-trips through the `unknown`
+        // type, so we cast back to the documented record shape.
+        // Per-jobType payload validators in `payload-schemas.ts` keep
+        // hostile keys out on the INSERT side.
+        payload: (row.payload ?? {}) as Readonly<Record<string, unknown>>,
         attempts: row.attempts,
         // `maxAttempts` is enforced at the worker level; the field is
         // informational on the claim. The worker overrides via
