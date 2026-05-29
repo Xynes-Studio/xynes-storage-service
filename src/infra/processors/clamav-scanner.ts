@@ -152,6 +152,13 @@ export class ClamavMalwareScanner implements MalwareScanner {
     try {
       const socket = await this.getSocket();
       const response = await this.sendInstream(socket, bytes);
+      // STORAGE-FU-5-FU-D Codex P2 (line 164): plain `zINSTREAM` is a
+      // one-shot command — clamd closes the connection after sending
+      // the reply. Pooling without `IDSESSION` framing creates a race
+      // where a second scan can land on a half-closed socket. Always
+      // reset after a successful scan so the next call opens a fresh
+      // connection.
+      this.resetSocket();
       return parseClamdResponse(response);
     } catch {
       this.resetSocket();
@@ -167,11 +174,50 @@ export class ClamavMalwareScanner implements MalwareScanner {
     const connectOptions: net.NetConnectOpts = this.socketPath
       ? { path: this.socketPath }
       : { host: this.host, port: this.port };
-    const socket = await this.socketFactory.connect(connectOptions);
+    // STORAGE-FU-5-FU-D Codex P2 (line 170): bound the connect step by
+    // the configured `timeoutMs` so a blackholed `CLAMD_HOST`/`CLAMD_PORT`
+    // doesn't pin the worker for the OS-level connect timeout. The race
+    // returns `unknown` to keep the STORAGE-9 §3.6 fail-loud posture.
+    const socket = await this.connectWithTimeout(connectOptions);
     socket.on('close', this.socketDropHandler);
     socket.on('error', this.socketDropHandler);
     this.socket = socket;
     return socket;
+  }
+
+  private connectWithTimeout(connectOptions: net.NetConnectOpts): Promise<SocketLike> {
+    return new Promise<SocketLike>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error('clamd connect timeout'));
+      }, this.timeoutMs);
+
+      this.socketFactory.connect(connectOptions).then(
+        (socket) => {
+          if (settled) {
+            // Timer already fired — discard the late socket so it
+            // doesn't leak into the pool.
+            try {
+              socket.destroy();
+            } catch {
+              // best effort
+            }
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          resolve(socket);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err instanceof Error ? err : new Error('clamd connect error'));
+        },
+      );
+    });
   }
 
   private async sendInstream(socket: SocketLike, bytes: Uint8Array): Promise<string> {

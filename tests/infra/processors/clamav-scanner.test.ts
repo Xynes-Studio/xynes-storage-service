@@ -149,7 +149,12 @@ describe('ClamavMalwareScanner', () => {
     expect(result).toEqual({ verdict: 'infected', signature: 'Win.Test.Signature' });
   });
 
-  test('reuses one persistent socket across sequential scans', async () => {
+  test('opens a fresh connection per scan (plain zINSTREAM is one-shot)', async () => {
+    // STORAGE-FU-5-FU-D Codex P2 (line 164): plain `zINSTREAM` does
+    // NOT support pooled reuse — clamd closes the connection after
+    // the reply. The scanner now closes the socket after every scan
+    // so the next call opens a fresh connection. (Pooled reuse would
+    // require the `IDSESSION` framing.)
     const state: FactoryState = { calls: [], sockets: [] };
     const scanner = new ClamavMalwareScanner(
       { host: '127.0.0.1', port: 3310, timeoutMs: 100 },
@@ -159,8 +164,11 @@ describe('ClamavMalwareScanner', () => {
     await scanner.scan({ bytes: new Uint8Array([1]) });
     await scanner.scan({ bytes: new Uint8Array([2]) });
 
-    expect(state.calls).toHaveLength(1);
-    expect(state.sockets[0]?.scannedPayloads).toHaveLength(2);
+    expect(state.calls).toHaveLength(2);
+    expect(state.sockets).toHaveLength(2);
+    expect(state.sockets[0]?.scannedPayloads).toHaveLength(1);
+    expect(state.sockets[1]?.scannedPayloads).toHaveLength(1);
+    expect(state.sockets[0]?.destroyed).toBe(true);
   });
 
   test('reconnects when the prior socket closes', async () => {
@@ -187,6 +195,54 @@ describe('ClamavMalwareScanner', () => {
 
     const result = await scanner.scan({ bytes: new Uint8Array([1]) });
     expect(result).toEqual({ verdict: 'unknown' });
+  });
+
+  test('returns unknown when the connect step exceeds the configured timeout', async () => {
+    // STORAGE-FU-5-FU-D Codex P2 (line 170): a blackholed
+    // `CLAMD_HOST`/`CLAMD_PORT` must NOT pin the worker for the
+    // OS-level connect timeout. The scanner bounds connect by
+    // `timeoutMs` and reports `unknown` so STORAGE-9 §3.6 fail-loud
+    // posture holds.
+    const slowFactory = {
+      async connect(): Promise<FakeSocket> {
+        // never resolves within the test's deadline
+        return await new Promise<FakeSocket>(() => {});
+      },
+    };
+    const scanner = new ClamavMalwareScanner(
+      { host: '127.0.0.1', port: 3310, timeoutMs: 15 },
+      slowFactory,
+    );
+
+    const result = await scanner.scan({ bytes: new Uint8Array([1]) });
+    expect(result).toEqual({ verdict: 'unknown' });
+  });
+
+  test('discards a late socket if connect resolves after the timeout fired', async () => {
+    // Defense-in-depth: if the connect promise resolves AFTER the
+    // timeout has already rejected, the late socket must be destroyed
+    // so it doesn't leak into the pool.
+    let resolveConnect: ((socket: FakeSocket) => void) | undefined;
+    const lateSocket = new FakeSocket({ responseText: 'stream: OK' });
+    const slowFactory = {
+      async connect(): Promise<FakeSocket> {
+        return await new Promise<FakeSocket>((resolve) => {
+          resolveConnect = resolve;
+        });
+      },
+    };
+    const scanner = new ClamavMalwareScanner(
+      { host: '127.0.0.1', port: 3310, timeoutMs: 15 },
+      slowFactory,
+    );
+
+    const verdict = await scanner.scan({ bytes: new Uint8Array([1]) });
+    expect(verdict).toEqual({ verdict: 'unknown' });
+
+    resolveConnect?.(lateSocket);
+    // Let microtasks settle so the discard-and-destroy path runs.
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    expect(lateSocket.destroyed).toBe(true);
   });
 
   test('uses socketPath connection options when provided', async () => {
