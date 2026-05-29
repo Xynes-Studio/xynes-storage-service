@@ -951,6 +951,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-5-FU-B | ✅ Landed 2026-05-28 (ffmpeg-backed `VideoProcessor` — closes Bug 1 for video variants; `-map_metadata -1` strips embedded metadata; pipe-only I/O with no temp files; `STORAGE_FFMPEG_TIMEOUT_MS` per-job timeout; in-process Bun.spawn against `ffmpeg-static`) |
 | STORAGE-FU-5-FU-C | ✅ Landed 2026-05-28 (LibreOffice-backed `DocumentProcessor` — closes Bug 1 for document preview variants; HTTP client to pod-local sidecar via `LIBREOFFICE_SERVICE_URL`; `STORAGE_SOFFICE_TIMEOUT_MS` per-job timeout; safe-fail to production stub when URL unset) |
 | STORAGE-FU-5-FU-E | ✅ Landed 2026-05-28 (Deployment posture decision — sharp + ffmpeg in-process, LibreOffice + clamav sidecars; Compose overlay + K8s draft manifests) |
+| STORAGE-FU-5-FU-G | ✅ Code landed 2026-05-28 (LibreOffice sidecar Bun HTTP shim image — closes Bug 1 (document) production gap. Source lives at `sidecars/libreoffice/` in this repo; Compose overlay + K8s manifests in `xynes-infra` pin to `xynes/libreoffice-sidecar:0.1.0`. Image build + live R2 smoke deferred to operator per plan §12.5 acceptance criteria.) |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
 | DEDUP-1 | ✅ Landed 2026-05-28 (Content-hash dedup schema — `platform.storage_object_references` reference-counting join table + workspace-scoped partial unique index on `storage_objects (workspace_id, sha256)`) |
 | DEDUP-2 | ✅ Landed 2026-05-28 (Content-hash dedup handler short-circuit + reference-counted soft-delete + CMS Console storage-client wiring) |
@@ -1897,9 +1898,7 @@ X-Document-Page-Height: <integer>
 Status-code semantics enforced by the processor:
 - `200` + allowlisted Content-Type → success.
 - `200` + unexpected Content-Type / empty body → `PROCESSOR_FAILED` (retryable).
-- `400`–`499` → `UNSUPPORTED_FORMAT` (non-retryable; the sidecar
-  rejected THIS document, retrying same bytes against same sidecar
-  won't help).
+- `400`–`499` → `UNSUPPORTED_FORMAT` (non-retryable; the sidecar rejected THIS document, retrying same bytes against same sidecar won't help).
 - `500`–`599` → `PROCESSOR_FAILED` (retryable; transient sidecar fault).
 - Network failure / DNS failure / timeout → `PROCESSOR_FAILED`.
 - Anything else (`1xx`, `3xx`) → `PROCESSOR_FAILED`.
@@ -2615,3 +2614,177 @@ on FU-A (and FU-B/C/D for video / document / scanner respectively).
   STORAGE-FU-3 hosted-secret-manager follow-ups).
 - Per-replica horizontal-pod-autoscaling.
 - Sidecar binary installation in CI (FU-F handles CI bring-up).
+
+---
+
+## LibreOffice Sidecar Bun HTTP Shim (STORAGE-FU-5-FU-G)
+
+The slim sidecar image that pairs with FU-C's `LibreOfficeDocumentProcessor`
+to close Bug 1 (document) in production. FU-C is the HTTP client; FU-G is
+the HTTP server. Bug 1 (document) is NOT closed until BOTH land + the live
+R2 smoke from plan §12.5 asserts `byte_size > 1024` for a representative
+PDF input.
+
+### Why it lives in this repo (not `xynes-infra`)
+
+Repo policy: `xynes/xynes-infra` is a docs / migrations / scripts repo
+(no runnable code). The sidecar's Bun HTTP shim + Dockerfile + tests are
+runnable code, so they live here next to their only consumer (FU-C).
+`xynes-infra` keeps Compose overlay + K8s draft updates + the static
+validator that pins the image tag.
+
+### Source layout
+
+```
+xynes-storage-service/sidecars/libreoffice/
+├── Dockerfile                 # multi-stage: oven/bun:1.1-debian source → debian:12-slim runtime
+├── package.json               # own Bun project; deps decoupled from service runtime
+├── tsconfig.json              # strict; isolated from service tsconfig
+├── .eslintrc.cjs              # minimal TS rules
+├── src/
+│   ├── shim.ts                # Bun.serve entry + boot() factory + defaultFs adapter
+│   ├── convert.ts             # pure runConvert(input, deps) — DI fs + soffice ports
+│   ├── soffice-runner.ts      # createSofficeRunner(spawn, opts) factory + defaultSofficeRunner
+│   ├── health.ts              # createHealthChecker — TTL cache + injectable clock
+│   ├── parse-request.ts       # strict JSON + base64 parser
+│   ├── safe-mime.ts           # closed-set MIME allowlist (mirrors FU-C byte-for-byte)
+│   └── errors.ts              # closed-set ShimErrorCode + status + redaction-safe messages
+└── tests/                     # 111 tests / 9 files / 319 expects; coverage 94.90/97.48
+```
+
+### Wire contract
+
+```
+POST /convert
+  Body:  application/json — { sourceContentType: string, bytes: <base64> }
+  200:   Content-Type: image/png + raw PNG bytes
+         Optional: X-Document-Page-Width / X-Document-Page-Height (positive ints)
+  400:   INVALID_JSON | MISSING_FIELD | INVALID_BASE64
+  413:   OVER_MAX_BYTES               (FU-C maps to OVER_MAX_BYTES)
+  415:   UNSUPPORTED_FORMAT           (FU-C maps to UNSUPPORTED_FORMAT, non-retryable)
+  500:   CONVERT_FAILED               (FU-C maps to PROCESSOR_FAILED, retryable)
+  504:   TIMEOUT                      (FU-C maps to PROCESSOR_FAILED, retryable)
+
+GET /health
+  200 { "status": "ok" }       one-shot RTF probe succeeded (cached TTL=15s)
+  503 { "status": "degraded" } probe failed or recent CONVERT_FAILED / TIMEOUT
+```
+
+The wire shape exactly matches FU-C's `DocumentSidecarClient` expectations
+in `src/infra/processors/libreoffice-document-processor.ts`. The shim's
+safe-MIME allowlist mirrors FU-C's `SAFE_DOCUMENT_PREVIEW_MIMES` from
+`profiles.ts`. Adding a new MIME requires updating BOTH lists; the
+xynes-infra static validator at
+`scripts/test/storage-fu-5-fu-g-libreoffice-sidecar-shim.test.sh`
+regression-guards the cross-list parity.
+
+### Security invariants enforced in code + proven by tests
+
+1. **Non-root user, no shell login.** Container runs as `uid=10001`
+   with `/usr/sbin/nologin`. Read-only root FS at runtime; only `/tmp`
+   (tmpfs in production) is writable.
+2. **`SAL_DISABLE_MACROS=1`** baked into the image-level env AND set
+   per-process by `buildSofficeEnv()` (defense in depth on top of FU-E
+   orchestrator-level env).
+3. **`soffice` argv is fully closed-set.** `buildSofficeArgv` builds
+   from the safe-MIME table + per-request UUID-named paths only. No
+   user input reaches the argv. Asserted by regex sweep against
+   `; | & \` < > $(` shell metacharacters.
+4. **Spawn-per-request.** No `soffice --accept` daemon mode (long
+   history of memory leaks under sustained load per plan §12.5 risk
+   register). Per-request `/tmp/soffice-work-<uuid>` directory wiped
+   in `finally`.
+5. **SIGTERM-then-SIGKILL kill chain on timeout.** A runaway `soffice`
+   process is killed via `proc.kill()` (SIGTERM), then SIGKILL after
+   `killGraceMs` (default 2s). Timed-out conversion surfaces as
+   `TIMEOUT` (504); `kill()` throwing is swallowed.
+6. **Output Content-Type is hard-coded `image/png`.** The shim refuses
+   to advertise any other type. Defense in depth: bytes that pass the
+   PNG magic-header check but parse as non-image (12-byte truncated
+   header) return null dimensions instead of garbage. Successful exit
+   code with non-PNG bytes (e.g. fake JPEG header in the output) is
+   classified `CONVERT_FAILED`.
+7. **Closed-set error codes.** Every non-2xx response is
+   `{ code: ShimErrorCode, message: <fixed string> }`. No interpolated
+   stderr blobs, no path leakage, no library version strings.
+   Regression-guarded by the xynes-infra static validator + per-route
+   `JSON.stringify(body).not.toContain('soffice'|'/tmp'|'AKIA'|'xynes_live_'|'X-Amz-Signature')` assertions.
+8. **Bun.serve error handler returns redacted 500.** A thrown handler
+   error surfaces as `{ code: 'INTERNAL_ERROR', message: 'Internal sidecar error.' }`.
+   The raw `Error.message` NEVER reflects.
+9. **Debug logs are off by default.** Setting `STORAGE_SIDECAR_DEBUG=1`
+   enables a single redacted log line per request (status code +
+   content-type only; NEVER request bytes).
+10. **`tini` as PID-1.** Mitigates `soffice` zombie accumulation under
+    the spawn-per-request model.
+
+### Env contract
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `STORAGE_SIDECAR_PORT` | `8100` | TCP listen port |
+| `STORAGE_SIDECAR_HOSTNAME` | `0.0.0.0` | Bind hostname |
+| `STORAGE_SIDECAR_TMP_ROOT` | `/tmp` | Root for per-request workdirs |
+| `STORAGE_SIDECAR_TIMEOUT_MS` | `55000` | Per-request soffice timeout (5s under FU-C's 60s default so the shim surfaces TIMEOUT before FU-C's AbortController fires) |
+| `STORAGE_SIDECAR_DEBUG` | unset | Set to `1` to enable redacted per-request log lines |
+
+All defaults are safe — malformed env values fall back rather than
+crash. Asserted by `tests/config.test.ts`.
+
+### How to run / test locally
+
+```bash
+# Run unit tests (no soffice binary required — uses DI fakes).
+cd xynes-storage-service/sidecars/libreoffice
+bun test
+bun test --coverage   # overall 94.90% funcs / 97.48% lines
+bun x tsc --noEmit    # zero errors
+bun run lint          # eslint clean
+
+# Build the image (requires Docker).
+docker build -t xynes/libreoffice-sidecar:0.1.0 .
+
+# Smoke against a live container.
+docker run --rm -p 8100:8100 xynes/libreoffice-sidecar:0.1.0 &
+curl -sf http://localhost:8100/health
+# → { "status": "ok" }
+```
+
+### Test summary
+
+- **111 tests / 0 fail / 319 expects / 9 files**.
+- Per-file coverage (all ≥ 80% per ADR-001 floor):
+  - `convert.ts`, `errors.ts`, `safe-mime.ts`: **100% funcs / 100% lines**
+  - `health.ts`: 91.67% funcs / 98.11% lines
+  - `parse-request.ts`: 100% funcs / 97.87% lines
+  - `shim.ts`: 80% funcs / 91.36% lines (uncovered: defaultServe `if (!bun) throw` branch — exercised only when Bun.serve is unavailable, which is unreachable in a Bun runtime)
+  - `soffice-runner.ts`: 87.5% funcs / 92.5% lines (uncovered: `defaultSofficeRunner` factory's `if (!globalBun) throw` branch — same posture)
+
+### Production closure status (Bug 1 — document)
+
+**Code-side complete.** Production closure of Bug 1 (document) requires:
+
+1. Operator builds the image: `docker build -t xynes/libreoffice-sidecar:0.1.0 sidecars/libreoffice/`
+2. Operator flips `STORAGE_PROCESSOR_MODE=live` + `LIBREOFFICE_SERVICE_URL=http://libreoffice-sidecar:8100`
+3. Operator runs `bash xynes-infra/scripts/smoke-universal-storage.sh --full --provider r2` and asserts `byte_size > 1024` for a representative PDF input.
+
+With FU-A + FU-B + FU-C + FU-E + FU-G all landed (code-side), the only
+remaining gate for Bug 1 global closure is the operator-side rollout
+sequence.
+
+### Out of scope (deferred follow-ups)
+
+- Multi-page preview rendering.
+- OCR for image-only PDFs.
+- Office encryption / password-protected document handling.
+- Streaming responses (the shim currently buffers the full PNG before
+  responding; payloads stay well under `MAX_DOCUMENT_BYTES`).
+- Multi-arch image build (linux/arm64 for Apple Silicon dev).
+- `soffice --accept` socket pre-warming (current implementation spawns
+  fresh per request per plan §12.5 leak-mitigation contract; if
+  cold-start latency becomes a bottleneck under sustained load, a
+  follow-up could add a long-lived `soffice` instance behind the
+  spawn-per-request fallback).
+- Pre-warming one idle `soffice` process at boot to absorb cold-start
+  latency under the first `/convert` (currently the `/health` probe
+  serves that purpose by running an RTF conversion at startup).
