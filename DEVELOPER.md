@@ -945,7 +945,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-2 | ✅ Landed 2026-05-15 (Postgres repositories) |
 | STORAGE-FU-2-FU-1 | ✅ Landed 2026-05-28 (Partial unique index `storage_processing_jobs_active_unique_uidx` on `(object_id, job_kind) WHERE status IN ('queued','running')` as belt-and-braces for `enqueueBatch` — DB-side 23505 translated to `DuplicateActiveJobError`) |
 | STORAGE-FU-2-FU-2 | ✅ Landed 2026-05-29 (Persisted `payload jsonb NOT NULL DEFAULT '{}'::jsonb` + `required boolean NOT NULL DEFAULT true` columns on `storage_processing_jobs`; deleted TS-side `REQUIRED_BY_JOB_TYPE` lookup; added per-jobType Zod `.strict()` payload validators that reject hostile keys BEFORE the INSERT) |
-| STORAGE-FU-2-FU-3 | ✅ Landed 2026-05-29 (CI Postgres service container — `supabase/postgres:17.4.1.018` + Supabase-CLI-style migration application via `psql` + new `integration-db` job parallel to `quality-gates` and `integration-processors`; `connectOrSkip()` honours `STORAGE_INTEGRATION_DB_REQUIRED=1` as a credential-sanitized hard-fail) |
+| STORAGE-FU-2-FU-3 | 🟡 Code-side landed 2026-05-29 (`connectOrSkip()` honours `STORAGE_INTEGRATION_DB_REQUIRED=1` as a credential-sanitized hard-fail; `sanitizeUrlForLogging` + `isIntegrationDbRequired` helpers; unit tests). CI integration deferred to STORAGE-FU-2-FU-3-CI (blocked on `xynes-infra` being published to a GitHub remote so a cross-repo checkout can resolve the canonical Supabase migrations) |
 | STORAGE-FU-2-FU-4 | ✅ Landed 2026-05-29 (DRY content-type-family prefix mapping — extracted `CONTENT_TYPE_FAMILY_PREFIXES` constant + derived 'other' branch exclusion list from `Object.values(...).flat()`; pure refactor, behavioural lock via existing `contentTypeFamily=other` integration test) |
 | STORAGE-FU-3 | ✅ Landed 2026-05-15 (Provider resolver + secret-manager interface) |
 | STORAGE-FU-4 | ✅ Landed 2026-05-15 (Composition root — handler registration + ready event) |
@@ -1259,14 +1259,14 @@ is unreachable so a clean laptop (no Docker, no Supabase) still passes
 fixture and relies on the `ON DELETE CASCADE` on `workspace_id` to
 clean up every storage row tree on teardown.
 
-#### Hard-fail mode for CI (STORAGE-FU-2-FU-3)
+#### Hard-fail mode (STORAGE-FU-2-FU-3)
 
 Setting `STORAGE_INTEGRATION_DB_REQUIRED=1` in the environment flips
 the `connectOrSkip()` helper from soft-skip to hard-fail: when the DB
 is unreachable, the helper throws a credential-sanitized error
-instead of returning `null`. The CI `integration-db` job sets this
-env var so silent skips can no longer hide integration-test breakage
-in CI.
+instead of returning `null`. Use this when you want a misconfigured
+local-dev or CI run to fail loudly rather than silently skip the
+integration suite.
 
 Closed-set semantics: only the literal string `'1'` enables hard-fail
 mode. `STORAGE_INTEGRATION_DB_REQUIRED=true`, `=yes`, or any truthy
@@ -1279,15 +1279,21 @@ password. The URL is sanitized via `URL.host` (host:port only) before
 embedding it in the message. See `sanitizeUrlForLogging()` in
 `tests/infra/db/repositories/_db.ts`.
 
-The CI job is documented in `.github/workflows/ci.yml` under the
-`integration-db` job. It pins `supabase/postgres:17.4.1.018` as a
-service container, checks out the `xynes-infra` repo into a sibling
-directory (via the `XYNES_INFRA_READ_TOKEN` secret — a PAT with
-`repo:read` on `Xynes-Studio/xynes-infra`), applies every canonical
-migration in timestamp order via `psql`, verifies the four base
-tables exist, runs `bun run db:check` to confirm the Drizzle mirror
-is in sync, then runs the integration suites with
-`STORAGE_INTEGRATION_DB_REQUIRED=1`.
+Local-dev usage:
+
+```bash
+# Soft-skip (default — clean laptop friendly):
+bun test tests/infra/db/repositories/
+
+# Hard-fail (require the DB to be up):
+STORAGE_INTEGRATION_DB_REQUIRED=1 bun test tests/infra/db/repositories/
+```
+
+CI integration is deferred to follow-up `STORAGE-FU-2-FU-3-CI`
+(blocked on `xynes-infra` being published to a GitHub remote so a
+cross-repo checkout can resolve the canonical Supabase migrations).
+The code-side hard-fail contract above is fully tested and ready to
+wire into CI as soon as the prerequisite lands.
 
 Local-dev posture is preserved: on a clean laptop without the env
 var, `connectOrSkip()` still returns `null` and tests soft-skip
