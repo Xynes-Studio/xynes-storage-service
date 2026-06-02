@@ -264,6 +264,67 @@ A sidecar OOM kill that leaves a residual `tmpfs` mount loses the bytes when the
 
 After FU-A + FU-E land:
 
+> **STORAGE-FU-AB-FIX-1 (2026-06-02) — §9.0 prerequisite:** before
+> running ANY operator-rollout step in this section on a laptop or
+> hosted environment, the storage-service Docker image MUST be
+> rebuilt to pick up the FU-A (`sharp`) + FU-B (`ffmpeg-static`)
+> in-process dependencies. These were added to
+> `xynes-storage-service/package.json` on 2026-05-28 and are NOT
+> present in any image built before that date.
+>
+> The dev compose file mounts a named volume
+> `storage-node_modules:/app/node_modules` over the image's
+> `/app/node_modules`, so simply rebuilding the image is NOT
+> sufficient — the operator MUST also drop the stale named volume:
+>
+> ```bash
+> cd xynes/xynes-infra
+> # Stop the container so the volume can be removed.
+> docker compose --env-file .env.dev.local -f docker-compose.dev.yml \
+>   stop storage-service
+> # Drop the stale named volume (it shadows the image's node_modules).
+> docker volume rm xynes-infra_storage-node_modules
+> # Rebuild without cache so the FU-A/B deps land freshly.
+> docker compose --env-file .env.dev.local -f docker-compose.dev.yml \
+>   build --no-cache storage-service
+> # Force-recreate so the new image + a fresh named volume are used.
+> docker compose --env-file .env.dev.local -f docker-compose.dev.yml \
+>   up -d --force-recreate storage-service
+> ```
+>
+> Verify the binaries land in the running container:
+>
+> ```bash
+> docker compose exec storage-service ls /app/node_modules/sharp
+> # → directory present
+> docker compose exec storage-service bun -e "console.log(require('sharp').versions)"
+> # → prints libvips version
+> docker compose exec storage-service ls /app/node_modules/ffmpeg-static/ffmpeg
+> # → file present, ~80 MB
+> docker compose exec storage-service bun -e "console.log(require('ffmpeg-static'))"
+> # → prints the binary path
+> ```
+>
+> Skip this step → `image_optimize` / `video_*` jobs will dead-letter
+> with `PROCESSOR_FAILED` regardless of `STORAGE_PROCESSOR_MODE`
+> because `buildLiveImageProcessor` / `buildLiveVideoProcessor` will
+> log a single startup WARN and fall back to `ProductionImageProcessorStub`
+> / `ProductionVideoProcessorStub` (the FU-A/B "safe-fail" path).
+>
+> A future regression that drops `sharp` or `ffmpeg-static` from
+> `package.json` is also caught by the new fail-fast RUN probes in
+> `xynes-storage-service/Dockerfile` — `docker build` will exit
+> non-zero before the image is tagged, instead of silently producing
+> a stub-mode runtime.
+>
+> Same caveat applies to hosted environments that build the `prod`
+> Dockerfile target: rebuild + redeploy the image. There is no named
+> volume to drop in hosted environments — the image rebuild alone
+> is sufficient there.
+>
+> See `xynes/xynes-infra/docs/plans/archive/2026-06-02-storage-fu-ab-fix-1.md`
+> for the full bug analysis + repro on 2026-06-02.
+
 > **STORAGE-FU-E-FIX-1 (2026-06-02):** the original FU-E rollout
 > command was overlay-validated only and never end-to-end tested.
 > When run against a clean laptop it failed three independent
@@ -278,8 +339,14 @@ After FU-A + FU-E land:
 The rollout below is the post-FU-E-FIX-1 sequence; it boots cleanly
 on a clean laptop with no pre-existing clamav images or named volumes.
 
-1. Operator flips `STORAGE_PROCESSOR_MODE=live` in `xynes-infra/.env.dev.local`.
-2. Operator brings up the **clamav-only** subset of the live-processors
+1. **(STORAGE-FU-AB-FIX-1)** Operator first runs the §9.0 prerequisite
+   block above to drop the stale `storage-node_modules` named volume,
+   rebuild the storage-service image with `--no-cache`, and verify
+   `sharp` + `ffmpeg-static` resolve inside the running container.
+   Skip this step → `image_optimize` / `video_*` jobs dead-letter
+   with `PROCESSOR_FAILED` regardless of `STORAGE_PROCESSOR_MODE`.
+2. Operator flips `STORAGE_PROCESSOR_MODE=live` in `xynes-infra/.env.dev.local`.
+3. Operator brings up the **clamav-only** subset of the live-processors
    overlay (the default, sufficient for malware scanning):
    ```bash
    cd xynes/xynes-infra
@@ -303,7 +370,7 @@ on a clean laptop with no pre-existing clamav images or named volumes.
      --profile libreoffice \
      up -d
    ```
-3. **Wait for the first-run freshclam definition download.** A brand-new
+4. **Wait for the first-run freshclam definition download.** A brand-new
    `clamav-defs` named volume is empty, so freshclam downloads ~250 MB
    of signatures on first boot. Expect this to take **5–10 minutes**
    on a residential connection. Subsequent restarts reuse the volume
@@ -314,8 +381,8 @@ on a clean laptop with no pre-existing clamav images or named volumes.
    ```
    `clamav-clamd` will keep failing its healthcheck until the first
    definition set lands; that is expected and not an error.
-4. Verify `storage.service.ready` log emits `"processorMode": "live"`.
-5. Verify clamd PING from inside the storage-service container.
+5. Verify `storage.service.ready` log emits `"processorMode": "live"`.
+6. Verify clamd PING from inside the storage-service container.
    The storage-service base image (`oven/bun:1`) does not ship `nc`,
    `netcat`, or `curl` — use Bun's TCP API for a credentialless probe:
    ```bash
@@ -340,7 +407,7 @@ on a clean laptop with no pre-existing clamav images or named volumes.
      'printf "PING\n" | nc -w 5 127.0.0.1 3310'
    # expected: PONG
    ```
-6. (LibreOffice profile only) Verify the sidecar's HTTP health
+7. (LibreOffice profile only) Verify the sidecar's HTTP health
    endpoint reachability. The storage-service container has no
    `curl` binary, so probe via Bun's `fetch` instead:
    ```bash
@@ -358,13 +425,13 @@ on a clean laptop with no pre-existing clamav images or named volumes.
    #  publish; production K8s manifests keep it ClusterIP-only per
    #  FU-E §5 security invariants.)
    ```
-7. Re-run the smoke harness against R2:
+8. Re-run the smoke harness against R2:
    ```bash
    bash scripts/smoke-universal-storage.sh --full --provider r2
    ```
    Every variant landed on R2 MUST be `> 1024` bytes (Bug 1
    regression guard).
-8. (Optional, validates FU-D end-to-end) Upload the EICAR antivirus
+9. (Optional, validates FU-D end-to-end) Upload the EICAR antivirus
    test vector and confirm the malware scanner blocks it.
    `scripts/smoke-universal-storage.sh` does not currently support a
    custom-file flag, so do the EICAR upload by hand using the same
