@@ -264,35 +264,92 @@ A sidecar OOM kill that leaves a residual `tmpfs` mount loses the bytes when the
 
 After FU-A + FU-E land:
 
+> **STORAGE-FU-E-FIX-1 (2026-06-02):** the original FU-E rollout
+> command was overlay-validated only and never end-to-end tested.
+> When run against a clean laptop it failed three independent
+> bring-up bugs: (a) the `clamav/clamav:1.3` image tag was retagged
+> off Docker Hub, (b) the FU-G LibreOffice shim image is not yet
+> published to a pull-able registry, and (c) ClamAV 1.5.x's default
+> `clamd.conf` binds to localhost only, breaking cross-container
+> access. FU-E-FIX-1 closes all three. See
+> `xynes/xynes-infra/docs/plans/archive/2026-06-02-storage-fu-e-fix-1.md`
+> for the full bug analysis.
+
+The rollout below is the post-FU-E-FIX-1 sequence; it boots cleanly
+on a clean laptop with no pre-existing clamav images or named volumes.
+
 1. Operator flips `STORAGE_PROCESSOR_MODE=live` in `xynes-infra/.env.dev.local`.
-2. Operator restarts storage-service with the live-processors overlay:
+2. Operator brings up the **clamav-only** subset of the live-processors
+   overlay (the default, sufficient for malware scanning):
    ```bash
    cd xynes/xynes-infra
    docker compose --env-file .env.dev.local \
      -f docker-compose.dev.yml \
      -f infra/compose/storage-live-processors.yml \
-     up -d storage-service libreoffice-sidecar clamav-clamd clamav-freshclam
+     up -d storage-service clamav-clamd clamav-freshclam
    ```
-3. Verify `storage.service.ready` log emits `"processorMode": "live"`.
-4. Verify `clamd PING` from inside the storage-service container:
+   Operators who also need document-preview generation must opt into
+   the LibreOffice leg explicitly with `--profile libreoffice`. The
+   libreoffice-sidecar service is profile-gated because the FU-G shim
+   image (`xynes/libreoffice-sidecar:0.1.0`) is not yet published —
+   activating the profile only makes sense after the operator has
+   either built the image locally per
+   `xynes/xynes-storage-service/sidecars/libreoffice/Dockerfile` or
+   pulled it from a private registry:
    ```bash
-   docker compose exec storage-service sh -c 'echo "PING" | nc clamav-clamd 3310'
+   docker compose --env-file .env.dev.local \
+     -f docker-compose.dev.yml \
+     -f infra/compose/storage-live-processors.yml \
+     --profile libreoffice \
+     up -d
+   ```
+3. **Wait for the first-run freshclam definition download.** A brand-new
+   `clamav-defs` named volume is empty, so freshclam downloads ~250 MB
+   of signatures on first boot. Expect this to take **5–10 minutes**
+   on a residential connection. Subsequent restarts reuse the volume
+   and skip the download:
+   ```bash
+   docker compose logs -f clamav-freshclam
+   # Wait for: "Database updated (...) signatures from database.clamav.net"
+   ```
+   `clamav-clamd` will keep failing its healthcheck until the first
+   definition set lands; that is expected and not an error.
+4. Verify `storage.service.ready` log emits `"processorMode": "live"`.
+5. Verify clamd PING from inside the storage-service container:
+   ```bash
+   docker compose exec storage-service sh -c \
+     'printf "PING\n" | nc -w 5 clamav-clamd 3310'
    # expected: PONG
    ```
-5. Verify LibreOffice sidecar reachability (TCP-level only until FU-C ships the HTTP shim — see §3):
+6. (LibreOffice profile only) Verify the sidecar's HTTP health
+   endpoint reachability:
    ```bash
-   docker compose exec storage-service sh -c 'nc -z libreoffice-sidecar 8100 && echo OK'
-   # expected: OK
-   # Once FU-C lands the Bun HTTP shim, this upgrades to:
-   #   docker compose exec storage-service curl -sf http://libreoffice-sidecar:8100/health
+   docker compose exec storage-service \
+     curl -sf http://libreoffice-sidecar:8100/health
+   # expected: {"status":"ok"}
    ```
-6. Re-run the smoke harness:
+7. Re-run the smoke harness against R2:
    ```bash
    bash scripts/smoke-universal-storage.sh --full --provider r2
    ```
-   Every variant landed on R2 MUST be `> 1024` bytes (Bug 1 regression guard).
+   Every variant landed on R2 MUST be `> 1024` bytes (Bug 1
+   regression guard).
+8. (Optional, validates FU-D end-to-end) Upload the EICAR antivirus
+   test vector and confirm it is blocked:
+   ```bash
+   bash scripts/smoke-universal-storage.sh --full --provider r2 \
+     --file ../../test-fixtures/malware-smoke/eicar-test.txt
+   ```
+   Expected DB state:
+   - `platform.storage_objects.status='failed'`
+   - `platform.storage_processing_jobs.error_code='MALWARE_DETECTED'`
+     for the corresponding `scan_validation` row.
 
-This sequence is **NOT** automated by FU-E. FU-E ships the posture decision, the compose overlay, the K8s draft, and the runbook entry. The operator step is the manual rollout gate.
+This sequence is **NOT** automated by FU-E. FU-E ships the posture
+decision, the compose overlay, the K8s draft, and the runbook entry.
+FU-E-FIX-1 promotes the overlay from documentation-grade-only to
+operationally-validated. The operator step is still the manual
+rollout gate.
 
 ---
 
