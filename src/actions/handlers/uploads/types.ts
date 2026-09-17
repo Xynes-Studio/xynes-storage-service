@@ -21,12 +21,7 @@ import type { ProviderKind, StorageProviderAdapter } from '../../../infra/provid
 // ── DTOs (handler-internal; never echoed verbatim) ─────────────────────────
 
 export type ObjectStatus =
-  | 'pending_upload'
-  | 'uploaded'
-  | 'processing'
-  | 'ready'
-  | 'failed'
-  | 'deleted';
+  'pending_upload' | 'uploaded' | 'processing' | 'ready' | 'failed' | 'deleted';
 
 export type UploadSessionStatus = 'pending' | 'completed' | 'aborted' | 'expired';
 
