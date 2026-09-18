@@ -481,20 +481,18 @@ describe('STORAGE-FU-4 buildEnqueueProcessingCallback', () => {
         async enqueueBatch(input) {
           spies.enqueueCalls += 1;
           // Return synthetic job rows mirroring the input.
-          return input.map(
-            (j, idx): StorageProcessingJobRecord => ({
-              id: `00000000-0000-4000-8000-00000000job${idx}`.slice(0, 36),
-              objectId: j.objectId,
-              jobType: j.jobType,
-              status: 'queued',
-              attempts: 0,
-              errorCode: null,
-              scheduledAt: j.scheduledAt,
-              createdAt: j.scheduledAt,
-              updatedAt: j.scheduledAt,
-              required: j.required,
-            }),
-          );
+          return input.map((j, idx): StorageProcessingJobRecord => ({
+            id: `00000000-0000-4000-8000-00000000job${idx}`.slice(0, 36),
+            objectId: j.objectId,
+            jobType: j.jobType,
+            status: 'queued',
+            attempts: 0,
+            errorCode: null,
+            scheduledAt: j.scheduledAt,
+            createdAt: j.scheduledAt,
+            updatedAt: j.scheduledAt,
+            required: j.required,
+          }));
         },
         async listForObject() {
           return [];
