@@ -22,6 +22,7 @@ import {
   ExtendedFakeObjectRepository,
   ExtendedFakeProviderResolver,
   makeObject,
+  makeJob,
   makeObjectsDeps,
   makeUserCtx,
 } from './_fakes';
@@ -69,22 +70,22 @@ describe('buildObjectsReadActionHandler — routing', () => {
   test('routes operation=list', async () => {
     const objects = new ExtendedFakeObjectRepository();
     objects.seed(makeObject({ status: 'ready' }));
-    const res = (await buildObjectsReadActionHandler(makeObjectsDeps({ objects }))(
+    const res = await buildObjectsReadActionHandler(makeObjectsDeps({ objects }))(
       { operation: 'list' },
       makeUserCtx(),
-    )) as { items: unknown[] };
-    expect(Array.isArray(res.items)).toBe(true);
+    );
+    expect(res).toMatchObject({ items: expect.any(Array) });
   });
 
   test('routes operation=get', async () => {
     const objects = new ExtendedFakeObjectRepository();
     const obj = makeObject({ status: 'ready' });
     objects.seed(obj);
-    const res = (await buildObjectsReadActionHandler(makeObjectsDeps({ objects }))(
+    const res = await buildObjectsReadActionHandler(makeObjectsDeps({ objects }))(
       { operation: 'get', objectId: obj.id },
       makeUserCtx(),
-    )) as { object: { id: string } };
-    expect(res.object.id).toBe(obj.id);
+    );
+    expect(res).toMatchObject({ object: { id: obj.id } });
   });
 
   test('routes operation=download_url', async () => {
@@ -92,11 +93,21 @@ describe('buildObjectsReadActionHandler — routing', () => {
     const obj = makeObject({ status: 'ready' });
     objects.seed(obj);
     const providers = new ExtendedFakeProviderResolver({ providerId: obj.providerId });
-    const res = (await buildObjectsReadActionHandler(makeObjectsDeps({ objects, providers }))(
+    const deps = makeObjectsDeps({ objects, providers });
+    deps.jobs.seed(
+      obj.id,
+      makeJob({
+        objectId: obj.id,
+        jobType: 'scan_validation',
+        required: true,
+        status: 'succeeded',
+      }),
+    );
+    const res = await buildObjectsReadActionHandler(deps)(
       { operation: 'download_url', objectId: obj.id },
       makeUserCtx(),
-    )) as { url: string };
-    expect(typeof res.url).toBe('string');
+    );
+    expect(res).toMatchObject({ url: expect.any(String) });
   });
 });
 
@@ -118,11 +129,11 @@ describe('buildObjectsDeleteActionHandler — routing', () => {
     const obj = makeObject({ status: 'ready' });
     objects.seed(obj);
     const providers = new ExtendedFakeProviderResolver({ providerId: obj.providerId });
-    const res = (await buildObjectsDeleteActionHandler(makeObjectsDeps({ objects, providers }))(
+    const res = await buildObjectsDeleteActionHandler(makeObjectsDeps({ objects, providers }))(
       { operation: 'delete', objectId: obj.id },
       makeUserCtx(),
-    )) as { object: { status: string } };
-    expect(res.object.status).toBe('deleted');
+    );
+    expect(res).toMatchObject({ object: { status: 'deleted' } });
   });
 });
 
@@ -141,12 +152,11 @@ describe('buildUsageReadActionHandler — routing', () => {
 
   test('routes operation=usage', async () => {
     const now = () => new Date('2026-05-13T12:00:00.000Z');
-    const res = (await buildUsageReadActionHandler(makeObjectsDeps({ now }))(
+    const res = await buildUsageReadActionHandler(makeObjectsDeps({ now }))(
       { operation: 'usage' },
       makeUserCtx(),
-    )) as { from: string; to: string };
-    expect(res.from).toBe('2026-04-14');
-    expect(res.to).toBe('2026-05-13');
+    );
+    expect(res).toMatchObject({ from: '2026-04-14', to: '2026-05-13' });
   });
 });
 

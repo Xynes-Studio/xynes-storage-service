@@ -475,11 +475,17 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
   async markSucceeded(input: {
     jobId: string;
     now: Date;
+    scanSource?: { key: string; providerId: string };
   }): Promise<StorageProcessingJobRecord | null> {
     const updated = await this.db
       .update(storageProcessingJobs)
       .set({
         status: 'succeeded',
+        ...(input.scanSource
+          ? {
+              payload: sql`${storageProcessingJobs.payload} || ${JSON.stringify({ scanSourceKey: input.scanSource.key, scanProviderId: input.scanSource.providerId })}::jsonb`,
+            }
+          : {}),
         finishedAt: input.now,
         // Clear any stale `errorCode` from a prior failed attempt so a
         // retried-and-succeeded job does not surface a stale failure

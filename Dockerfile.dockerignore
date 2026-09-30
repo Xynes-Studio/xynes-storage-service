@@ -1,0 +1,20 @@
+# Dockerfile-specific allowlist, independent of any local .dockerignore.
+**
+!package.json
+!bun.lock
+!src/
+!src/**
+!scripts/
+!scripts/**
+!tests/
+!tests/**
+!tsconfig.json
+!.eslintrc*
+!.prettier*
+# Never admit host dependencies, env files, credentials or generated evidence.
+**/node_modules
+**/.env
+**/.env.*
+**/.git
+**/coverage
+**/*.log

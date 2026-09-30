@@ -14,6 +14,7 @@ import type {
   AbortMultipartUploadOptions,
   CompleteMultipartUploadOptions,
   CompleteMultipartUploadResult,
+  CopyObjectOptions,
   CreateDownloadUrlOptions,
   CreateMultipartUploadOptions,
   CreateSingleUploadUrlOptions,
@@ -69,6 +70,7 @@ export class FakeStorageAdapter implements StorageProviderAdapter {
   public headObjectImpl?: (opts: HeadObjectOptions) => Promise<HeadObjectResult>;
   public createDownloadUrlImpl?: (opts: CreateDownloadUrlOptions) => Promise<DownloadUrl>;
   public deleteObjectImpl?: (opts: DeleteObjectOptions) => Promise<void>;
+  public copyObjectImpl?: (opts: CopyObjectOptions) => Promise<void>;
 
   // STORAGE-FU-5 — server-side I/O methods. Tests that exercise the
   // runner pipeline through the real adapter contract may set the
@@ -149,6 +151,11 @@ export class FakeStorageAdapter implements StorageProviderAdapter {
   async deleteObject(opts: DeleteObjectOptions): Promise<void> {
     this.calls.push({ method: 'deleteObject', opts });
     if (this.deleteObjectImpl) return this.deleteObjectImpl(opts);
+  }
+
+  async copyObject(opts: CopyObjectOptions): Promise<void> {
+    this.calls.push({ method: 'copyObject', opts });
+    await this.copyObjectImpl?.(opts);
   }
 
   async getObjectBytes(opts: { objectKey: string }): Promise<Uint8Array> {
@@ -253,6 +260,35 @@ export class FakeRepositories {
   };
 
   readonly sessions: UploadSessionRepository = {
+    finalizeIfPending: async (input) => {
+      const s = this.state.sessions.get(input.sessionId);
+      const o = this.state.objects.get(input.objectId);
+      if (
+        this.failConditionalComplete ||
+        !s ||
+        !o ||
+        s.workspaceId !== input.workspaceId ||
+        o.workspaceId !== input.workspaceId ||
+        s.objectId !== o.id ||
+        s.status !== 'pending' ||
+        s.expiresAt.getTime() <= input.now.getTime() ||
+        o.status !== 'pending_upload' ||
+        o.providerObjectKey !== input.stagingObjectKey
+      )
+        return null;
+      const object: StorageObjectRecord = {
+        ...o,
+        providerObjectKey: input.finalizedObjectKey,
+        status: 'uploaded',
+        sha256: input.sha256,
+        uploadedAt: input.now,
+        updatedAt: input.now,
+      };
+      const session: UploadSessionRecord = { ...s, status: 'completed', completedAt: input.now };
+      this.state.objects.set(o.id, object);
+      this.state.sessions.set(s.id, session);
+      return { object, session };
+    },
     createObjectWithSession: async (input: CreateObjectWithSessionInput) => {
       if (this.throwOnCreateOnce) {
         const err = this.throwOnCreateOnce;

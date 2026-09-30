@@ -222,6 +222,17 @@ export interface StorageObjectReferenceRepository {
 }
 
 export interface UploadSessionRepository {
+  /** Atomically complete a pending unexpired session and bind its pending object
+   * to a fresh server-only snapshot. A lost race MUST NOT change either row. */
+  finalizeIfPending(input: {
+    sessionId: string;
+    workspaceId: string;
+    objectId: string;
+    stagingObjectKey: string;
+    finalizedObjectKey: string;
+    sha256: string | null;
+    now: Date;
+  }): Promise<CreateObjectWithSessionResult | null>;
   /**
    * Insert one object row + one upload session row in a single transaction
    * (or equivalent atomic op). Implementations MUST guarantee that a

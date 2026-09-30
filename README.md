@@ -33,6 +33,9 @@ first consumer, but the contract is universal — any Xynes app may use it.
 
 ## Documentation
 
+- [`docs/native-image-security.md`](./docs/native-image-security.md) — XYN-SEC-001 remediation and Linux release-image verification.
+- [`docs/SECURITY-REMEDIATION-STATUS.md`](./docs/SECURITY-REMEDIATION-STATUS.md) — SEC-001 and SEC-001-FU-1 closure evidence and rollout requirements.
+
 - [`DEVELOPER.md`](./DEVELOPER.md) — developer contract, planned action keys, actor surface, folder layout.
 - [`docs/architecture.md`](./docs/architecture.md) — local mirror of the high-level architecture.
 - [`docs/api-contract.md`](./docs/api-contract.md) — planned route table, request/response shapes.
