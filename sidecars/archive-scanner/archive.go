@@ -47,12 +47,12 @@ func validateArchive(b []byte, p policy, contentType ...string) string {
 	return (&archiveBudget{p: p}).inspect(b, 0, name)
 }
 func unsupported(b []byte, name string) bool {
-	for _, magic := range [][]byte{[]byte("Rar!"), []byte("7z\xbc\xaf\x27\x1c"), []byte("BZh"), {0xfd, '7', 'z', 'X', 'Z', 0}, []byte("MSCF"), []byte("!<arch>\n"), {0x28, 0xb5, 0x2f, 0xfd}, {0x04, 0x22, 0x4d, 0x18}, {0x1f, 0x9d}, []byte("LZIP"), []byte("xar!"), []byte("070701"), []byte("070702"), []byte("070707"), {0xed, 0xab, 0xee, 0xdb}, {0x60, 0xea}, []byte("ITSF")} {
+	for _, magic := range [][]byte{[]byte("7z\xbc\xaf\x27\x1c"), []byte("BZh"), {0xfd, '7', 'z', 'X', 'Z', 0}, []byte("MSCF"), []byte("!<arch>\n"), {0x28, 0xb5, 0x2f, 0xfd}, {0x04, 0x22, 0x4d, 0x18}, {0x1f, 0x9d}, []byte("LZIP"), []byte("xar!"), []byte("070701"), []byte("070702"), []byte("070707"), {0xed, 0xab, 0xee, 0xdb}, {0x60, 0xea}, []byte("ITSF")} {
 		if bytes.HasPrefix(b, magic) {
 			return true
 		}
 	}
-	if bytes.Contains(b, []byte("Rar!")) || (len(b) >= 32774 && string(b[32769:32774]) == "CD001") || (len(b) >= 512 && string(b[len(b)-512:len(b)-508]) == "koly") {
+	if bytes.Contains(b, []byte("Rar!\x1a\x07\x00")) || bytes.Contains(b, []byte("Rar!\x1a\x07\x01\x00")) || (len(b) >= 32774 && string(b[32769:32774]) == "CD001") || (len(b) >= 512 && string(b[len(b)-512:len(b)-508]) == "koly") {
 		return true
 	}
 	for _, ext := range []string{".rar", ".7z", ".bz2", ".xz", ".cab", ".iso", ".zst", ".lz", ".lzma"} {

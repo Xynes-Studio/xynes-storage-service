@@ -63,6 +63,15 @@ def scan(port, data, mime=None, timeout=3):
             reply += chunk
         return reply.decode().rstrip('\0')
 
+def scan_unix(name, data, mime=None):
+    wire = (('zXYNES ' + mime + '\0').encode() if mime else b'') + b'zINSTREAM\0'
+    wire += struct.pack('!I', len(data)) + data + b'\0' * 4
+    # printf produces bounded binary framing; arguments never become shell code.
+    escaped = ''.join('\\%03o' % byte for byte in wire)
+    return command('docker', 'exec', name, 'sh', '-c',
+                   'printf "%b" "$1" | nc -U -w 3 "$2"', 'sh', escaped,
+                   '/tmp/clamd.sock').rstrip('\0')
+
 def pid(name):
     return command('docker', 'exec', name, 'sh', '-c',
                    'for d in /proc/[0-9]*; do read -r c < "$d/comm"; if [ "$c" = clamd ]; then echo "${d##*/}"; fi; done')
@@ -106,6 +115,15 @@ try:
         ordinary = (FIXTURES / 'ordinary.zip').read_bytes()
         verdict = scan(port, ordinary, 'application/zip;charset=utf-8')
         assert verdict == 'stream: OK', (repr(verdict), command('docker', 'logs', low))
+        unix_verdict = scan_unix(low, ordinary, 'application/zip')
+        assert unix_verdict == 'stream: OK', ('supervisor Unix socket', unix_verdict)
+        assert 'MaxFileSize' in scan_unix(low, (FIXTURES / 'member-size.zip').read_bytes(), 'application/zip')
+        assert 'ArchiveIncomplete' in scan_unix(low, b'broken', 'application/zip')
+        print('Unix supervisor: typed ordinary ZIP accepted, limits/incomplete rejected', flush=True)
+        assert scan(port, b'harmless literal Rar! text', 'application/octet-stream') == 'stream: OK'
+        for marker in [b'Rar!\x1a\x07\x00', b'Rar!\x1a\x07\x01\x00']:
+            assert 'ArchiveUnsupported' in scan(port, b'MZ harmless stub ' + marker)
+        print('RAR: ordinary text accepted; complete embedded RAR 4/5 markers rejected', flush=True)
         assert 'ArchiveIncomplete' in scan(port, b'broken', 'application/zip;charset=utf-8')
         for fixture, limit in [('member-size', 'MaxFileSize'), ('expanded-size', 'MaxScanSize'),
                                ('members', 'MaxFiles'), ('nested', 'MaxRecursion'),

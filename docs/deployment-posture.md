@@ -135,7 +135,7 @@ The processor implementations in FU-A..D read these env vars (set by the operato
 | `LIBREOFFICE_SERVICE_URL` | `http://libreoffice-sidecar:8100` | Tier-2 (LibreOffice) | Sidecar HTTP endpoint. **Pod-local DNS only** — never a public URL. |
 | `CLAMD_HOST` | `clamav-clamd` | Tier-2 (clamav) | Sidecar hostname. **Pod-local DNS only**. |
 | `CLAMD_PORT` | `3310` | Tier-2 (clamav) | TCP port. |
-| `CLAMD_SOCKET` | _(unset)_ | Tier-2 (clamav) | Unix socket path; takes precedence over TCP when set. |
+| `CLAMD_SOCKET` | _(unset)_ | Tier-2 (clamav) | Supervisor Unix socket; takes precedence over TCP. Match scanner `XYNES_ARCHIVE_SOCKET` (default `/tmp/clamd.sock`); see [archive policy](XYN-SEC-002-archive-policy.md). |
 
 **Tier-1 (sharp + ffmpeg) processors have NO env-configured network endpoints** — they're in-process; misconfiguration is impossible.
 

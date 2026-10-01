@@ -1,5 +1,27 @@
 # Pre-PR Re-validation Report
 
+## PR #33 review-comment repairs — 2026-10-01
+
+- Unix scans now enter the supervisor at `/tmp/clamd.sock` (custom absolute path
+  via `XYNES_ARCHIVE_SOCKET`); raw clamd has no Unix listener. TCP and Unix share
+  one slot, all limits, watchdog/restart and shutdown cleanup. Socket permissions
+  are `0660`; occupied paths are preserved. Shared-volume requirements are in the
+  [archive policy](XYN-SEC-002-archive-policy.md).
+- RAR detection requires complete RAR 4/5 markers, including embedded SFX markers.
+  Ordinary `Rar!` text and truncated markers pass preflight.
+- Test-first evidence: old pinned Unix route returned `UNKNOWN COMMAND` for typed
+  ZIP scans; benign `Rar!` text failed the new Go regression before the fixes.
+- Fresh rebuilt pinned image: Unix ordinary ZIP accepted, member-size and declared
+  incompleteness rejected; benign RAR text accepted, full embedded markers rejected.
+  All six archive tests and both SEC-001 consumer gates pass. Frozen owned daemon
+  reaped in **0.831s** after 50ms client disconnect under the low test watchdog.
+- Bun configured gate: **1,710 pass, 18 skip, zero fail**, **93.11% functions /
+  94.54% lines**; scanner client **88.64% / 96.10%**. Lint/typecheck pass.
+- Go **1.27.1 Linux** race/per-file gate: **86.3% overall**, archive.go **95.20%**,
+  server.go **82.41%**. Host Go 1.24.1 race/per-file gate also passes.
+- Independent read-only review found no actionable issues. No hosted deployment
+  or real provider/database writes were performed; unrelated health work preserved.
+
 ## PR #33 merge resolution — 2026-10-01
 
 Merged `develop` at `8167da2cd15909d1846a9d3f44c0836a0b596fa6` (SEC-001 PR #32)

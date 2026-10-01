@@ -28,6 +28,7 @@ const MAX_RESPONSE_BYTES = 16 * 1024;
 export interface ClamavMalwareScannerOptions {
   readonly host?: string;
   readonly port?: number;
+  /** Supervisor Unix socket (default sidecar path: /tmp/clamd.sock), not raw clamd. */
   readonly socketPath?: string;
   readonly timeoutMs?: number;
   readonly chunkBytes?: number;

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,7 +125,7 @@ func loadPolicy(env map[string]string) (policy, error) {
 	return p, nil
 }
 func (p policy) config(database string) string {
-	return fmt.Sprintf("Foreground yes\nTCPSocket 3311\nTCPAddr 127.0.0.1\nLocalSocket /tmp/clamd.sock\nDatabaseDirectory %s\nTemporaryDirectory /tmp\nScanArchive yes\nAlertExceedsMax yes\nAlertEncrypted yes\nAlertBrokenExecutables yes\nAlertBrokenMedia yes\nMaxFileSize %d\nMaxScanSize %d\nMaxFiles %d\nMaxRecursion %d\nMaxScanTime %d\nStreamMaxLength %d\nMaxThreads 1\nMaxQueue 2\nCommandReadTimeout 5\nReadTimeout 10\nBytecodeTimeout 1000\nConcurrentDatabaseReload no\n", database, p.File, p.Expanded, p.Files, p.Depth, p.ScanMS, p.Input)
+	return fmt.Sprintf("Foreground yes\nTCPSocket 3311\nTCPAddr 127.0.0.1\nDatabaseDirectory %s\nTemporaryDirectory /tmp\nScanArchive yes\nAlertExceedsMax yes\nAlertEncrypted yes\nAlertBrokenExecutables yes\nAlertBrokenMedia yes\nMaxFileSize %d\nMaxScanSize %d\nMaxFiles %d\nMaxRecursion %d\nMaxScanTime %d\nStreamMaxLength %d\nMaxThreads 1\nMaxQueue 2\nCommandReadTimeout 5\nReadTimeout 10\nBytecodeTimeout 1000\nConcurrentDatabaseReload no\n", database, p.File, p.Expanded, p.Files, p.Depth, p.ScanMS, p.Input)
 }
 
 type daemon struct {
@@ -325,6 +326,26 @@ func environment() map[string]string {
 	}
 	return m
 }
+
+// The legacy public Unix path now belongs to the supervisor, never raw clamd.
+func listenScannerSocket(path string) (net.Listener, error) {
+	if path == "" {
+		path = "/tmp/clamd.sock"
+	}
+	if !filepath.IsAbs(path) {
+		return nil, errors.New("scanner socket path must be absolute")
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0660); err != nil {
+		listener.Close()
+		return nil, err
+	}
+	return listener, nil
+}
+
 func main() {
 	p, err := loadPolicy(environment())
 	if err != nil {
@@ -366,27 +387,47 @@ func main() {
 		os.Exit(1)
 	}
 	defer listener.Close()
+	unixListener, err := listenScannerSocket(os.Getenv("XYNES_ARCHIVE_SOCKET"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "scanner socket unavailable")
+		d.stop()
+		os.Exit(1)
+	}
+	defer unixListener.Close()
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	g := &gateway{p: p, daemon: d, slot: make(chan struct{}, 1), self: self}
-	serve(ctx, listener, g)
+	serve(ctx, listener, g, unixListener)
 }
 
-func serve(ctx context.Context, listener net.Listener, g *gateway) {
+func serve(ctx context.Context, listener net.Listener, g *gateway, additional ...net.Listener) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	g.baseCtx = ctx
 	g.onFatal = cancel
-	go func() { <-ctx.Done(); listener.Close() }()
-	var active sync.WaitGroup
-	defer active.Wait()
-	for {
-		c, err := listener.Accept()
-		if err != nil {
-			cancel()
-			return
+	listeners := append([]net.Listener{listener}, additional...)
+	go func() {
+		<-ctx.Done()
+		for _, l := range listeners {
+			l.Close()
 		}
-		active.Add(1)
-		go func() { defer active.Done(); g.handle(c) }()
+	}()
+	var acceptors, active sync.WaitGroup
+	defer active.Wait()
+	for _, l := range listeners {
+		acceptors.Add(1)
+		go func(l net.Listener) {
+			defer acceptors.Done()
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					cancel()
+					return
+				}
+				active.Add(1)
+				go func() { defer active.Done(); g.handle(c) }()
+			}
+		}(l)
 	}
+	acceptors.Wait()
 }

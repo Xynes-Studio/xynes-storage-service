@@ -257,7 +257,10 @@ describe('ClamavMalwareScanner', () => {
       makeFactory({ responseText: 'stream: OK' }, state),
     );
 
-    const result = await scanner.scan({ bytes: new Uint8Array([1]) });
+    const result = await scanner.scan({
+      bytes: new Uint8Array([1]),
+      contentType: 'application/zip',
+    });
     expect(result).toEqual({ verdict: 'clean' });
     expect(state.calls[0]).toEqual({ path: '/tmp/clamd.sock' });
   });

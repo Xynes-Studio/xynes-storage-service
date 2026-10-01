@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -291,5 +292,101 @@ func TestDaemonScanCancellationClosesPrivateSocket(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("private scan ignored cancellation")
+	}
+}
+
+func TestSupervisorUnixSocket(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "xyn-unix-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "scanner.sock")
+	unixListener, err := listenScannerSocket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unixListener.Close()
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0660 {
+		t.Fatalf("socket permissions: %v %v", info, err)
+	}
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpListener.Close()
+	child := filepath.Join(dir, "validator")
+	if err := os.WriteFile(child, []byte("#!/bin/sh\nprintf ''\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	p := smallPolicy()
+	p.WallMS = 2000
+	g := &gateway{p: p, daemon: &daemon{dial: fakeReply(t, "stream: OK")}, slot: make(chan struct{}, 1), self: child}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { serve(ctx, tcpListener, g, unixListener); close(done) }()
+	scan := func(network, address string, b []byte) string {
+		t.Helper()
+		c, err := net.DialTimeout(network, address, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		c.SetDeadline(time.Now().Add(3 * time.Second))
+		// Every required application scan includes the metadata preamble.
+		if _, err := c.Write(append([]byte("zXYNES application/zip\x00"), wire(b)...)); err != nil {
+			t.Fatal(err)
+		}
+		out, err := bufio.NewReader(c).ReadString(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	g.slot <- struct{}{}
+	for _, endpoint := range []struct{ network, address string }{{"unix", path}, {"tcp", tcpListener.Addr().String()}} {
+		if got := scan(endpoint.network, endpoint.address, []byte("hi")); !strings.Contains(got, "busy ERROR") {
+			t.Fatal(got)
+		}
+	}
+	<-g.slot
+	if got := scan("unix", path, []byte("hi")); got != "stream: OK\x00" {
+		t.Fatal(got)
+	}
+	if got := scan("unix", path, bytes.Repeat([]byte("A"), 4097)); !strings.Contains(got, "StreamMaxLength") {
+		t.Fatal(got)
+	}
+	if got := scan("tcp", tcpListener.Addr().String(), []byte("hi")); got != "stream: OK\x00" {
+		t.Fatal(got)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("listeners did not stop")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("socket not removed: %v", err)
+	}
+}
+
+func TestSupervisorSocketRefusesInvalidOrOccupiedPaths(t *testing.T) {
+	if l, err := listenScannerSocket("relative.sock"); err == nil {
+		l.Close()
+		t.Fatal("relative path accepted")
+	}
+	file := filepath.Join(t.TempDir(), "occupied")
+	if err := os.WriteFile(file, []byte("preserve"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := listenScannerSocket(file); err == nil {
+		l.Close()
+		t.Fatal("occupied path replaced")
+	}
+	b, err := os.ReadFile(file)
+	if err != nil || string(b) != "preserve" {
+		t.Fatal("existing path modified")
 	}
 }

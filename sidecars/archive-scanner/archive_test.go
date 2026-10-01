@@ -61,3 +61,23 @@ func TestZIPIntegrity(t *testing.T) {
 		t.Fatalf("corrupt ZIP accepted: %q", got)
 	}
 }
+
+func TestRARSignatures(t *testing.T) {
+	for _, b := range [][]byte{
+		[]byte("Rar! is ordinary text"),
+		[]byte("binary prefix Rar! suffix"),
+		[]byte("Rar!\x1a\x07"),
+		[]byte("prefix Rar!\x1a\x07\x01"),
+	} {
+		if got := validateArchive(b, smallPolicy()); got != "" {
+			t.Fatalf("benign or incomplete marker rejected: %q: %s", b, got)
+		}
+	}
+	for _, signature := range []string{"Rar!\x1a\x07\x00", "Rar!\x1a\x07\x01\x00"} {
+		for _, prefix := range []string{"", "MZ harmless executable stub "} {
+			if got := validateArchive([]byte(prefix+signature+"harmless"), smallPolicy()); got != "ArchiveUnsupported" {
+				t.Fatalf("RAR/SFX signature accepted: %q: %s", signature, got)
+			}
+		}
+	}
+}

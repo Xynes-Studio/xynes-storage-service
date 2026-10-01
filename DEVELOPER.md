@@ -2151,10 +2151,10 @@ as `SCANNER_INCONCLUSIVE` and MUST NEVER be silently coerced to `clean`.
 ### Files
 
 - `src/infra/processors/clamav-scanner.ts` — `ClamavMalwareScanner` class.
-  Speaks the clamd `zINSTREAM` protocol over either TCP (`host` + `port`)
-  or a unix socket path (`socketPath`, takes precedence). Maintains a
-  single pooled persistent connection per scanner instance with
-  reconnect-on-close. Exposes a `__forTesting__` seam (`parseClamdResponse`).
+  Sends bounded `zXYNES` metadata plus `zINSTREAM` to the archive supervisor
+  over TCP (`host` + `port`) or its Unix socket (`socketPath`, takes precedence).
+  The supervisor owns `/tmp/clamd.sock` by default; raw clamd is private TCP only.
+  Opens a fresh connection per scan. Exposes a `__forTesting__` seam (`parseClamdResponse`).
 - `src/infra/processors/index.ts` — barrel re-exports
   `ClamavMalwareScanner`, `ClamavMalwareScannerOptions`,
   `DEFAULT_CLAMD_HOST`, `DEFAULT_CLAMD_PORT`, `DEFAULT_CLAMD_TIMEOUT_MS`.
@@ -2173,7 +2173,7 @@ as `SCANNER_INCONCLUSIVE` and MUST NEVER be silently coerced to `clean`.
 |---|---|---|
 | `CLAMD_HOST` | `clamav-clamd` | Sidecar hostname per FU-E §4. Trimmed; blank falls back to default. |
 | `CLAMD_PORT` | `3310` | Strict positive-integer parse; malformed → default. |
-| `CLAMD_SOCKET` | unset | When set, takes precedence over TCP. Pod-local unix socket path. |
+| `CLAMD_SOCKET` | unset | Supervisor Unix socket; takes precedence over TCP. Match scanner `XYNES_ARCHIVE_SOCKET` (default `/tmp/clamd.sock`); see [archive policy](docs/XYN-SEC-002-archive-policy.md). |
 | `CLAMD_TIMEOUT_MS` | `25000` | Strict positive-integer parse; malformed → default. |
 
 ### Security invariants (proven by tests)
@@ -2796,7 +2796,7 @@ lifecycles into sidecars reached over the pod-local network only.
 | `LIBREOFFICE_SERVICE_URL` | `http://libreoffice-sidecar:8100` | Tier-2 | Pod-local DNS only. |
 | `CLAMD_HOST` | `clamav-clamd` | Tier-2 | Pod-local DNS only. |
 | `CLAMD_PORT` | `3310` | Tier-2 | TCP port. |
-| `CLAMD_SOCKET` | _(unset)_ | Tier-2 | Unix socket; takes precedence over TCP when set. |
+| `CLAMD_SOCKET` | _(unset)_ | Tier-2 | Supervisor Unix socket; takes precedence over TCP when set. See [archive policy](docs/XYN-SEC-002-archive-policy.md). |
 
 Tier-2 processors fall back to the safe-fail production stub when the
 env var is unset — a misconfigured live deployment dead-letters cleanly
