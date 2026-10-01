@@ -12,6 +12,9 @@
  *     single busy workspace cannot starve siblings.
  *   - `runOnce()` drives one drain pass — exposed for deterministic
  *     tests. `start()` runs an interval loop.
+ *   - Scan jobs finish and persist first within each batch. Every non-scan
+ *     runner checks persisted scan success, including across workers.
+ *     Pending scans release native claims without consuming attempts.
  *
  * Retry policy:
  *   - On a non-retryable failure → terminal `failed`.
@@ -36,10 +39,11 @@
  * provider-side details before returning.
  */
 import { computeAggregateStatus } from './aggregator';
+import { getScanValidationState, type ScanValidationState } from './scan-gate';
+import { isFinalizedSource } from '../uploads/finalized-source';
 import type {
   ClaimedJob,
   JobRunner,
-  ProcessingJobType,
   ProcessingWorkerDependencies,
   StorageProcessingJobRecord,
 } from './types';
@@ -125,16 +129,24 @@ export class ProcessingWorker {
 
     if (claimed.length === 0) return stats;
 
-    // Run phase: drive every claim concurrently.
-    const results = await Promise.all(claimed.map((job) => this.runClaimed(job)));
+    // Persist scan results first, even if a native job was claimed ahead of
+    // its scan. Other workers' running scans are handled by the gate below.
+    const scans = await Promise.all(
+      claimed.filter((job) => job.jobType === 'scan_validation').map((job) => this.runClaimed(job)),
+    );
+    const native = await Promise.all(
+      claimed.filter((job) => job.jobType !== 'scan_validation').map((job) => this.runClaimed(job)),
+    );
+    const results = [...scans, ...native];
 
     for (const r of results) {
       stats = {
         ...stats,
-        attempted: stats.attempted + 1,
+        attempted: stats.attempted + (r === 'skipped' ? 0 : 1),
         succeeded: stats.succeeded + (r === 'succeeded' ? 1 : 0),
         retried: stats.retried + (r === 'retried' ? 1 : 0),
         failed: stats.failed + (r === 'failed' ? 1 : 0),
+        skipped: stats.skipped + (r === 'skipped' ? 1 : 0),
       };
     }
 
@@ -172,8 +184,10 @@ export class ProcessingWorker {
     }
   }
 
-  private async runClaimed(job: ClaimedJob): Promise<'succeeded' | 'retried' | 'failed'> {
-    const runner = this.deps.runners[job.jobType as ProcessingJobType];
+  private async runClaimed(
+    job: ClaimedJob,
+  ): Promise<'succeeded' | 'retried' | 'failed' | 'skipped'> {
+    const runner = this.deps.runners[job.jobType];
     const object = await this.deps.findObject({
       objectId: job.objectId,
       workspaceId: job.workspaceId,
@@ -181,7 +195,12 @@ export class ProcessingWorker {
 
     // Parent object is deleted (or missing). Cancel the job — no point
     // doing the work.
-    if (!object || object.status === 'deleted') {
+    if (
+      !object ||
+      object.status === 'deleted' ||
+      object.id !== job.objectId ||
+      object.workspaceId !== job.workspaceId
+    ) {
       await this.deps.queue.markFailed({
         jobId: job.id,
         errorCode: 'OBJECT_NOT_AVAILABLE',
@@ -195,6 +214,68 @@ export class ProcessingWorker {
 
     if (!runner) {
       return this.handleFailure(job, object.workspaceId, object.id, 'RUNNER_MISSING', true);
+    }
+
+    if (!isFinalizedSource(object)) {
+      await this.deps.queue.markFailed({
+        jobId: job.id,
+        errorCode: 'SCAN_SOURCE_UNBOUND',
+        terminal: true,
+        now: this.now(),
+      });
+      await this.deps.status.updateAggregateStatus({
+        objectId: object.id,
+        workspaceId: object.workspaceId,
+        nextStatus: 'failed',
+        now: this.now(),
+      });
+      return 'failed';
+    }
+
+    // XYN-SEC-001: no native metadata or pixel parsing until a required scan
+    // for this object has succeeded. Check persisted state on every claim.
+    if (job.jobType !== 'scan_validation') {
+      let scanState: ScanValidationState;
+      try {
+        const jobs = await this.deps.queue.listForObject({
+          objectId: object.id,
+          workspaceId: object.workspaceId,
+        });
+        scanState = getScanValidationState(object, jobs);
+      } catch {
+        return this.handleFailure(
+          job,
+          object.workspaceId,
+          object.id,
+          'SCAN_STATE_UNAVAILABLE',
+          true,
+        );
+      }
+      if (scanState === 'pending') {
+        await this.deps.queue.releaseClaimedJob({
+          jobId: job.id,
+          nextScheduledAt: new Date(this.now().getTime() + 1_000),
+          now: this.now(),
+        });
+        return 'skipped';
+      }
+      if (scanState === 'blocked') {
+        await this.deps.queue.markFailed({
+          jobId: job.id,
+          errorCode: 'SCAN_NOT_PASSED',
+          terminal: true,
+          now: this.now(),
+        });
+        // Missing/cancelled scan evidence is also a safety failure. Do not
+        // let the normal best-effort variant aggregator mark it ready.
+        await this.deps.status.updateAggregateStatus({
+          objectId: object.id,
+          workspaceId: object.workspaceId,
+          nextStatus: 'failed',
+          now: this.now(),
+        });
+        return 'failed';
+      }
     }
 
     let result;
@@ -215,7 +296,14 @@ export class ProcessingWorker {
       );
     }
 
-    await this.deps.queue.markSucceeded({ jobId: job.id, now: this.now() });
+    await this.deps.queue.markSucceeded({
+      jobId: job.id,
+      now: this.now(),
+      scanSource:
+        job.jobType === 'scan_validation'
+          ? { key: object.providerObjectKey, providerId: object.providerId }
+          : undefined,
+    });
     await this.updateParentAggregate(object.workspaceId, object.id);
     return 'succeeded';
   }

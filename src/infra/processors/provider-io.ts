@@ -90,7 +90,13 @@ export function createS3ProviderObjectIO(deps: S3ProviderObjectIODependencies): 
   return {
     async readObject(input) {
       const r = await resolve(input);
-      return r.adapter.getObjectBytes({ objectKey: input.objectKey });
+      return r.adapter.getObjectBytes({
+        objectKey: input.objectKey,
+        ...(input.maxBytes !== undefined ? { maxBytes: input.maxBytes } : {}),
+        ...(input.expectedByteSize !== undefined
+          ? { expectedByteSize: input.expectedByteSize }
+          : {}),
+      });
     },
     async writeObject(input) {
       const r = await resolve(input);

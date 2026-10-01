@@ -125,7 +125,10 @@ export function mapVariantRow(row: StorageObjectVariantRow): StorageObjectVarian
 // ── platform.storage_processing_jobs → StorageProcessingJobRecord ──────────
 
 export function mapProcessingJobRow(row: StorageProcessingJobRow): StorageProcessingJobRecord {
+  const payload = row.payload;
   return {
+    scanSourceKey: typeof payload?.scanSourceKey === 'string' ? payload.scanSourceKey : null,
+    scanProviderId: typeof payload?.scanProviderId === 'string' ? payload.scanProviderId : null,
     id: row.id,
     objectId: row.objectId,
     // DB column: job_kind. DTO field: jobType. STORAGE-7 planner uses

@@ -172,9 +172,11 @@ export function getVideoProfile(profile: QualityProfile): VideoProfile {
  * Aligns with the platform-wide MVP defaults documented in
  * `2026-05-10-universal-object-storage-file-upload-api.md` §10.
  */
-export const MAX_IMAGE_BYTES = 50 * 1024 * 1024; // 50 MiB
-export const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
-export const MAX_DOCUMENT_BYTES = 100 * 1024 * 1024; // 100 MiB
+export {
+  MAX_IMAGE_BYTES,
+  MAX_VIDEO_BYTES,
+  MAX_DOCUMENT_BYTES,
+} from '../../objects/byte-size-policy';
 
 /** Hard pixel dimension cap. Anything larger fails before processor work. */
 export const MAX_IMAGE_DIMENSION = 16_384;

@@ -24,11 +24,74 @@ import { describe, expect, test } from 'bun:test';
 import { SharpImageProcessor } from '../../../src/infra/processors/sharp-image-processor';
 import type { ImageVariantSpec } from '../../../src/actions/handlers/processing/runners/profiles';
 import { loadFixture } from './_helpers';
+import {
+  RunnerExecutionError,
+  RunnerInputError,
+} from '../../../src/actions/handlers/processing/runners/errors';
 
 describe('STORAGE-FU-5-FU-F — SharpImageProcessor integration suite', () => {
   const processor = new SharpImageProcessor();
   const JPEG_FIXTURE = loadFixture('sample.jpg');
   const PNG_FIXTURE = loadFixture('sample.png');
+
+  test('XYN-SEC-001: safe committed AVIF decodes and re-encodes with patched libheif', async () => {
+    const bytes = loadFixture('sample.avif');
+    const probe = await processor.probe({ bytes });
+    expect(probe).toMatchObject({ width: 256, height: 192, format: 'heif' });
+    const rendered = await processor.renderVariant({
+      bytes,
+      spec: { role: 'preview_medium', maxWidth: 128, maxHeight: 128, quality: 80, format: 'jpeg' },
+    });
+    expect(await processor.probe({ bytes: rendered.bytes })).toMatchObject({
+      width: 128,
+      height: 96,
+      format: 'jpeg',
+      hasGpsExif: false,
+    });
+  });
+
+  test('XYN-SEC-001: safe HEIC metadata works; unavailable HEVC decoder fails safely', async () => {
+    const bytes = loadFixture('sample.heic');
+    expect(await processor.probe({ bytes })).toMatchObject({
+      width: 256,
+      height: 192,
+      format: 'heif',
+    });
+    // Bundled Sharp supports AV1, not HEVC pixels. Preserve the existing safe
+    // failure rather than claiming new HEIC rendering support.
+    await expect(
+      processor.renderVariant({
+        bytes,
+        spec: {
+          role: 'preview_medium',
+          maxWidth: 128,
+          maxHeight: 128,
+          quality: 80,
+          format: 'jpeg',
+        },
+      }),
+    ).rejects.toBeInstanceOf(RunnerExecutionError);
+  });
+
+  test.each(['sample.avif', 'sample.heic'] as const)(
+    'XYN-SEC-001: truncated %s produces a closed-set error',
+    async (name) => {
+      const bytes = loadFixture(name).slice(0, 32);
+      await expect(processor.probe({ bytes })).rejects.toBeInstanceOf(RunnerInputError);
+      await expect(
+        processor.renderVariant({
+          bytes,
+          spec: {
+            role: 'preview_medium',
+            maxWidth: 128,
+            maxHeight: 128,
+            quality: 80,
+            format: 'jpeg',
+          },
+        }),
+      ).rejects.toBeInstanceOf(RunnerInputError);
+    },
+  );
 
   test('probes the committed JPEG fixture (with synthetic GPS EXIF)', async () => {
     const out = await processor.probe({ bytes: JPEG_FIXTURE });

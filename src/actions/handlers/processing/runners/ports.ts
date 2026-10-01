@@ -45,6 +45,10 @@ import type { ImageVariantSpec, VideoProfile, VariantRole } from './profiles';
 export interface ProviderObjectIO {
   readObject(input: {
     objectKey: string;
+    /** Bound actual streamed bytes, not just response metadata. */
+    maxBytes?: number;
+    /** Reject actual bytes inconsistent with the stored upload declaration. */
+    expectedByteSize?: number;
     /**
      * STORAGE-FU-5: optional routing hint. Production impls resolve the
      * workspace's provider here; fakes MAY ignore. NEVER carries the
@@ -194,10 +198,11 @@ export interface DocumentProcessor {
 export type MalwareScanResult =
   | { readonly verdict: 'clean' }
   | { readonly verdict: 'infected'; readonly signature?: string }
-  | { readonly verdict: 'unknown' };
+  | { readonly verdict: 'limit_exceeded' }
+  | { readonly verdict: 'unknown'; readonly retryable?: boolean };
 
 export interface MalwareScanner {
-  scan(input: { bytes: Uint8Array }): Promise<MalwareScanResult>;
+  scan(input: { bytes: Uint8Array; contentType?: string }): Promise<MalwareScanResult>;
 }
 
 /**

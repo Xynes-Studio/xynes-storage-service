@@ -51,6 +51,24 @@ reads the committed binaries only).
 
 ## Security notes
 
+### XYN-SEC-001 corpus additions (2026-09-30)
+
+`sample.avif` (103557 bytes) is the existing deterministic-noise `sample.png`
+encoded with Sharp 0.35.5 at AVIF quality 80. `sample.heic` (56460 bytes) is
+the same synthetic PNG encoded by macOS ImageIO through `sips`. Both are
+256×192 harmless controls, with no external media or exploit payloads.
+The tests read these committed bytes and also truncate their headers to
+exercise safe closed-set errors. Recreate only these additions with:
+
+```bash
+bun -e 'import sharp from "sharp"; await sharp("tests/integration/processors/fixtures/sample.png").avif({quality:80}).toFile("tests/integration/processors/fixtures/sample.avif");'
+sips -s format heic tests/integration/processors/fixtures/sample.png --out tests/integration/processors/fixtures/sample.heic
+```
+
+HEIC regeneration needs macOS, and bytes may change between encoder versions.
+CI never regenerates these fixtures. The existing `_generate.ts` does not
+regenerate these two additions.
+
 - **EICAR is the standard test vector**, not real malware. A hostile
   AV agent that flags this directory should be considered a regression
   in the AV agent, not the fixture.

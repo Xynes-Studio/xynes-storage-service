@@ -17,8 +17,14 @@
  *     parameters.
  */
 import {
+  DEFAULT_MAX_BYTE_SIZE,
+  isValidObjectByteSize,
+} from '../../actions/handlers/objects/byte-size-policy';
+import { disposeProviderBody, readBoundedProviderBody } from './bounded-body';
+import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
+  CopyObjectCommand,
   CreateMultipartUploadCommand,
   DeleteObjectCommand,
   GetObjectCommand,
@@ -27,6 +33,8 @@ import {
   S3Client,
   UploadPartCommand,
   type S3ClientConfig,
+  type ServiceInputTypes,
+  type ServiceOutputTypes,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { ProviderAdapterError } from './errors';
@@ -35,6 +43,7 @@ import {
   type AbortMultipartUploadOptions,
   type CompleteMultipartUploadOptions,
   type CompleteMultipartUploadResult,
+  type CopyObjectOptions,
   type CreateDownloadUrlOptions,
   type CreateMultipartUploadOptions,
   type CreateSingleUploadUrlOptions,
@@ -62,15 +71,17 @@ const MAX_PRESIGN_EXPIRY_SECONDS = 7 * 24 * 60 * 60; // 7 days — AWS SigV4 har
  * Optional dependency-injection seam so tests can swap the SDK without
  * spinning up a real network.
  */
+type S3PresignFn = <Input extends ServiceInputTypes, Output extends ServiceOutputTypes>(
+  client: S3Client,
+  command: Parameters<typeof getSignedUrl<ServiceInputTypes, Input, Output>>[1],
+  opts: { expiresIn: number },
+) => Promise<string>;
+
 export interface S3StorageProviderAdapterDeps {
   /** Build an S3Client for the given config. Tests inject a fake. */
   readonly createClient?: (config: S3ClientConfig) => S3Client;
   /** Sign a command into a presigned URL. Tests inject a fake. */
-  readonly presign?: (
-    client: S3Client,
-    command: unknown,
-    opts: { expiresIn: number },
-  ) => Promise<string>;
+  readonly presign?: S3PresignFn;
 }
 
 function nonEmptyString(value: string | undefined | null, fieldName: string): string {
@@ -139,12 +150,27 @@ async function runWithRedactedError<T>(op: () => Promise<T>): Promise<T> {
   try {
     return await op();
   } catch (err) {
+    if (
+      err instanceof ProviderAdapterError &&
+      (err.code === 'PROVIDER_OBJECT_TOO_LARGE' || err.code === 'PROVIDER_OBJECT_SIZE_MISMATCH')
+    ) {
+      throw new ProviderAdapterError(err.code);
+    }
     // Pull a stable code from the underlying SDK error if available, but do
     // NOT propagate the raw message — it may carry the bucket name, the
     // signed URL fragment, or the request signature.
     const code =
-      typeof (err as { name?: unknown }).name === 'string' ? (err as { name: string }).name : null;
+      typeof err === 'object' &&
+      err !== null &&
+      'name' in err &&
+      typeof err.name === 'string' &&
+      /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(err.name)
+        ? err.name
+        : null;
     const safeDetail = code ? ` (provider code: ${code})` : '';
+    if (code === 'NoSuchUpload') {
+      throw new ProviderAdapterError('PROVIDER_MULTIPART_NOT_FOUND');
+    }
     throw new ProviderAdapterError(
       'PROVIDER_OPERATION_FAILED',
       `Storage provider operation failed${safeDetail}`,
@@ -157,11 +183,7 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
   public readonly endpointHost: string;
   public readonly bucket: string;
   private readonly client: S3Client;
-  private readonly presignFn: (
-    client: S3Client,
-    command: unknown,
-    opts: { expiresIn: number },
-  ) => Promise<string>;
+  private readonly presignFn: S3PresignFn;
   private readonly storageClass?: string;
 
   constructor(config: ProviderAdapterConfig, deps: S3StorageProviderAdapterDeps = {}) {
@@ -185,14 +207,13 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
     const createClient = deps.createClient ?? ((cfg: S3ClientConfig) => new S3Client(cfg));
     this.client = createClient(clientConfig);
     this.presignFn =
-      deps.presign ??
-      ((client, command, opts) =>
-        getSignedUrl(client as S3Client, command as Parameters<typeof getSignedUrl>[1], opts));
+      deps.presign ?? ((client, command, opts) => getSignedUrl(client, command, opts));
     this.storageClass = config.storageClass;
   }
 
   async createSingleUploadUrl(opts: CreateSingleUploadUrlOptions): Promise<SingleUploadUrl> {
     validateObjectKey(opts.objectKey);
+    refuseFinalizedUpload(opts.objectKey);
     const expiresIn = opts.expiresInSeconds ?? DEFAULT_PRESIGN_EXPIRY_SECONDS;
     validateExpiry(expiresIn);
 
@@ -230,6 +251,7 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
 
   async createMultipartUpload(opts: CreateMultipartUploadOptions): Promise<MultipartUploadHandle> {
     validateObjectKey(opts.objectKey);
+    refuseFinalizedUpload(opts.objectKey);
 
     const command = new CreateMultipartUploadCommand({
       Bucket: this.bucket,
@@ -407,8 +429,35 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
 
   // ── STORAGE-FU-5: server-side I/O for processing runners ─────────────────
 
+  async copyObject(opts: CopyObjectOptions): Promise<void> {
+    validateObjectKey(opts.sourceObjectKey);
+    validateObjectKey(opts.destinationObjectKey);
+    if (opts.sourceObjectKey === opts.destinationObjectKey) {
+      throw new ProviderAdapterError('PROVIDER_CONFIG_INVALID', 'Invalid snapshot destination');
+    }
+    const command = new CopyObjectCommand({
+      Bucket: this.bucket,
+      Key: opts.destinationObjectKey,
+      CopySource: `${encodeURIComponent(this.bucket)}/${opts.sourceObjectKey.split('/').map(encodeURIComponent).join('/')}`,
+      MetadataDirective: 'COPY',
+      // No tagging, ACL or KMS dependency. The upload API cannot sign this key.
+    });
+    await runWithRedactedError(async () => {
+      const result = await this.client.send(command);
+      if (!result.CopyObjectResult?.ETag) throw new Error('Snapshot copy incomplete');
+    });
+  }
+
   async getObjectBytes(opts: GetObjectBytesOptions): Promise<Uint8Array> {
     validateObjectKey(opts.objectKey);
+    const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTE_SIZE;
+    if (
+      !isValidObjectByteSize(maxBytes) ||
+      maxBytes > DEFAULT_MAX_BYTE_SIZE ||
+      (opts.expectedByteSize !== undefined && !isValidObjectByteSize(opts.expectedByteSize))
+    ) {
+      throw new ProviderAdapterError('PROVIDER_CONFIG_INVALID');
+    }
     const command = new GetObjectCommand({
       Bucket: this.bucket,
       Key: opts.objectKey,
@@ -420,7 +469,23 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
     // and break callers that expect the adapter's closed error shape.
     return runWithRedactedError(async () => {
       const response = await this.client.send(command);
-      return readSdkStreamAsBytes(response.Body);
+      const limit = Math.min(maxBytes, opts.expectedByteSize ?? maxBytes);
+      const length = response.ContentLength;
+      if (length !== undefined) {
+        if (!Number.isSafeInteger(length) || length < 0) {
+          await disposeProviderBody(response.Body);
+          throw new ProviderAdapterError('PROVIDER_OBJECT_SIZE_MISMATCH');
+        }
+        if (length > limit) {
+          await disposeProviderBody(response.Body);
+          throw new ProviderAdapterError('PROVIDER_OBJECT_TOO_LARGE');
+        }
+        if (opts.expectedByteSize !== undefined && length !== opts.expectedByteSize) {
+          await disposeProviderBody(response.Body);
+          throw new ProviderAdapterError('PROVIDER_OBJECT_SIZE_MISMATCH');
+        }
+      }
+      return readBoundedProviderBody(response.Body, limit, opts.expectedByteSize);
     });
   }
 
@@ -448,7 +513,7 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
       // S3 v4 conditional write — providers that honour `If-None-Match: *`
       // refuse if the object already exists. Defense in depth on top of
       // the runner's `deriveVariantObjectKey` non-collision check.
-      (commandInput as unknown as Record<string, unknown>).IfNoneMatch = '*';
+      commandInput.IfNoneMatch = '*';
     }
     const command = new PutObjectCommand(commandInput);
     await runWithRedactedError(() => this.client.send(command));
@@ -467,26 +532,8 @@ export function createS3StorageProviderAdapter(
   return new S3StorageProviderAdapter(config, deps);
 }
 
-/**
- * Convert an AWS SDK v3 response Body into a `Uint8Array`. The SDK
- * uses `transformToByteArray` in modern releases; older releases
- * return a Web `ReadableStream` or a Node `Readable`. We collect
- * whichever variant we get without depending on Node-specific APIs.
- */
-async function readSdkStreamAsBytes(body: unknown): Promise<Uint8Array> {
-  if (body == null) return new Uint8Array();
-  const candidate = body as {
-    transformToByteArray?: () => Promise<Uint8Array>;
-    arrayBuffer?: () => Promise<ArrayBuffer>;
-  };
-  if (typeof candidate.transformToByteArray === 'function') {
-    return candidate.transformToByteArray();
+function refuseFinalizedUpload(key: string): void {
+  if (/^workspaces\/[^/]+\/finalized\//.test(key)) {
+    throw new ProviderAdapterError('PROVIDER_CONFIG_INVALID', 'Invalid upload destination');
   }
-  if (typeof candidate.arrayBuffer === 'function') {
-    return new Uint8Array(await candidate.arrayBuffer());
-  }
-  throw new ProviderAdapterError(
-    'PROVIDER_OPERATION_FAILED',
-    'Storage provider returned an unsupported response body shape',
-  );
 }

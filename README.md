@@ -33,6 +33,9 @@ first consumer, but the contract is universal — any Xynes app may use it.
 
 ## Documentation
 
+- [`docs/native-image-security.md`](./docs/native-image-security.md) — XYN-SEC-001 remediation and Linux release-image verification.
+- [`docs/SECURITY-REMEDIATION-STATUS.md`](./docs/SECURITY-REMEDIATION-STATUS.md) — SEC-001 and SEC-001-FU-1 closure evidence and rollout requirements.
+
 - [`DEVELOPER.md`](./DEVELOPER.md) — developer contract, planned action keys, actor surface, folder layout.
 - [`docs/architecture.md`](./docs/architecture.md) — local mirror of the high-level architecture.
 - [`docs/api-contract.md`](./docs/api-contract.md) — planned route table, request/response shapes.
@@ -40,6 +43,15 @@ first consumer, but the contract is universal — any Xynes app may use it.
   [`xynes-infra/infra/architecture/epics/universal-object-storage.md`](https://github.com/Xynes-Studio/xynes-infra/blob/main/infra/architecture/epics/universal-object-storage.md)
 - Source plan with full story breakdown:
   [`xynes-infra/docs/plans/2026-05-10-universal-object-storage-file-upload-api.md`](https://github.com/Xynes-Studio/xynes-infra/blob/main/docs/plans/2026-05-10-universal-object-storage-file-upload-api.md)
+
+## Upload size validation
+
+Single and multipart completion verify actual provider length against declared
+`byteSize` and the existing content-family limits before accepting an upload.
+Workers also bound downloaded bytes before scanning or native processing.
+See [the API contract](docs/api-contract.md#complete-upload-session),
+[developer guidance](DEVELOPER.md#xyn-sec-002--actual-upload-and-processing-length-enforcement-2026-09-30),
+and [verification evidence](docs/XYN-SEC-002-verification.md).
 
 ## Branch model
 
@@ -62,3 +74,5 @@ no `bun install` step and no service to run locally.
 MIT — see [`LICENSE`](./LICENSE).
 
 Copyright © 2025 Xynes Studio.
+
+[SEC-002 bounded archive policy and integration prerequisites](docs/XYN-SEC-002-archive-policy.md)

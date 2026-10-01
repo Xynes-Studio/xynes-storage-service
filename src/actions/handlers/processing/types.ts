@@ -181,7 +181,11 @@ export interface ProcessingJobQueueRepository {
   }): Promise<ClaimedJob | null>;
 
   /** Mark a running job `succeeded`. MUST bump `attempts`. */
-  markSucceeded(input: { jobId: string; now: Date }): Promise<StorageProcessingJobRecord | null>;
+  markSucceeded(input: {
+    jobId: string;
+    now: Date;
+    scanSource?: { key: string; providerId: string };
+  }): Promise<StorageProcessingJobRecord | null>;
 
   /**
    * Mark a running job either `failed` (terminal) or back to `queued`

@@ -143,6 +143,9 @@ class FakeObjectRepo implements Pick<StorageObjectRepository, 'findByIdForWorksp
 }
 
 class FakeProviderAdapter implements StorageProviderAdapter {
+  async copyObject(): Promise<void> {
+    throw new Error('not implemented');
+  }
   public readonly providerKind: ProviderKind = 'r2';
   public readonly endpointHost = 's3.fake.example';
   public readonly bucket = 'fake-bucket';

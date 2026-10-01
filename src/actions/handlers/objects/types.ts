@@ -62,6 +62,9 @@ export interface StorageObjectVariantRecord {
 export type ProcessingJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
 export interface StorageProcessingJobRecord {
+  /** Internal scan evidence, stripped by public response builders. */
+  readonly scanSourceKey?: string | null;
+  readonly scanProviderId?: string | null;
   readonly id: string;
   readonly objectId: string;
   readonly jobType: string;
@@ -105,13 +108,7 @@ export interface ListObjectsRepoFilters {
   readonly purpose?: string;
   readonly status?: ObjectStatus;
   readonly contentTypeFamily?:
-    | 'image'
-    | 'video'
-    | 'audio'
-    | 'document'
-    | 'archive'
-    | 'text'
-    | 'other';
+    'image' | 'video' | 'audio' | 'document' | 'archive' | 'text' | 'other';
   readonly createdBy?: string;
   readonly createdAfter?: Date;
   readonly createdBefore?: Date;

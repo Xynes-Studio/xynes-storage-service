@@ -13,11 +13,13 @@
  *        §STORAGE-9: "public visibility does not mean public delivery
  *        until scan/validation passes". We treat `public` the same as
  *        `private` from the URL-minting perspective.
- *   3. Resolve the provider that holds the original by `providerId` (NOT
+ *   3. Require persisted successful scan validation before resolving credentials.
+ *      Pending, missing, failed or inconsistent evidence denies delivery.
+ *   4. Resolve the provider that holds the original by `providerId` (NOT
  *      the workspace default — see §STORAGE-6 acceptance criteria).
  *      `ForbiddenError` if the provider is gone.
- *   4. Sign the URL.
- *   5. Return `{ objectId, url, expiresAt }` and nothing else.
+ *   5. Sign the URL.
+ *   6. Return `{ objectId, url, expiresAt }` and nothing else.
  *
  * Plan §STORAGE-9: "Signed read URLs are short-lived and only created
  * after permission checks." Workspace ownership IS the permission check
@@ -29,6 +31,7 @@ import type { ActionContext } from '../../types';
 import type { CreateDownloadUrlResponse } from './responses';
 import { DEFAULT_DOWNLOAD_URL_TTL_SECONDS, createDownloadUrlPayloadSchema } from './schemas';
 import type { ObjectsHandlerDependencies } from './types';
+import { getScanValidationState, type ScanValidationState } from '../processing/scan-gate';
 
 /**
  * Object states that ARE eligible for a signed download URL.
@@ -37,10 +40,9 @@ import type { ObjectsHandlerDependencies } from './types';
  * provider, so a signed GET would return 404 / NoSuchKey and confuse the
  * caller.
  *
- * `failed` is included so a caller can still inspect what landed (the
- * processing pipeline may have failed AFTER the original landed on the
- * provider — the original object is preserved per the product principles
- * in plan §4).
+ * Every eligible state also requires a clean scan. `failed` permits access
+ * to a clean original when another processing job fails; object status
+ * alone never proves that the original is safe to deliver.
  */
 const DELIVERABLE_STATUSES = new Set(['uploaded', 'processing', 'ready', 'failed']);
 
@@ -62,6 +64,22 @@ export function createDownloadUrlHandler(deps: ObjectsHandlerDependencies) {
       throw new ValidationError('Object not found');
     }
     if (!DELIVERABLE_STATUSES.has(object.status)) {
+      throw new ValidationError('Object is not yet available for download');
+    }
+
+    // XYN-SEC-001: neither ready nor failed proves a clean scan. Check the
+    // requested object's scan jobs before resolving credentials or signing.
+    let scanState: ScanValidationState;
+    try {
+      const jobs = await deps.jobs.listForObject({
+        objectId: object.id,
+        workspaceId: ctx.workspaceId,
+      });
+      scanState = getScanValidationState(object, jobs);
+    } catch {
+      throw new ValidationError('Object is not yet available for download');
+    }
+    if (scanState !== 'passed') {
       throw new ValidationError('Object is not yet available for download');
     }
 

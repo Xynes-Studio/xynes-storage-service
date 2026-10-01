@@ -60,7 +60,7 @@ function buildTranscode() {
 describe('video_probe runner', () => {
   test('returns {} for a normal 30 s 720p video', async () => {
     const { providerIO, runner } = buildProbe();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 16 };
     providerIO.preload(object.providerObjectKey, makeBytes(16));
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_probe' }) });
     expect(out).toEqual({});
@@ -88,7 +88,7 @@ describe('video_probe runner', () => {
       ...processor.probeResult,
       durationSeconds: MAX_VIDEO_DURATION_SECONDS + 1,
     };
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_probe' }) });
     expect(out).toEqual({ errorCode: 'OVER_MAX_DURATION', retryable: false });
@@ -101,7 +101,7 @@ describe('video_probe runner', () => {
       width: MAX_VIDEO_DIMENSION + 1,
       height: 1080,
     };
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_probe' }) });
     expect(out).toEqual({ errorCode: 'OVER_MAX_DIMENSIONS', retryable: false });
@@ -114,7 +114,7 @@ describe('video_probe runner', () => {
       width: 1920,
       height: MAX_VIDEO_DIMENSION + 1,
     };
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_probe' }) });
     expect(out).toEqual({ errorCode: 'OVER_MAX_DIMENSIONS', retryable: false });
@@ -132,7 +132,7 @@ describe('video_probe runner', () => {
     const { providerIO, processor, runner } = buildProbe();
     providerIO.preload(seedVideoObject().providerObjectKey, makeBytes(8));
     processor.throwOnProbeOnce = new Error('ffprobe: corrupt mp4 atom');
-    const object = seedVideoObject();
+    const object = seedVideoObject({ byteSize: 8 });
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_probe' }) });
     expect(out).toEqual({ errorCode: 'PROCESSOR_FAILED', retryable: true });
   });
@@ -141,7 +141,7 @@ describe('video_probe runner', () => {
 describe('video_thumbnail runner', () => {
   test('writes a poster variant and records it', async () => {
     const { providerIO, variants, runner } = buildThumbnail();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 16 };
     providerIO.preload(object.providerObjectKey, makeBytes(16));
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_thumbnail' }) });
     expect(out).toEqual({});
@@ -152,7 +152,7 @@ describe('video_thumbnail runner', () => {
 
   test('poster variant content type is image/jpeg or image/webp', async () => {
     const { providerIO, variants, runner } = buildThumbnail();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({ object, job: seedClaimedJob({ jobType: 'video_thumbnail' }) });
     expect(['image/jpeg', 'image/webp']).toContain(variants.records[0]?.contentType);
@@ -167,7 +167,7 @@ describe('video_thumbnail runner', () => {
 
   test('returns retryable PROCESSOR_FAILED on poster render throw', async () => {
     const { providerIO, processor, runner } = buildThumbnail();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     processor.throwOnPosterOnce = new Error('ffmpeg: codec not found');
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_thumbnail' }) });
@@ -176,7 +176,7 @@ describe('video_thumbnail runner', () => {
 
   test('returns retryable PROCESSOR_FAILED on variant write throw', async () => {
     const { providerIO, runner } = buildThumbnail();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     providerIO.throwOnWriteOnce = new Error('NoSuchBucket');
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_thumbnail' }) });
@@ -191,7 +191,7 @@ describe('video_thumbnail runner', () => {
       height: 720,
       contentType: 'image/jpeg',
     };
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({
       object,
@@ -208,7 +208,7 @@ describe('video_thumbnail runner', () => {
 describe('video_transcode runner', () => {
   test('writes one transcode_h264 variant (MP4) and records it', async () => {
     const { providerIO, variants, runner } = buildTranscode();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 16 };
     providerIO.preload(object.providerObjectKey, makeBytes(16));
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_transcode' }) });
     expect(out).toEqual({});
@@ -219,7 +219,7 @@ describe('video_transcode runner', () => {
 
   test('transcode variant carries durationSeconds', async () => {
     const { providerIO, variants, runner } = buildTranscode();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({ object, job: seedClaimedJob({ jobType: 'video_transcode' }) });
     expect(variants.records[0]?.durationSeconds).toBe(30);
@@ -227,9 +227,12 @@ describe('video_transcode runner', () => {
 
   test('transcode variant key never collides with the original', async () => {
     const { providerIO, variants, runner } = buildTranscode();
-    const object = seedVideoObject({
-      providerObjectKey: 'workspaces/ws/objects/obj/clip.mp4',
-    });
+    const object = {
+      ...seedVideoObject({
+        providerObjectKey: 'workspaces/ws/objects/obj/clip.mp4',
+      }),
+      byteSize: 8,
+    };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({ object, job: seedClaimedJob({ jobType: 'video_transcode' }) });
     const recKey = variants.records[0]?.providerObjectKey;
@@ -246,7 +249,7 @@ describe('video_transcode runner', () => {
 
   test('returns retryable PROCESSOR_FAILED on transcode render throw', async () => {
     const { providerIO, processor, runner } = buildTranscode();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     processor.throwOnTranscodeOnce = new Error('ffmpeg: oom');
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_transcode' }) });
@@ -255,7 +258,7 @@ describe('video_transcode runner', () => {
 
   test('returns retryable PROCESSOR_FAILED when variant write throws', async () => {
     const { providerIO, runner } = buildTranscode();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     providerIO.throwOnWriteOnce = new Error('AccessDenied');
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'video_transcode' }) });
@@ -264,7 +267,7 @@ describe('video_transcode runner', () => {
 
   test('all uses of ifAbsent are true (defense in depth — original sacred)', async () => {
     const { providerIO, runner } = buildTranscode();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({ object, job: seedClaimedJob({ jobType: 'video_transcode' }) });
     for (const w of providerIO.writes) {

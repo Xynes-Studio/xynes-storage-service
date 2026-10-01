@@ -38,7 +38,26 @@ The MVP target is a single VPS with Docker Compose (per `xynes/xynes-infra/infra
 
 ### Sharp (FU-A — already landed)
 
-Bundled via `sharp@^0.34.5` in the storage-service `package.json`. The OCI `oven/bun:1` base image ships glibc; sharp's npm package includes a pre-built libvips for linux-x64-glibc. No Dockerfile change was needed for FU-A.
+Bundled via pinned `sharp@0.35.5`. XYN-SEC-001 requires loaded Sharp ≥0.35.5,
+libheif ≥1.23.5 and libvips ≥8.18.7 before decoding. Linux production dependencies
+are installed inside the image and checked during its build. The production
+image copies runtime files only and runs as `bun`. Apply `compose.security.yml`
+last to remove development bind mounts/shared env injection and enforce the
+read-only filesystem and resource limits. See [native image security](native-image-security.md)
+for the release verification command, storage-only env contract and limitations.
+All native processing and signed downloads require persisted successful required
+scan validation. Pending scans defer processing; failed or unavailable scan
+evidence prevents decoding and delivery, including across worker instances.
+Scan proof must also match a finalized source key/provider. Upload completion
+requires same-bucket `CopyObject` permission and private buckets. New client upload
+capabilities address staging; no client upload API may address finalized keys.
+Legacy objects/scan rows fail closed. Before rollout, revoke/expire existing GET
+capabilities and re-upload/rescan legacy content as required; do not backfill proof.
+Apply staging expiry after the maximum upload lifetime; finalized snapshots must
+never have blanket expiry or be rewritten. See [native image security](native-image-security.md#legacy-rollout-and-retention),
+[current status](SECURITY-REMEDIATION-STATUS.md) and
+[PR/release handoff](XYN-SEC-001-pr-handoff.md). SEC-001-FU-1 implementation and
+isolated-provider/DB verification are complete; deployment remains separately authorized.
 
 - **Constructor cost:** ~50 ms first call (lazy-loaded per PR #15 Codex P1 fix); ~0 ms thereafter.
 - **Memory:** sharp's pixel cache is **disabled** at module load via `sharp.cache(false)` — no cross-tenant pixel residue. Per-call working set is bounded by the image dimensions (≤ 16k × 16k via `MAX_IMAGE_DIMENSION` re-check).
@@ -97,9 +116,9 @@ A long-lived `soffice` process in headless mode behind a thin Bun HTTP shim that
 
 Two sidecars because their lifecycles are independent:
 
-1. **`clamav-clamd`** — long-lived `clamd` daemon listening on TCP `3310` (or Unix socket). Scanning uses the `INSTREAM` protocol (bytes streamed in over the socket; no temp file ever touches disk).
+1. **`clamav-clamd`** — SEC-002 archive supervisor on TCP `3310`, owning a private ClamAV daemon on loopback `3311`. Storage streams metadata and original bytes; a bounded original tempfile lives in tmpfs. Members are never extracted to disk.
 2. **`clamav-freshclam`** — long-lived `freshclam` updater that fetches definitions on a configurable schedule (default every 24 h). Writes to a **shared named volume** that `clamav-clamd` reads. A `freshclam` failure restarts ONLY the `freshclam` container; `clamd` keeps scanning against the last good definitions.
-- **`unknown` is never coerced to `clean`** (STORAGE-9 §3.6 invariant). A clamd disconnect or read timeout surfaces as `SCANNER_INCONCLUSIVE` → STORAGE-7 worker retries with backoff and dead-letters at `maxAttempts`.
+- **`unknown` is never coerced to `clean`** (STORAGE-9 §3.6 invariant). Availability errors surface as `SCANNER_INCONCLUSIVE` with bounded retries. Client timeout is terminal; archive-limit or incomplete inspection fails without retries.
 - **discovery** — storage-service reaches the clamd sidecar via `CLAMD_HOST=clamav-clamd` + `CLAMD_PORT=3310`.
 
 ---
@@ -116,7 +135,7 @@ The processor implementations in FU-A..D read these env vars (set by the operato
 | `LIBREOFFICE_SERVICE_URL` | `http://libreoffice-sidecar:8100` | Tier-2 (LibreOffice) | Sidecar HTTP endpoint. **Pod-local DNS only** — never a public URL. |
 | `CLAMD_HOST` | `clamav-clamd` | Tier-2 (clamav) | Sidecar hostname. **Pod-local DNS only**. |
 | `CLAMD_PORT` | `3310` | Tier-2 (clamav) | TCP port. |
-| `CLAMD_SOCKET` | _(unset)_ | Tier-2 (clamav) | Unix socket path; takes precedence over TCP when set. |
+| `CLAMD_SOCKET` | _(unset)_ | Tier-2 (clamav) | Supervisor Unix socket; takes precedence over TCP. Match scanner `XYNES_ARCHIVE_SOCKET` (default `/tmp/clamd.sock`); see [archive policy](XYN-SEC-002-archive-policy.md). |
 
 **Tier-1 (sharp + ffmpeg) processors have NO env-configured network endpoints** — they're in-process; misconfiguration is impossible.
 
@@ -128,10 +147,10 @@ The processor implementations in FU-A..D read these env vars (set by the operato
 
 The two sidecars below are **opt-in for live mode**. The dev stack defaults to `STORAGE_PROCESSOR_MODE=stub` (per `.env.example`), so neither sidecar is mandatory for laptop development.
 
-When an operator flips `STORAGE_PROCESSOR_MODE=live` in `.env.dev.local`, they MUST also start the sidecars by passing the live processors profile:
+When an operator flips `STORAGE_PROCESSOR_MODE=live` in `.env.dev`, they MUST also start the sidecars by passing the live processors profile:
 
 ```bash
-docker compose --env-file .env.dev.local \
+docker compose --env-file .env.dev \
   -f docker-compose.dev.yml \
   -f infra/compose/storage-live-processors.yml \
   up -d
@@ -145,10 +164,10 @@ services:
     image: lscr.io/linuxserver/libreoffice:7.6.7
     # ...
   clamav-clamd:
-    image: clamav/clamav:1.3
+    image: xynes/archive-scanner:0.1.0
     # ...
   clamav-freshclam:
-    image: clamav/clamav:1.3
+    image: clamav/clamav:1.5.2-debian
     command: ["freshclam", "--daemon", "--foreground"]
     # ...
   storage-service:
@@ -164,7 +183,7 @@ services:
 
 The full file enforces:
 - Pinned image tags (no `:latest`).
-- Read-only root filesystem on both sidecars.
+- Read-only scanner root filesystem; freshclam retains its upstream writable entrypoint exception.
 - `cap_drop: [ALL]` (no Linux capabilities granted).
 - `security_opt: [no-new-privileges:true]`.
 - Resource limits matching `xynes/xynes-infra/infra/release/ENVIRONMENTS.md` (sidecars are NOT counted against the storage-service RAM budget; they are documented as separate line items in the live-mode footnote).
@@ -254,7 +273,7 @@ Macros are disabled **globally** at the container env level, not per-request. A 
 - **sharp:** in-memory buffer → in-memory buffer (FU-A).
 - **ffmpeg:** stdin → stdout pipes (FU-B planned).
 - **LibreOffice:** input bytes written to a `tmpfs`-mounted per-request directory; deleted in a `finally` block on the storage-service side. The directory is **not host-mounted** — it lives only inside the sidecar's filesystem.
-- **clamav:** `INSTREAM` protocol streams bytes through the TCP socket; no temp file.
+- **clamav:** metadata plus INSTREAM sends bytes to the supervisor; a bounded original tempfile is removed after inspection. No member files are extracted.
 
 A sidecar OOM kill that leaves a residual `tmpfs` mount loses the bytes when the sidecar restarts (tmpfs is RAM-backed).
 
@@ -264,66 +283,61 @@ A sidecar OOM kill that leaves a residual `tmpfs` mount loses the bytes when the
 
 After FU-A + FU-E land:
 
-> **STORAGE-FU-AB-FIX-1 (2026-06-02) — §9.0 prerequisite:** before
-> running ANY operator-rollout step in this section on a laptop or
-> hosted environment, the storage-service Docker image MUST be
-> rebuilt to pick up the FU-A (`sharp`) + FU-B (`ffmpeg-static`)
-> in-process dependencies. These were added to
-> `xynes-storage-service/package.json` on 2026-05-28 and are NOT
-> present in any image built before that date.
->
-> The dev compose file mounts a named volume
-> `storage-node_modules:/app/node_modules` over the image's
-> `/app/node_modules`, so simply rebuilding the image is NOT
-> sufficient — the operator MUST also drop the stale named volume:
->
-> ```bash
-> cd xynes/xynes-infra
-> # Stop the container so the volume can be removed.
-> docker compose --env-file .env.dev.local -f docker-compose.dev.yml \
->   stop storage-service
-> # Drop the stale named volume (it shadows the image's node_modules).
-> docker volume rm xynes-infra_storage-node_modules
-> # Rebuild without cache so the FU-A/B deps land freshly.
-> docker compose --env-file .env.dev.local -f docker-compose.dev.yml \
->   build --no-cache storage-service
-> # Force-recreate so the new image + a fresh named volume are used.
-> docker compose --env-file .env.dev.local -f docker-compose.dev.yml \
->   up -d --force-recreate storage-service
-> ```
->
-> Verify the binaries land in the running container:
->
-> ```bash
-> docker compose exec storage-service ls /app/node_modules/sharp
-> # → directory present
-> docker compose exec storage-service bun -e "console.log(require('sharp').versions)"
-> # → prints libvips version
-> docker compose exec storage-service ls /app/node_modules/ffmpeg-static/ffmpeg
-> # → file present, ~80 MB
-> docker compose exec storage-service bun -e "console.log(require('ffmpeg-static'))"
-> # → prints the binary path
-> ```
->
-> Skip this step → `image_optimize` / `video_*` jobs will dead-letter
-> with `PROCESSOR_FAILED` regardless of `STORAGE_PROCESSOR_MODE`
-> because `buildLiveImageProcessor` / `buildLiveVideoProcessor` will
-> log a single startup WARN and fall back to `ProductionImageProcessorStub`
-> / `ProductionVideoProcessorStub` (the FU-A/B "safe-fail" path).
->
-> A future regression that drops `sharp` or `ffmpeg-static` from
-> `package.json` is also caught by the new fail-fast RUN probes in
-> `xynes-storage-service/Dockerfile` — `docker build` will exit
-> non-zero before the image is tagged, instead of silently producing
-> a stub-mode runtime.
->
-> Same caveat applies to hosted environments that build the `prod`
-> Dockerfile target: rebuild + redeploy the image. There is no named
-> volume to drop in hosted environments — the image rebuild alone
-> is sufficient there.
->
-> See `xynes/xynes-infra/docs/plans/archive/2026-06-02-storage-fu-ab-fix-1.md`
-> for the full bug analysis + repro on 2026-06-02.
+### 9.0 STORAGE-FU-AB-FIX-1: refresh development dependencies
+
+Both Docker targets verify that Sharp loads and `ffmpeg-static` supplies a binary
+that successfully executes `-version`. Permission checks alone did not reject a
+non-executable file in the tested Bun/container runtime. The final prod check
+runs as `bun`, while the existing production-dependencies stage still enforces
+the patched native decoder gate.
+
+The dev stack mounts `storage-node_modules` over the image dependencies. A build
+cannot update an existing volume. When refreshing that development volume, resolve
+its actual name before removing the stopped storage container: a stopped container
+still holds its volume reference. These commands affect only storage-service and
+its dependency cache; database and provider volumes remain intact.
+
+```bash
+set -e
+cd xynes/xynes-infra
+storage_container=$(docker compose --env-file .env.dev -f docker-compose.dev.yml \
+  ps -a -q storage-service)
+test -n "$storage_container"
+storage_deps_volume=$(docker inspect --format \
+  '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "/app/node_modules")}}{{.Name}}{{end}}{{end}}' \
+  "$storage_container")
+test -n "$storage_deps_volume"
+docker compose --env-file .env.dev -f docker-compose.dev.yml stop storage-service
+docker compose --env-file .env.dev -f docker-compose.dev.yml rm -f storage-service
+docker volume rm "$storage_deps_volume"
+docker compose --env-file .env.dev -f docker-compose.dev.yml \
+  build --no-cache storage-service
+docker compose --env-file .env.dev -f docker-compose.dev.yml \
+  up -d --force-recreate storage-service
+```
+
+For the default project, the resolved deletion is
+`docker volume rm xynes-infra_storage-node_modules`; custom project names have a
+different prefix. Do not use `docker compose down -v` for this refresh. If no
+storage container exists, build and start it first, then inspect its dependency
+volume only if runtime verification fails. Volume removal errors stop this
+procedure; verify which containers reference the volume before proceeding.
+
+Verify the running container after mounts are applied, because a successful image
+build cannot prove a mounted dependency cache is current:
+
+```bash
+docker compose --env-file .env.dev -f docker-compose.dev.yml exec -T storage-service \
+  bun -e 'require("sharp"); const p = require("ffmpeg-static"); require("fs").accessSync(p, require("fs").constants.X_OK); if (Bun.spawnSync([p, "-version"]).exitCode !== 0) throw new Error("FFMPEG_UNAVAILABLE"); console.log("Processor binaries available");'
+```
+
+Missing live binaries fail processing closed; they do not provide working image
+or video variants. This procedure is for the local dev stack. Hosted deployment
+uses the hardened `prod` target and [storage security overlay](../compose.security.yml)
+with no development dependency volume; follow the release/security rollout gates.
+An image rebuild alone does not certify scanner availability or end-to-end uploads.
+
+Historical analysis: `xynes/xynes-infra/docs/plans/archive/2026-06-02-storage-fu-ab-fix-1.md`.
 
 > **STORAGE-FU-E-FIX-1 (2026-06-02):** the original FU-E rollout
 > command was overlay-validated only and never end-to-end tested.
@@ -336,21 +350,20 @@ After FU-A + FU-E land:
 > `xynes/xynes-infra/docs/plans/archive/2026-06-02-storage-fu-e-fix-1.md`
 > for the full bug analysis.
 
-The rollout below is the post-FU-E-FIX-1 sequence; it boots cleanly
-on a clean laptop with no pre-existing clamav images or named volumes.
+The local sequence below incorporates the dependency refresh and supervisor
+probe. SEC-001/002 hosted rollout requirements remain the release authority.
 
 1. **(STORAGE-FU-AB-FIX-1)** Operator first runs the §9.0 prerequisite
    block above to drop the stale `storage-node_modules` named volume,
    rebuild the storage-service image with `--no-cache`, and verify
    `sharp` + `ffmpeg-static` resolve inside the running container.
-   Skip this step → `image_optimize` / `video_*` jobs dead-letter
-   with `PROCESSOR_FAILED` regardless of `STORAGE_PROCESSOR_MODE`.
-2. Operator flips `STORAGE_PROCESSOR_MODE=live` in `xynes-infra/.env.dev.local`.
+   Verify binaries after mounts are applied before enabling live processing.
+2. Operator flips `STORAGE_PROCESSOR_MODE=live` in `xynes-infra/.env.dev`.
 3. Operator brings up the **clamav-only** subset of the live-processors
    overlay (the default, sufficient for malware scanning):
    ```bash
    cd xynes/xynes-infra
-   docker compose --env-file .env.dev.local \
+   docker compose --env-file .env.dev \
      -f docker-compose.dev.yml \
      -f infra/compose/storage-live-processors.yml \
      up -d storage-service clamav-clamd clamav-freshclam
@@ -364,7 +377,7 @@ on a clean laptop with no pre-existing clamav images or named volumes.
    `xynes/xynes-storage-service/sidecars/libreoffice/Dockerfile` or
    pulled it from a private registry:
    ```bash
-   docker compose --env-file .env.dev.local \
+   docker compose --env-file .env.dev \
      -f docker-compose.dev.yml \
      -f infra/compose/storage-live-processors.yml \
      --profile libreoffice \
@@ -382,30 +395,26 @@ on a clean laptop with no pre-existing clamav images or named volumes.
    `clamav-clamd` will keep failing its healthcheck until the first
    definition set lands; that is expected and not an error.
 5. Verify `storage.service.ready` log emits `"processorMode": "live"`.
-6. Verify clamd PING from inside the storage-service container.
-   The storage-service base image (`oven/bun:1`) does not ship `nc`,
-   `netcat`, or `curl` — use Bun's TCP API for a credentialless probe:
+6. Verify a harmless scan through the archive supervisor from Storage. Public
+   port 3310 is the supervisor; raw clamd PING on that port is unsupported.
+   See [SEC-002 archive policy](XYN-SEC-002-archive-policy.md) for limits and
+   coordinated rollout requirements.
    ```bash
-   docker compose exec storage-service bun -e '
-     const s = await Bun.connect({
-       hostname: "clamav-clamd",
-       port: 3310,
-       socket: {
-         data(_, data) { console.log("RECV:", JSON.stringify(data.toString())); },
-         open(sock) { sock.write("PING\n"); },
-       },
+   docker compose --env-file .env.dev -f docker-compose.dev.yml exec -T storage-service bun -e '
+     const { ClamavMalwareScanner } = await import("./src/infra/processors/clamav-scanner.ts");
+     const scanner = new ClamavMalwareScanner({
+       host: process.env.CLAMD_HOST,
+       port: Number(process.env.CLAMD_PORT ?? 3310),
+       socketPath: process.env.CLAMD_SOCKET,
      });
-     await new Promise(r => setTimeout(r, 1500));
-     s.end();
+     const result = await scanner.scan({
+       bytes: new TextEncoder().encode("harmless readiness probe"),
+       contentType: "text/plain",
+     });
+     console.log(result);
+     if (result.verdict !== "clean") process.exit(1);
    '
-   # expected: RECV: "PONG\n"
-   ```
-   Alternative (from the clamav-clamd container itself, which does ship
-   `nc` and `clamdscan`):
-   ```bash
-   docker compose exec clamav-clamd sh -c \
-     'printf "PING\n" | nc -w 5 127.0.0.1 3310'
-   # expected: PONG
+   # expected: { verdict: "clean" }
    ```
 7. (LibreOffice profile only) Verify the sidecar's HTTP health
    endpoint reachability. The storage-service container has no
@@ -490,3 +499,11 @@ rollout gate.
 - `xynes/xynes-infra/infra/release/deployment-posture/k8s/README.md` — K8s draft manifests.
 - `xynes/xynes-infra/infra/release/K8S-READINESS-CHECKLIST.md` — broader K8s migration audit.
 - `xynes/xynes-infra/infra/release/ENVIRONMENTS.md` §4 — port table + live-mode RAM footnote.
+
+## SEC-002 bounded archive scanner (2026-10-01)
+
+The live overlay replaces raw clamd with the custom non-root scanner supervisor.
+ClamAV is pinned by image digest; explicit expansion/count/recursion/time limits
+are supplemented by strict preflight and process kill/reap. See
+[the canonical archive policy](XYN-SEC-002-archive-policy.md) for resource budgets,
+image build, private probes, signature-volume checks and pending SEC-001 merge gate.

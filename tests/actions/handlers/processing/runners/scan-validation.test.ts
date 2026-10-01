@@ -27,7 +27,7 @@ function build() {
 describe('scan-validation runner', () => {
   test('returns {} when scanner verdict is clean', async () => {
     const { providerIO, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 128 };
     providerIO.preload(object.providerObjectKey, makeBytes(128));
     const out = await runner({ object, job: seedClaimedJob() });
     expect(out).toEqual({});
@@ -35,7 +35,7 @@ describe('scan-validation runner', () => {
 
   test('reads bytes via provider IO (single read per job)', async () => {
     const { providerIO, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 128 };
     providerIO.preload(object.providerObjectKey, makeBytes(128));
     await runner({ object, job: seedClaimedJob() });
     expect(providerIO.readCount).toBe(1);
@@ -62,12 +62,15 @@ describe('scan-validation runner', () => {
     expect(out).toEqual({ errorCode: 'OVER_MAX_BYTES', retryable: false });
   });
 
-  test('does not enforce a hard byte cap for "other" content types (audio/archive/text)', async () => {
+  test('accepts audio within the global upload cap', async () => {
     const { providerIO, runner } = build();
-    const object = seedObject({
-      contentType: 'audio/mpeg',
-      byteSize: 5 * 1024 * 1024 * 1024,
-    });
+    const object = {
+      ...seedObject({
+        contentType: 'audio/mpeg',
+        byteSize: 5 * 1024 * 1024 * 1024,
+      }),
+      byteSize: 16,
+    };
     providerIO.preload(object.providerObjectKey, makeBytes(16));
     const out = await runner({ object, job: seedClaimedJob() });
     expect(out).toEqual({});
@@ -76,7 +79,7 @@ describe('scan-validation runner', () => {
   test('returns non-retryable MALWARE_DETECTED when scanner returns infected', async () => {
     const { providerIO, scanner, runner } = build();
     scanner.verdict = { verdict: 'infected', signature: 'TestSig.123' };
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 32 };
     providerIO.preload(object.providerObjectKey, makeBytes(32));
     const out = await runner({ object, job: seedClaimedJob() });
     expect(out).toEqual({ errorCode: 'MALWARE_DETECTED', retryable: false });
@@ -85,7 +88,7 @@ describe('scan-validation runner', () => {
   test('returns RETRYABLE SCANNER_INCONCLUSIVE when scanner returns unknown', async () => {
     const { providerIO, scanner, runner } = build();
     scanner.verdict = { verdict: 'unknown' };
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 32 };
     providerIO.preload(object.providerObjectKey, makeBytes(32));
     const out = await runner({ object, job: seedClaimedJob() });
     expect(out).toEqual({ errorCode: 'SCANNER_INCONCLUSIVE', retryable: true });
@@ -111,7 +114,7 @@ describe('scan-validation runner', () => {
   test('never embeds the bytes or signature into the errorCode (closed-set only)', async () => {
     const { providerIO, scanner, runner } = build();
     scanner.verdict = { verdict: 'infected', signature: 'EICAR-TEST-FILE' };
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const out = (await runner({ object, job: seedClaimedJob() })) as {
       errorCode: string;
@@ -121,5 +124,33 @@ describe('scan-validation runner', () => {
     // Closed-set: the signature name is NEVER part of the surfaced
     // errorCode (defense in depth on the worker redaction layer).
     expect(out.errorCode).not.toContain('EICAR');
+  });
+});
+
+describe('SEC-002 scanner resource budgets', () => {
+  test('rejects input over the scanner budget before a provider read', async () => {
+    const { runner, providerIO, scanner } = build();
+    const out = await runner({
+      object: seedVideoObject({ byteSize: 64 * 1024 * 1024 + 1 }),
+      job: seedClaimedJob(),
+    });
+    expect(out).toEqual({ errorCode: 'OVER_MAX_BYTES', retryable: false });
+    expect(providerIO.readCount).toBe(0);
+    expect(scanner.scanCount).toBe(0);
+  });
+  test('does not retry archive inspection limit failures', async () => {
+    const { providerIO } = build();
+    const object = { ...seedObject({ contentType: 'application/zip' }), byteSize: 4 };
+    providerIO.preload(object.providerObjectKey, makeBytes(4));
+    const limited = createScanValidationRunner({
+      providerIO,
+      scanner: {
+        async scan() {
+          return { verdict: 'limit_exceeded' };
+        },
+      },
+    });
+    const out = await limited({ object, job: seedClaimedJob() });
+    expect(out).toEqual({ errorCode: 'ARCHIVE_INSPECTION_REJECTED', retryable: false });
   });
 });

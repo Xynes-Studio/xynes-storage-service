@@ -63,6 +63,21 @@ before being added.
 
 ## Global Standards
 
+XYN-SEC-001 adds a patched native decoder gate and production image checks.
+See [`docs/native-image-security.md`](docs/native-image-security.md) for the
+Sharp version floor, Linux verification command, storage-only environment
+contract and Compose security overlay. Development/stub workflows are unchanged.
+SEC-001 includes immutable content binding from SEC-001-FU-1. Complete upload
+copies staging into a fresh server-only key and atomically binds the session and
+object via `finalizeIfPending`. Required scans persist the source key/provider;
+workers and downloads match that proof before proceeding. Legacy records fail
+closed and require re-upload plus a new scan. Run
+`bash scripts/verify-immutable-source.sh` for disposable provider/Postgres tests
+and coverage (Go, Docker and Bun required; no application DB/env is used).
+Consult [`docs/SECURITY-REMEDIATION-STATUS.md`](docs/SECURITY-REMEDIATION-STATUS.md)
+and [`docs/XYN-SEC-001-pr-handoff.md`](docs/XYN-SEC-001-pr-handoff.md) for rollout,
+legacy URL expiry and provider copy requirements. Merge does not approve deployment.
+
 - Runtime: **Bun** (matches the rest of the backend service tier).
 - Language: **TypeScript** with strict mode.
 - Web framework: **Hono**.
@@ -958,7 +973,7 @@ the Drizzle implementations (same posture as STORAGE-5..STORAGE-8).
 | STORAGE-FU-5-FU-E | ✅ Landed 2026-05-28 (Deployment posture decision — sharp + ffmpeg in-process, LibreOffice + clamav sidecars; Compose overlay + K8s draft manifests) |
 | STORAGE-FU-5-FU-F | ✅ Landed 2026-05-29 (Fixture-based integration suite under `tests/integration/processors/` — committed `sample.jpg`/`sample.png`/`sample.mp4`/`sample.pdf`/`eicar.txt` fixtures + per-processor suites with `describeIfBinary`/`describeIfEnv` soft-skip gates + new `integration-processors` CI job with `STORAGE_INTEGRATION_PROCESSORS_REQUIRED=1`) |
 | STORAGE-FU-5-FU-G | ✅ Code landed 2026-05-28 (LibreOffice sidecar Bun HTTP shim image — closes Bug 1 (document) production gap. Source lives at `sidecars/libreoffice/` in this repo; Compose overlay + K8s manifests in `xynes-infra` pin to `xynes/libreoffice-sidecar:0.1.0`. Image build + live R2 smoke deferred to operator per plan §12.5 acceptance criteria.) |
-| STORAGE-FU-AB-FIX-1 | ✅ Landed 2026-06-02 (Live image + video processors not actually running in the dev stack — fail-fast `bun -e "require('sharp'); require('ffmpeg-static')"` probes added to BOTH `AS dev` and `AS prod` Dockerfile stages immediately after `bun install`; `docs/deployment-posture.md` §9.0 operator-rebuild prerequisite block documenting the stale `storage-node_modules` named-volume drop + `--no-cache` rebuild + `--force-recreate` sequence; static validator `scripts/test/storage-fu-ab-fix-1-live-processor-binaries.test.sh` in `xynes-infra` enforces both pieces stay coherent.) |
+| STORAGE-FU-AB-FIX-1 | Updated 2026-10-01: dev and final non-root prod images probe Sharp plus executable ffmpeg; SEC-001 production stages/native gate and SEC-002 scan controls retained. `docs/deployment-posture.md` §9.0 resolves the dev dependency volume, removes the stopped storage container, rebuilds and checks binaries after mounts. |
 | STORAGE-FU-6 | ✅ Landed 2026-05-16 (Worker lifecycle — `startLifecycle` + SIGTERM/SIGINT graceful shutdown + worker-cap env knobs) |
 | DEDUP-1 | ✅ Landed 2026-05-28 (Content-hash dedup schema — `platform.storage_object_references` reference-counting join table + workspace-scoped partial unique index on `storage_objects (workspace_id, sha256)`) |
 | DEDUP-2 | ✅ Landed 2026-05-28 (Content-hash dedup handler short-circuit + reference-counted soft-delete + CMS Console storage-client wiring) |
@@ -2137,10 +2152,10 @@ as `SCANNER_INCONCLUSIVE` and MUST NEVER be silently coerced to `clean`.
 ### Files
 
 - `src/infra/processors/clamav-scanner.ts` — `ClamavMalwareScanner` class.
-  Speaks the clamd `zINSTREAM` protocol over either TCP (`host` + `port`)
-  or a unix socket path (`socketPath`, takes precedence). Maintains a
-  single pooled persistent connection per scanner instance with
-  reconnect-on-close. Exposes a `__forTesting__` seam (`parseClamdResponse`).
+  Sends bounded `zXYNES` metadata plus `zINSTREAM` to the archive supervisor
+  over TCP (`host` + `port`) or its Unix socket (`socketPath`, takes precedence).
+  The supervisor owns `/tmp/clamd.sock` by default; raw clamd is private TCP only.
+  Opens a fresh connection per scan. Exposes a `__forTesting__` seam (`parseClamdResponse`).
 - `src/infra/processors/index.ts` — barrel re-exports
   `ClamavMalwareScanner`, `ClamavMalwareScannerOptions`,
   `DEFAULT_CLAMD_HOST`, `DEFAULT_CLAMD_PORT`, `DEFAULT_CLAMD_TIMEOUT_MS`.
@@ -2159,22 +2174,25 @@ as `SCANNER_INCONCLUSIVE` and MUST NEVER be silently coerced to `clean`.
 |---|---|---|
 | `CLAMD_HOST` | `clamav-clamd` | Sidecar hostname per FU-E §4. Trimmed; blank falls back to default. |
 | `CLAMD_PORT` | `3310` | Strict positive-integer parse; malformed → default. |
-| `CLAMD_SOCKET` | unset | When set, takes precedence over TCP. Pod-local unix socket path. |
-| `CLAMD_TIMEOUT_MS` | `10000` | Strict positive-integer parse; malformed → default. |
+| `CLAMD_SOCKET` | unset | Supervisor Unix socket; takes precedence over TCP. Match scanner `XYNES_ARCHIVE_SOCKET` (default `/tmp/clamd.sock`); see [archive policy](docs/XYN-SEC-002-archive-policy.md). |
+| `CLAMD_TIMEOUT_MS` | `25000` | Strict positive-integer parse; malformed → default. |
 
 ### Security invariants (proven by tests)
 
 1. **`unknown` is NEVER coerced to `clean`.** clamd responses other than
    `OK` / `… FOUND` map to `{ verdict: 'unknown' }`. The runner contract
    (STORAGE-8 `scan-validation`) flips parents to `failed` on the required
-   `scan_validation` job when verdict is `unknown` after retries.
+   `scan_validation` job when verdict is `unknown` after bounded availability
+   retries. Client timeout is terminal; archive limits/incomplete inspection are
+   non-retryable `ARCHIVE_INSPECTION_REJECTED`.
 2. **No raw signature names in error envelopes.** `parseClamdResponse`
    extracts the signature into the typed result; the runner forwards
    `{ verdict: 'infected', signature }` as structured fields, never as
    user-visible error message text.
-3. **Bytes are streamed via `INSTREAM`** — never written to a temp file.
-4. **Clamd-only upstream** — no external scanning APIs reached from this
-   processor.
+3. **Storage streams bytes via `INSTREAM`.** The SEC-002 supervisor retains
+   only the bounded original upload in tmpfs; members are inspected in memory.
+4. **Supervised private ClamAV upstream** — no external scanning APIs reached
+   from this processor; canonical live mode requires the archive supervisor.
 5. **Connection failures don't leak transport details.** The scanner
    catches every error from `getSocket()` / `sendInstream()` /
    `readResponse()` and returns `{ verdict: 'unknown' }`. The underlying
@@ -2779,7 +2797,7 @@ lifecycles into sidecars reached over the pod-local network only.
 | `LIBREOFFICE_SERVICE_URL` | `http://libreoffice-sidecar:8100` | Tier-2 | Pod-local DNS only. |
 | `CLAMD_HOST` | `clamav-clamd` | Tier-2 | Pod-local DNS only. |
 | `CLAMD_PORT` | `3310` | Tier-2 | TCP port. |
-| `CLAMD_SOCKET` | _(unset)_ | Tier-2 | Unix socket; takes precedence over TCP when set. |
+| `CLAMD_SOCKET` | _(unset)_ | Tier-2 | Supervisor Unix socket; takes precedence over TCP when set. See [archive policy](docs/XYN-SEC-002-archive-policy.md). |
 
 Tier-2 processors fall back to the safe-fail production stub when the
 env var is unset — a misconfigured live deployment dead-letters cleanly
@@ -3179,3 +3197,60 @@ New job `integration-processors` in `.github/workflows/ci.yml`:
 - Performance benchmarking suite.
 - Cross-platform CI matrix (macOS + Windows).
 - Visual-regression testing of image / document previews.
+
+
+## XYN-SEC-002 — actual upload and processing length enforcement (2026-09-30)
+
+Completion HEADs both single and multipart objects before transitioning any
+successful state or enqueueing jobs. Actual length must exactly match declared
+`byteSize`, be positive/safe/integral, and obey the shared content-family cap.
+`src/actions/handlers/objects/byte-size-policy.ts` is the single source for the
+existing limits: image 50 MiB, video 2 GiB, document 100 MiB, other 5 GiB. Existing
+exports from upload schemas and processing profiles remain available.
+
+Invalid lengths abort the pending session and return the existing
+`400 VALIDATION_ERROR` envelope. The object remains `pending_upload`; no jobs
+are queued. Bytes are retained to avoid deleting a concurrent completion's
+object. The abandoned-upload job only expires pending sessions and does not
+remove finalized provider objects; operators must clean up rejected objects
+under their retention policy. Do not treat the rejected session as reusable.
+Provider HEAD/network errors leave the session pending. A finalized multipart
+handle may disappear before a retry; the adapter maps `NoSuchUpload` to the
+safe `PROVIDER_MULTIPART_NOT_FOUND` code and the handler recovers only after
+HEAD and length validation. Other completion errors propagate.
+
+All six processing runners use `readObjectForProcessing`. It checks stored
+size, passes `maxBytes` and `expectedByteSize` through `ProviderObjectIO`, and
+checks the returned actual length again before a scanner/native processor.
+`OVER_MAX_BYTES` and integrity `PROFILE_GUARD_REJECTED` failures are
+non-retryable; transient provider failures remain retryable `PROCESSOR_FAILED`.
+
+The S3 adapter reads Node async iterables or Web streams incrementally. It
+checks GET metadata, counts actual bytes independently, cancels/destroys the
+response on rejection, and uses one growing buffer bounded by the smaller of
+the declaration and policy. Temporary allocation during growth can exceed one
+buffer; these caps bound input retention, not total native-process RSS. Existing
+worker concurrency and container memory settings still need capacity planning,
+particularly for the existing 2 GiB video/5 GiB other-family limits. Whole-body
+`transformToByteArray`/`arrayBuffer` conversion-only response shapes fail closed.
+SDK error details remain redacted; read bounds use strongly typed optional
+fields, with no type skips or relaxed compiler settings added.
+
+No new env variables, dependencies, database schema changes, or data migration.
+Tests use synthetic data and a loopback S3 protocol fixture with the real SDK.
+Database tests must run against an isolated, backed-up test database if enabled.
+Live R2/B2/MinIO deployments and Linux release-image validation remain separate
+operator evidence; the local fixture does not certify provider deployment.
+See [implementation plan](docs/plans/2026-09-30-XYN-SEC-002-upload-size-enforcement.md)
+and [verification record](docs/XYN-SEC-002-verification.md).
+The [pre-PR re-validation report](docs/XYN-SEC-002-pre-pr-review.md) records the
+independently isolated PR scope and review cleanup.
+
+### SEC-002 archive inspection extension (2026-10-01)
+
+See [archive policy](docs/XYN-SEC-002-archive-policy.md). Live scans require the
+custom pinned scanner supervisor, with a 64 MiB input cap, bounded ZIP/TAR/GZIP
+preflight, ClamAV limits and kill/reap watchdog. Deterministic rejection is terminal.
+The separately developed SEC-001 download/native scan-success gates are a merge
+integration prerequisite. Run the isolated archive harness and enable its combined
+SEC-001 gate after those changes become available.

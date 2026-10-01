@@ -44,11 +44,15 @@ export function resetIds(): void {
 
 export function seedObject(overrides: Partial<StorageObjectRecord> = {}): StorageObjectRecord {
   const now = new Date('2026-05-14T01:00:00.000Z');
+  const id = overrides.id ?? nextObjectId();
+  const workspaceId = overrides.workspaceId ?? TEST_WORKSPACE_ID;
   return {
-    id: overrides.id ?? nextObjectId(),
+    id,
     workspaceId: overrides.workspaceId ?? TEST_WORKSPACE_ID,
     providerId: overrides.providerId ?? '00000000-0000-4000-8000-0000000000a0',
-    providerObjectKey: overrides.providerObjectKey ?? 'workspaces/ws/objects/obj/file.bin',
+    providerObjectKey:
+      overrides.providerObjectKey ??
+      `workspaces/${workspaceId}/finalized/v1/${id}/00000000-0000-4000-8000-000000000099`,
     filename: overrides.filename ?? 'file.bin',
     contentType: overrides.contentType ?? 'image/jpeg',
     byteSize: overrides.byteSize ?? 1024,
@@ -188,7 +192,11 @@ export class FakeProcessingQueue implements ProcessingJobQueueRepository {
     };
   }
 
-  async markSucceeded(input: { jobId: string; now: Date }) {
+  async markSucceeded(input: {
+    jobId: string;
+    now: Date;
+    scanSource?: { key: string; providerId: string };
+  }) {
     this.markSucceededCount += 1;
     const r = this.rows.get(input.jobId);
     if (!r) return null;
@@ -196,6 +204,8 @@ export class FakeProcessingQueue implements ProcessingJobQueueRepository {
     const updated: QueueRow = {
       ...r,
       status: 'succeeded',
+      scanSourceKey: input.scanSource?.key ?? null,
+      scanProviderId: input.scanSource?.providerId ?? null,
       errorCode: null,
       attempts: r.attempts + 1,
       updatedAt: input.now,
@@ -296,6 +306,18 @@ export class FakeProcessingQueue implements ProcessingJobQueueRepository {
       scheduledAt: row.scheduledAt ?? now,
       createdAt: row.createdAt ?? now,
       updatedAt: row.updatedAt ?? now,
+      scanSourceKey:
+        row.scanSourceKey === undefined &&
+        row.status === 'succeeded' &&
+        row.jobType === 'scan_validation'
+          ? `workspaces/${this.workspaceOf(row.objectId)}/finalized/v1/${row.objectId}/00000000-0000-4000-8000-000000000099`
+          : row.scanSourceKey,
+      scanProviderId:
+        row.scanProviderId === undefined &&
+        row.status === 'succeeded' &&
+        row.jobType === 'scan_validation'
+          ? '00000000-0000-4000-8000-0000000000a0'
+          : row.scanProviderId,
       payload: row.payload ?? {},
       maxAttempts: row.maxAttempts ?? this.maxAttemptsDefault,
     };
@@ -305,6 +327,8 @@ export class FakeProcessingQueue implements ProcessingJobQueueRepository {
 
 function stripPayload(row: QueueRow): StorageProcessingJobRecord {
   return {
+    scanSourceKey: row.scanSourceKey,
+    scanProviderId: row.scanProviderId,
     id: row.id,
     objectId: row.objectId,
     jobType: row.jobType,
