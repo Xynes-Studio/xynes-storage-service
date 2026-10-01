@@ -1,6 +1,35 @@
 # Pre-PR Re-validation Report
 
-## Verdict
+## PR #33 merge resolution — 2026-10-01
+
+Merged `develop` at `8167da2cd15909d1846a9d3f44c0836a0b596fa6` (SEC-001 PR #32)
+into SEC-002. Resolved four conflicts in CI, upload completion, S3 adapter and
+runner integration fixtures. Both SEC-001 CI jobs and archive-safety remain;
+archive-safety now requires the combined quarantine gate.
+
+Completion retains immutable copy/atomic finalization, checks staging and copied
+source lengths before acceptance, recovers only typed missing multipart handles,
+and preserves ownership-aware cleanup. A harmless SDK fixture replaces 4 staging
+bytes with 5 during copy and verifies rejection before finalization/enqueue.
+Two new copied-source length tests failed before the integration fix and pass now.
+S3 CopyObject and independently bounded streaming reads coexist.
+
+Validation: configured coverage gate **1,710 passed, 18 skipped, zero failures**;
+**93.11% functions / 94.54% lines**. Changed production completion is **100% functions /
+94.38% lines** and S3 adapter **100% / 100%**. Lint and typecheck pass. Four inherited
+formatting differences were normalized to the locked formatter to keep lint green.
+Real pinned scanner harness passes six archive tests and both SEC-001 delivery/native
+rejection tests on the complete merged tree. Frozen daemon was reaped after client
+disconnect in **1.108s** with the deliberately low watchdog. Scanner code/image
+unchanged; the harness reused the previously built pinned test image.
+
+Optional real MinIO/Postgres and unprovisioned processor suites remain skipped in
+this local run; their existing CI jobs remain required. Loopback SDK multipart,
+copy, HEAD, replay and bounded GET tests run locally. No real database, provider,
+deployment or GitHub PR merge was performed. Main-checkout health edits are preserved.
+This addendum supersedes the historical missing-SEC-001 merge blocker below.
+
+## Historical verdict
 
 > This report preserves the initial pre-publication review. The publication
 > addendum below records the subsequent user authorization and PR32 gate evidence.

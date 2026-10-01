@@ -14,6 +14,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { createCompleteUploadHandler } from '../../../../src/actions/handlers/uploads/complete';
+import { createFinalizedSourceKey } from '../../../../src/actions/handlers/uploads/finalized-source';
 import { ValidationError } from '../../../../src/actions/errors';
 import { ProviderAdapterError } from '../../../../src/infra/providers/errors';
 import type {
@@ -100,7 +101,7 @@ describe('completeUploadHandler — single happy path', () => {
     const handler = createCompleteUploadHandler(deps);
     await handler({ operation: 'complete', uploadId: session.id }, makeUserCtx());
     const heads = providers.adapter.calls.filter((c) => c.method === 'headObject');
-    expect(heads.length).toBe(1);
+    expect(heads.length).toBe(2);
   });
 
   test('rejects empty single uploads (HEAD returns 0 bytes)', async () => {
@@ -202,7 +203,11 @@ describe('completeUploadHandler — state transitions', () => {
   test('idempotent on already-completed session', async () => {
     const repositories = new FakeRepositories();
     const { session } = seedPending(repositories);
-    repositories.setSessionStatus(session.id, 'completed');
+    const object = repositories.getObject(session.objectId)!;
+    repositories.seedSession(
+      { ...session, status: 'completed', completedAt: new Date() },
+      { ...object, status: 'uploaded', providerObjectKey: createFinalizedSourceKey(object) },
+    );
     const deps = makeDeps({ repositories });
     const handler = createCompleteUploadHandler(deps);
     const res = await handler({ operation: 'complete', uploadId: session.id }, makeUserCtx());
@@ -284,7 +289,14 @@ describe('completeUploadHandler — race-loss path', () => {
         return r;
       }
       // Subsequent reads see the row as completed.
-      if (r) return { ...r, status: 'completed' as const, completedAt: new Date() };
+      if (r) {
+        const o = repositories.getObject(r.objectId)!;
+        repositories.seedSession(
+          { ...r, status: 'completed', completedAt: new Date() },
+          { ...o, status: 'uploaded', providerObjectKey: createFinalizedSourceKey(o) },
+        );
+        return repositories.getSession(r.id)!;
+      }
       return r;
     };
     repositories.failConditionalComplete = true;
@@ -377,16 +389,15 @@ describe('completeUploadHandler — defensive branches', () => {
     ).rejects.toThrow(/storage provider/i);
   });
 
-  test('markUploaded miss surfaces inconsistent-state envelope', async () => {
+  test('finalization CAS miss surfaces state-conflict envelope', async () => {
     const repositories = new FakeRepositories();
     const { session } = seedPending(repositories);
-    // After session is marked completed, delete the object so markUploaded fails.
-    // Wrap markUploaded with a stub that always returns null.
+    // Simulate losing the atomic session/object finalization compare-and-set.
     const handler = createCompleteUploadHandler({
       ...makeDeps({ repositories }),
-      objects: {
-        ...repositories.objects,
-        markUploaded: async () => null,
+      sessions: {
+        ...repositories.sessions,
+        finalizeIfPending: async () => null,
       },
     });
     await expect(
@@ -463,7 +474,9 @@ describe('XYN-SEC-002 — provider length reconciliation', () => {
       );
       expect(result.object.status).toBe('uploaded');
       expect(providers.adapter.calls.map((c) => c.method)).toEqual(
-        uploadMethod === 'multipart' ? ['completeMultipartUpload', 'headObject'] : ['headObject'],
+        uploadMethod === 'multipart'
+          ? ['completeMultipartUpload', 'headObject', 'copyObject', 'headObject', 'deleteObject']
+          : ['headObject', 'copyObject', 'headObject', 'deleteObject'],
       );
     });
   }
@@ -619,4 +632,50 @@ describe('XYN-SEC-002 — multipart completion recovery', () => {
     ).rejects.toBeInstanceOf(ProviderAdapterError);
     expect(providers.adapter.calls.map((c) => c.method)).toEqual(['completeMultipartUpload']);
   });
+});
+
+describe('SEC-001 + SEC-002 finalized source length', () => {
+  for (const actual of [4096, 4097]) {
+    test(`validates copied source length ${actual} before finalization`, async () => {
+      const repositories = new FakeRepositories();
+      const { session, object } = seedPending(repositories);
+      const providers = new FakeProviderResolver();
+      let candidate: string | undefined;
+      let enqueued = false;
+      providers.adapter.copyObjectImpl = async ({ destinationObjectKey }) => {
+        candidate = destinationObjectKey;
+      };
+      providers.adapter.headObjectImpl = async ({ objectKey }) => ({
+        objectKey,
+        contentLength: objectKey === candidate ? actual : 4096,
+        contentType: object.contentType,
+        etag: '"fixture"',
+        lastModified: new Date(),
+      });
+      const deps = {
+        ...makeDeps({ repositories, providers }),
+        enqueueProcessing: async () => {
+          enqueued = true;
+          return [];
+        },
+      };
+      const completed = createCompleteUploadHandler(deps)(
+        { operation: 'complete', uploadId: session.id },
+        makeUserCtx(),
+      );
+      if (actual === 4096) {
+        await expect(completed).resolves.toMatchObject({ object: { status: 'uploaded' } });
+        expect(repositories.getObject(object.id)?.providerObjectKey).toBe(candidate);
+      } else {
+        await expect(completed).rejects.toBeInstanceOf(ValidationError);
+        expect(repositories.getSession(session.id)?.status).toBe('aborted');
+        expect(repositories.getObject(object.id)?.status).toBe('pending_upload');
+        expect(providers.adapter.calls.filter((c) => c.method === 'deleteObject')).toEqual([]);
+      }
+      expect(enqueued).toBe(actual === 4096);
+      expect(
+        providers.adapter.calls.filter((c) => c.method === 'headObject').map((c) => c.opts),
+      ).toContainEqual({ objectKey: candidate });
+    });
+  }
 });

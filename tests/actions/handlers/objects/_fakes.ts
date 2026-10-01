@@ -104,7 +104,8 @@ export function makeObject(input: MakeObjectInput = {}): StorageObjectRecord {
     workspaceId,
     providerId: input.providerId ?? '00000000-0000-4000-8000-0000000000a0',
     providerObjectKey:
-      input.providerObjectKey ?? `workspaces/${workspaceId}/objects/${id}/file.bin`,
+      input.providerObjectKey ??
+      `workspaces/${workspaceId}/finalized/v1/${id}/00000000-0000-4000-8000-000000000099`,
     filename: input.filename ?? 'file.bin',
     contentType: input.contentType ?? 'application/octet-stream',
     byteSize: input.byteSize ?? 4096,
@@ -150,9 +151,23 @@ export function makeJob(input: {
   attempts?: number;
   errorCode?: string | null;
   required?: boolean;
+  scanSourceKey?: string | null;
+  scanProviderId?: string | null;
 }): StorageProcessingJobRecord {
   const now = new Date('2026-05-13T01:30:00.000Z');
   return {
+    scanSourceKey:
+      input.scanSourceKey === undefined &&
+      input.jobType === 'scan_validation' &&
+      input.status === 'succeeded'
+        ? `workspaces/${TEST_WORKSPACE_ID}/finalized/v1/${input.objectId}/00000000-0000-4000-8000-000000000099`
+        : input.scanSourceKey,
+    scanProviderId:
+      input.scanProviderId === undefined &&
+      input.jobType === 'scan_validation' &&
+      input.status === 'succeeded'
+        ? '00000000-0000-4000-8000-0000000000a0'
+        : input.scanProviderId,
     id: input.id ?? nextJobId(),
     objectId: input.objectId,
     jobType: input.jobType ?? 'image_optimize',

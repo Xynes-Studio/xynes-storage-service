@@ -63,6 +63,21 @@ before being added.
 
 ## Global Standards
 
+XYN-SEC-001 adds a patched native decoder gate and production image checks.
+See [`docs/native-image-security.md`](docs/native-image-security.md) for the
+Sharp version floor, Linux verification command, storage-only environment
+contract and Compose security overlay. Development/stub workflows are unchanged.
+SEC-001 includes immutable content binding from SEC-001-FU-1. Complete upload
+copies staging into a fresh server-only key and atomically binds the session and
+object via `finalizeIfPending`. Required scans persist the source key/provider;
+workers and downloads match that proof before proceeding. Legacy records fail
+closed and require re-upload plus a new scan. Run
+`bash scripts/verify-immutable-source.sh` for disposable provider/Postgres tests
+and coverage (Go, Docker and Bun required; no application DB/env is used).
+Consult [`docs/SECURITY-REMEDIATION-STATUS.md`](docs/SECURITY-REMEDIATION-STATUS.md)
+and [`docs/XYN-SEC-001-pr-handoff.md`](docs/XYN-SEC-001-pr-handoff.md) for rollout,
+legacy URL expiry and provider copy requirements. Merge does not approve deployment.
+
 - Runtime: **Bun** (matches the rest of the backend service tier).
 - Language: **TypeScript** with strict mode.
 - Web framework: **Hono**.

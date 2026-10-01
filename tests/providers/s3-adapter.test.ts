@@ -129,6 +129,56 @@ describe('S3StorageProviderAdapter — configuration', () => {
   });
 });
 
+describe('SEC-001-FU-1 provider snapshot', () => {
+  test.each(['r2', 'b2', 'idrive_e2', 'aws_s3', 'minio', 's3_generic'] as const)(
+    '%s uses same-bucket server copy with an encoded source and no tagging/ACL/KMS',
+    async (providerKind) => {
+      const { adapter, sentCommands } = makeAdapter(
+        { ...MINIO_CONFIG, providerKind },
+        { sendResult: { CopyObjectResult: { ETag: 'fixture-etag' } } },
+      );
+      await adapter.copyObject({
+        sourceObjectKey: 'workspaces/a/uploads/v1/a/file name+#.bin',
+        destinationObjectKey: 'workspaces/a/finalized/v1/a/fixture',
+      });
+      expect(sentCommands[0]).toEqual({
+        name: 'CopyObjectCommand',
+        input: {
+          Bucket: MINIO_CONFIG.bucket,
+          Key: 'workspaces/a/finalized/v1/a/fixture',
+          CopySource: `${MINIO_CONFIG.bucket}/workspaces/a/uploads/v1/a/file%20name%2B%23.bin`,
+          MetadataDirective: 'COPY',
+        },
+      });
+    },
+  );
+  test('a copy with missing result or SDK failure cannot be accepted', async () => {
+    for (const fake of [{ sendResult: {} }, { sendError: new Error('fixture provider detail') }]) {
+      const { adapter } = makeAdapter(MINIO_CONFIG, fake);
+      await expect(
+        adapter.copyObject({ sourceObjectKey: 'staging', destinationObjectKey: 'snapshot' }),
+      ).rejects.toThrow('Storage provider operation failed');
+    }
+  });
+  test('copy cannot target its source', async () => {
+    const { adapter } = makeAdapter(MINIO_CONFIG);
+    await expect(
+      adapter.copyObject({ sourceObjectKey: 'same', destinationObjectKey: 'same' }),
+    ).rejects.toThrow('Invalid snapshot destination');
+  });
+  test('single and multipart upload APIs cannot mint finalized-key write capabilities', async () => {
+    const { adapter, sentCommands } = makeAdapter(MINIO_CONFIG);
+    const objectKey = 'workspaces/a/finalized/v1/b/c';
+    await expect(adapter.createSingleUploadUrl({ objectKey })).rejects.toThrow(
+      'Invalid upload destination',
+    );
+    await expect(adapter.createMultipartUpload({ objectKey })).rejects.toThrow(
+      'Invalid upload destination',
+    );
+    expect(sentCommands).toHaveLength(0);
+  });
+});
+
 describe('S3StorageProviderAdapter — createSingleUploadUrl', () => {
   test('issues a PUT command with expected key + bucket + content type', async () => {
     const capture = { commands: [] as CapturedCommand[], expiries: [] as number[] };

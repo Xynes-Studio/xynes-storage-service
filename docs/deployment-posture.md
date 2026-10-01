@@ -38,7 +38,26 @@ The MVP target is a single VPS with Docker Compose (per `xynes/xynes-infra/infra
 
 ### Sharp (FU-A — already landed)
 
-Bundled via `sharp@^0.34.5` in the storage-service `package.json`. The OCI `oven/bun:1` base image ships glibc; sharp's npm package includes a pre-built libvips for linux-x64-glibc. No Dockerfile change was needed for FU-A.
+Bundled via pinned `sharp@0.35.5`. XYN-SEC-001 requires loaded Sharp ≥0.35.5,
+libheif ≥1.23.5 and libvips ≥8.18.7 before decoding. Linux production dependencies
+are installed inside the image and checked during its build. The production
+image copies runtime files only and runs as `bun`. Apply `compose.security.yml`
+last to remove development bind mounts/shared env injection and enforce the
+read-only filesystem and resource limits. See [native image security](native-image-security.md)
+for the release verification command, storage-only env contract and limitations.
+All native processing and signed downloads require persisted successful required
+scan validation. Pending scans defer processing; failed or unavailable scan
+evidence prevents decoding and delivery, including across worker instances.
+Scan proof must also match a finalized source key/provider. Upload completion
+requires same-bucket `CopyObject` permission and private buckets. New client upload
+capabilities address staging; no client upload API may address finalized keys.
+Legacy objects/scan rows fail closed. Before rollout, revoke/expire existing GET
+capabilities and re-upload/rescan legacy content as required; do not backfill proof.
+Apply staging expiry after the maximum upload lifetime; finalized snapshots must
+never have blanket expiry or be rewritten. See [native image security](native-image-security.md#legacy-rollout-and-retention),
+[current status](SECURITY-REMEDIATION-STATUS.md) and
+[PR/release handoff](XYN-SEC-001-pr-handoff.md). SEC-001-FU-1 implementation and
+isolated-provider/DB verification are complete; deployment remains separately authorized.
 
 - **Constructor cost:** ~50 ms first call (lazy-loaded per PR #15 Codex P1 fix); ~0 ms thereafter.
 - **Memory:** sharp's pixel cache is **disabled** at module load via `sharp.cache(false)` — no cross-tenant pixel residue. Per-call working set is bounded by the image dimensions (≤ 16k × 16k via `MAX_IMAGE_DIMENSION` re-check).

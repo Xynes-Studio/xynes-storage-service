@@ -25,7 +25,14 @@ import { dirname, join } from 'node:path';
 
 const FIXTURES_DIR = join(dirname(new URL(import.meta.url).pathname), 'fixtures');
 
-export type FixtureName = 'sample.jpg' | 'sample.png' | 'sample.mp4' | 'sample.pdf' | 'eicar.txt';
+export type FixtureName =
+  | 'sample.jpg'
+  | 'sample.png'
+  | 'sample.avif'
+  | 'sample.heic'
+  | 'sample.mp4'
+  | 'sample.pdf'
+  | 'eicar.txt';
 
 /**
  * Read a committed binary fixture into a `Uint8Array`.

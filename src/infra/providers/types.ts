@@ -175,6 +175,12 @@ export interface DeleteObjectOptions {
   readonly objectKey: string;
 }
 
+/** Atomic same-bucket snapshot. Destination must be fresh and server-controlled. */
+export interface CopyObjectOptions {
+  readonly sourceObjectKey: string;
+  readonly destinationObjectKey: string;
+}
+
 /** STORAGE-FU-5: server-side read of object bytes. Used by runners. */
 export interface GetObjectBytesOptions {
   readonly objectKey: string;
@@ -218,6 +224,7 @@ export interface StorageProviderAdapter {
   headObject(opts: HeadObjectOptions): Promise<HeadObjectResult>;
   createDownloadUrl(opts: CreateDownloadUrlOptions): Promise<DownloadUrl>;
   deleteObject(opts: DeleteObjectOptions): Promise<void>;
+  copyObject(opts: CopyObjectOptions): Promise<void>;
   /**
    * STORAGE-FU-5: server-side object read for processing runners.
    * Returns the raw bytes. Errors are wrapped as `ProviderAdapterError`

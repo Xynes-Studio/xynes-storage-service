@@ -152,7 +152,7 @@ export function createCreateUploadHandler(deps: UploadHandlerDependencies) {
       workspaceId: ctx.workspaceId,
       objectId,
       filename: input.filename,
-    });
+    }).replace('/objects/', '/uploads/v1/');
 
     const purpose = input.purpose ?? DEFAULT_UPLOAD_PURPOSE;
     const visibility = input.visibility ?? 'private';

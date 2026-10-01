@@ -458,11 +458,10 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
         // STORAGE-FU-2-FU-2: `payload` is now a real column. The
         // queue repo projects it straight onto `ClaimedJob.payload`
         // so STORAGE-8 runners see what the planner emitted. The
-        // Drizzle `jsonb()` column round-trips through the `unknown`
-        // type, so we cast back to the documented record shape.
+        // Drizzle's schema mirror already types the JSONB record.
         // Per-jobType payload validators in `payload-schemas.ts` keep
         // hostile keys out on the INSERT side.
-        payload: (row.payload ?? {}) as Readonly<Record<string, unknown>>,
+        payload: row.payload ?? {},
         attempts: row.attempts,
         // `maxAttempts` is enforced at the worker level; the field is
         // informational on the claim. The worker overrides via
@@ -475,11 +474,17 @@ export class PostgresProcessingJobQueueRepository implements ProcessingJobQueueR
   async markSucceeded(input: {
     jobId: string;
     now: Date;
+    scanSource?: { key: string; providerId: string };
   }): Promise<StorageProcessingJobRecord | null> {
     const updated = await this.db
       .update(storageProcessingJobs)
       .set({
         status: 'succeeded',
+        ...(input.scanSource
+          ? {
+              payload: sql`${storageProcessingJobs.payload} || ${JSON.stringify({ scanSourceKey: input.scanSource.key, scanProviderId: input.scanSource.providerId })}::jsonb`,
+            }
+          : {}),
         finishedAt: input.now,
         // Clear any stale `errorCode` from a prior failed attempt so a
         // retried-and-succeeded job does not surface a stale failure

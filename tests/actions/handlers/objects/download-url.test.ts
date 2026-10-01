@@ -15,16 +15,36 @@
 import { describe, expect, test } from 'bun:test';
 import { ForbiddenError, ValidationError } from '../../../../src/actions/errors';
 import { createDownloadUrlHandler } from '../../../../src/actions/handlers/objects/download-url';
-import type { ProviderKind } from '../../../../src/infra/providers/types';
 import {
   ExtendedFakeObjectRepository,
   ExtendedFakeProviderResolver,
   FakeStorageAdapter,
   OTHER_WORKSPACE_ID,
   makeObject,
+  makeJob,
   makeObjectsDeps,
   makeUserCtx,
 } from './_fakes';
+
+// Existing download-contract tests explicitly seed successful scan evidence.
+// Quarantine negatives use their own unscanned fixtures in download-scan-gate.test.ts.
+function makeScannedObjectsDeps(overrides: Parameters<typeof makeObjectsDeps>[0] = {}) {
+  const deps = makeObjectsDeps(overrides);
+  for (const object of deps.objects.objects.values()) {
+    deps.jobs.seed(
+      object.id,
+      makeJob({
+        objectId: object.id,
+        jobType: 'scan_validation',
+        required: true,
+        status: 'succeeded',
+        scanSourceKey: object.providerObjectKey,
+        scanProviderId: object.providerId,
+      }),
+    );
+  }
+  return deps;
+}
 
 const FORBIDDEN = [
   'provider_kind',
@@ -51,7 +71,7 @@ describe('downloadUrlHandler — happy paths', () => {
       const obj = makeObject({ status });
       objects.seed(obj);
       const providers = new ExtendedFakeProviderResolver({ providerId: obj.providerId });
-      const res = await createDownloadUrlHandler(makeObjectsDeps({ objects, providers }))(
+      const res = await createDownloadUrlHandler(makeScannedObjectsDeps({ objects, providers }))(
         { operation: 'download_url', objectId: obj.id },
         makeUserCtx(),
       );
@@ -68,12 +88,12 @@ describe('downloadUrlHandler — happy paths', () => {
     const obj = makeObject({ status: 'ready' });
     objects.seed(obj);
     const providers = new ExtendedFakeProviderResolver({ providerId: obj.providerId });
-    await createDownloadUrlHandler(makeObjectsDeps({ objects, providers }))(
+    await createDownloadUrlHandler(makeScannedObjectsDeps({ objects, providers }))(
       { operation: 'download_url', objectId: obj.id, expiresInSeconds: 600 },
       makeUserCtx(),
     );
     const call = providers.adapter.calls.find((c) => c.method === 'createDownloadUrl');
-    expect((call?.opts as { expiresInSeconds?: number }).expiresInSeconds).toBe(600);
+    expect(call?.opts).toMatchObject({ expiresInSeconds: 600 });
   });
 
   test('passes downloadFilename through to the adapter', async () => {
@@ -81,12 +101,12 @@ describe('downloadUrlHandler — happy paths', () => {
     const obj = makeObject({ status: 'ready' });
     objects.seed(obj);
     const providers = new ExtendedFakeProviderResolver({ providerId: obj.providerId });
-    await createDownloadUrlHandler(makeObjectsDeps({ objects, providers }))(
+    await createDownloadUrlHandler(makeScannedObjectsDeps({ objects, providers }))(
       { operation: 'download_url', objectId: obj.id, downloadFilename: 'invoice.pdf' },
       makeUserCtx(),
     );
     const call = providers.adapter.calls.find((c) => c.method === 'createDownloadUrl');
-    expect((call?.opts as { downloadFilename?: string }).downloadFilename).toBe('invoice.pdf');
+    expect(call?.opts).toMatchObject({ downloadFilename: 'invoice.pdf' });
   });
 
   test('uses defaultDownloadTtlSeconds when caller omits TTL', async () => {
@@ -95,10 +115,10 @@ describe('downloadUrlHandler — happy paths', () => {
     objects.seed(obj);
     const providers = new ExtendedFakeProviderResolver({ providerId: obj.providerId });
     await createDownloadUrlHandler(
-      makeObjectsDeps({ objects, providers, defaultDownloadTtlSeconds: 333 }),
+      makeScannedObjectsDeps({ objects, providers, defaultDownloadTtlSeconds: 333 }),
     )({ operation: 'download_url', objectId: obj.id }, makeUserCtx());
     const call = providers.adapter.calls.find((c) => c.method === 'createDownloadUrl');
-    expect((call?.opts as { expiresInSeconds?: number }).expiresInSeconds).toBe(333);
+    expect(call?.opts).toMatchObject({ expiresInSeconds: 333 });
   });
 
   test('response is exactly {objectId, url, expiresAt} — no extra keys', async () => {
@@ -106,7 +126,7 @@ describe('downloadUrlHandler — happy paths', () => {
     const obj = makeObject({ status: 'ready' });
     objects.seed(obj);
     const providers = new ExtendedFakeProviderResolver({ providerId: obj.providerId });
-    const res = await createDownloadUrlHandler(makeObjectsDeps({ objects, providers }))(
+    const res = await createDownloadUrlHandler(makeScannedObjectsDeps({ objects, providers }))(
       { operation: 'download_url', objectId: obj.id },
       makeUserCtx(),
     );
@@ -117,7 +137,7 @@ describe('downloadUrlHandler — happy paths', () => {
 describe('downloadUrlHandler — not-found paths', () => {
   test('unknown object', async () => {
     await expect(
-      createDownloadUrlHandler(makeObjectsDeps())(
+      createDownloadUrlHandler(makeScannedObjectsDeps())(
         {
           operation: 'download_url',
           objectId: '00000000-0000-4000-8000-aaaaaaaaaaaa',
@@ -132,7 +152,7 @@ describe('downloadUrlHandler — not-found paths', () => {
     const foreign = makeObject({ workspaceId: OTHER_WORKSPACE_ID, status: 'ready' });
     objects.seed(foreign);
     await expect(
-      createDownloadUrlHandler(makeObjectsDeps({ objects }))(
+      createDownloadUrlHandler(makeScannedObjectsDeps({ objects }))(
         { operation: 'download_url', objectId: foreign.id },
         makeUserCtx(),
       ),
@@ -144,7 +164,7 @@ describe('downloadUrlHandler — not-found paths', () => {
     const o = makeObject({ status: 'deleted' });
     objects.seed(o);
     await expect(
-      createDownloadUrlHandler(makeObjectsDeps({ objects }))(
+      createDownloadUrlHandler(makeScannedObjectsDeps({ objects }))(
         { operation: 'download_url', objectId: o.id },
         makeUserCtx(),
       ),
@@ -156,7 +176,7 @@ describe('downloadUrlHandler — not-found paths', () => {
     const o = makeObject({ status: 'pending_upload' });
     objects.seed(o);
     await expect(
-      createDownloadUrlHandler(makeObjectsDeps({ objects }))(
+      createDownloadUrlHandler(makeScannedObjectsDeps({ objects }))(
         { operation: 'download_url', objectId: o.id },
         makeUserCtx(),
       ),
@@ -177,19 +197,20 @@ describe('downloadUrlHandler — provider resolution', () => {
     });
     providers.unavailableProviderIds.add(obj.providerId);
     await expect(
-      createDownloadUrlHandler(makeObjectsDeps({ objects, providers }))(
+      createDownloadUrlHandler(makeScannedObjectsDeps({ objects, providers }))(
         { operation: 'download_url', objectId: obj.id },
         makeUserCtx(),
       ),
     ).rejects.toBeInstanceOf(ForbiddenError);
     // Sanity: message MUST NOT leak provider config.
     try {
-      await createDownloadUrlHandler(makeObjectsDeps({ objects, providers }))(
+      await createDownloadUrlHandler(makeScannedObjectsDeps({ objects, providers }))(
         { operation: 'download_url', objectId: obj.id },
         makeUserCtx(),
       );
     } catch (e) {
-      const msg = (e as Error).message;
+      if (!(e instanceof Error)) throw e;
+      const msg = e.message;
       for (const f of FORBIDDEN) expect(msg).not.toContain(f);
       expect(msg).not.toMatch(/[A-Fa-f0-9]{16,}/); // no long hex (no provider id leak).
     }
@@ -200,7 +221,7 @@ describe('downloadUrlHandler — provider resolution', () => {
     const obj = makeObject({ status: 'ready' });
     objects.seed(obj);
     const providers = new ExtendedFakeProviderResolver({ providerId: obj.providerId });
-    await createDownloadUrlHandler(makeObjectsDeps({ objects, providers }))(
+    await createDownloadUrlHandler(makeScannedObjectsDeps({ objects, providers }))(
       { operation: 'download_url', objectId: obj.id },
       makeUserCtx(),
     );
@@ -210,7 +231,7 @@ describe('downloadUrlHandler — provider resolution', () => {
 });
 
 describe('downloadUrlHandler — response shape redaction across providers', () => {
-  for (const kind of ['r2', 'b2', 'idrive_e2', 'aws_s3', 'minio'] as ProviderKind[]) {
+  for (const kind of ['r2', 'b2', 'idrive_e2', 'aws_s3', 'minio'] as const) {
     test(`provider=${kind}: response has no per-provider field`, async () => {
       const adapter = new FakeStorageAdapter(kind);
       const providers = new ExtendedFakeProviderResolver({
@@ -220,11 +241,10 @@ describe('downloadUrlHandler — response shape redaction across providers', () 
       const objects = new ExtendedFakeObjectRepository();
       const obj = makeObject({
         status: 'ready',
-        providerObjectKey: 'workspaces/x/objects/y/leak.bin',
         providerId: providers.providerId,
       });
       objects.seed(obj);
-      const res = await createDownloadUrlHandler(makeObjectsDeps({ objects, providers }))(
+      const res = await createDownloadUrlHandler(makeScannedObjectsDeps({ objects, providers }))(
         { operation: 'download_url', objectId: obj.id },
         makeUserCtx(),
       );
@@ -236,7 +256,7 @@ describe('downloadUrlHandler — response shape redaction across providers', () 
 describe('downloadUrlHandler — validation', () => {
   test('rejects malformed objectId', async () => {
     await expect(
-      createDownloadUrlHandler(makeObjectsDeps())(
+      createDownloadUrlHandler(makeScannedObjectsDeps())(
         { operation: 'download_url', objectId: 'nope' },
         makeUserCtx(),
       ),
@@ -248,7 +268,7 @@ describe('downloadUrlHandler — validation', () => {
     const obj = makeObject({ status: 'ready' });
     objects.seed(obj);
     await expect(
-      createDownloadUrlHandler(makeObjectsDeps({ objects }))(
+      createDownloadUrlHandler(makeScannedObjectsDeps({ objects }))(
         {
           operation: 'download_url',
           objectId: obj.id,

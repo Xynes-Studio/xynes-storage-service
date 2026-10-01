@@ -14,9 +14,15 @@ import {
 
 /** Loopback S3 protocol fixture: real SDK HTTP, no hosted provider or database. */
 describe('XYN-SEC-002 — SDK multipart/HEAD/GET integration', () => {
-  for (const actual of [3, 4, 5]) {
-    test(`multipart declared=4 actual=${actual}: reconciles before enqueue`, async () => {
-      let stored = new Uint8Array(0);
+  for (const [actual, copied] of [
+    [3, 3],
+    [4, 4],
+    [5, 5],
+    [4, 5],
+  ] as const) {
+    test(`multipart declared=4 actual=${actual} copied=${copied}: reconciles before enqueue`, async () => {
+      const stored = new Map<string, Uint8Array>();
+      const heads: string[] = [];
       const methods: string[] = [];
       const server = Bun.serve({
         hostname: '127.0.0.1',
@@ -31,8 +37,15 @@ describe('XYN-SEC-002 — SDK multipart/HEAD/GET integration', () => {
               '<InitiateMultipartUploadResult><Bucket>fixture</Bucket><Key>fixture</Key><UploadId>fixture-upload</UploadId></InitiateMultipartUploadResult>',
             );
           }
+          if (request.method === 'PUT' && request.headers.has('x-amz-copy-source')) {
+            const source = '/' + decodeURIComponent(request.headers.get('x-amz-copy-source')!);
+            // Harmless replay between staging HEAD and copy: change 4 bytes to 5.
+            if (copied !== actual) stored.set(source, new Uint8Array(copied));
+            stored.set(url.pathname, stored.get(source)!.slice());
+            return xml('<CopyObjectResult><ETag>"fixture-etag"</ETag></CopyObjectResult>');
+          }
           if (request.method === 'PUT') {
-            stored = new Uint8Array(await request.arrayBuffer());
+            stored.set(url.pathname, new Uint8Array(await request.arrayBuffer()));
             return new Response(null, { headers: { etag: '"fixture-etag"' } });
           }
           if (request.method === 'POST') {
@@ -42,13 +55,20 @@ describe('XYN-SEC-002 — SDK multipart/HEAD/GET integration', () => {
             );
           }
           if (request.method === 'HEAD') {
-            return new Response(null, { headers: { 'content-length': String(stored.byteLength) } });
+            heads.push(url.pathname);
+            return new Response(null, {
+              headers: { 'content-length': String(stored.get(url.pathname)?.byteLength ?? 0) },
+            });
+          }
+          if (request.method === 'DELETE') {
+            stored.delete(url.pathname);
+            return new Response(null, { status: 204 });
           }
           // Chunked GET intentionally omits length, testing actual-byte counting.
           return new Response(
             new ReadableStream<Uint8Array>({
               start(controller) {
-                controller.enqueue(stored);
+                controller.enqueue(stored.get(url.pathname)!);
                 controller.close();
               },
             }),
@@ -107,9 +127,13 @@ describe('XYN-SEC-002 — SDK multipart/HEAD/GET integration', () => {
           },
           context,
         );
-        if (actual !== 4) {
+        if (actual !== 4 || copied !== 4) {
           await expect(completed).rejects.toBeInstanceOf(ValidationError);
           expect(enqueued).toBe(false);
+          if (copied !== actual) {
+            expect(heads.at(-1)).toContain('/finalized/v1/');
+            expect(repositories.getObject(created.objectId)?.status).toBe('pending_upload');
+          }
           expect(
             (
               await repositories.sessions.findByIdForWorkspace({
@@ -139,7 +163,8 @@ describe('XYN-SEC-002 — SDK multipart/HEAD/GET integration', () => {
             ).byteLength,
           ).toBe(4);
           // A replaced object must not bypass the worker's streaming guard.
-          stored = new Uint8Array(5);
+          expect(heads.at(-1)).toBe(`/fixture/${object.providerObjectKey}`);
+          stored.set(`/fixture/${object.providerObjectKey}`, new Uint8Array(5));
           let probed = false;
           const processor = new FakeImageProcessor();
           processor.probe = async () => {
