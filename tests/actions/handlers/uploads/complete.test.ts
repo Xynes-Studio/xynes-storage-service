@@ -14,6 +14,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { createCompleteUploadHandler } from '../../../../src/actions/handlers/uploads/complete';
+import { createFinalizedSourceKey } from '../../../../src/actions/handlers/uploads/finalized-source';
 import { ValidationError } from '../../../../src/actions/errors';
 import type {
   StorageObjectRecord,
@@ -201,7 +202,11 @@ describe('completeUploadHandler — state transitions', () => {
   test('idempotent on already-completed session', async () => {
     const repositories = new FakeRepositories();
     const { session } = seedPending(repositories);
-    repositories.setSessionStatus(session.id, 'completed');
+    const object = repositories.getObject(session.objectId)!;
+    repositories.seedSession(
+      { ...session, status: 'completed', completedAt: new Date() },
+      { ...object, status: 'uploaded', providerObjectKey: createFinalizedSourceKey(object) },
+    );
     const deps = makeDeps({ repositories });
     const handler = createCompleteUploadHandler(deps);
     const res = await handler({ operation: 'complete', uploadId: session.id }, makeUserCtx());
@@ -283,7 +288,14 @@ describe('completeUploadHandler — race-loss path', () => {
         return r;
       }
       // Subsequent reads see the row as completed.
-      if (r) return { ...r, status: 'completed' as const, completedAt: new Date() };
+      if (r) {
+        const o = repositories.getObject(r.objectId)!;
+        repositories.seedSession(
+          { ...r, status: 'completed', completedAt: new Date() },
+          { ...o, status: 'uploaded', providerObjectKey: createFinalizedSourceKey(o) },
+        );
+        return repositories.getSession(r.id)!;
+      }
       return r;
     };
     repositories.failConditionalComplete = true;
@@ -376,16 +388,15 @@ describe('completeUploadHandler — defensive branches', () => {
     ).rejects.toThrow(/storage provider/i);
   });
 
-  test('markUploaded miss surfaces inconsistent-state envelope', async () => {
+  test('finalization CAS miss surfaces state-conflict envelope', async () => {
     const repositories = new FakeRepositories();
     const { session } = seedPending(repositories);
-    // After session is marked completed, delete the object so markUploaded fails.
-    // Wrap markUploaded with a stub that always returns null.
+    // Simulate losing the atomic session/object finalization compare-and-set.
     const handler = createCompleteUploadHandler({
       ...makeDeps({ repositories }),
-      objects: {
-        ...repositories.objects,
-        markUploaded: async () => null,
+      sessions: {
+        ...repositories.sessions,
+        finalizeIfPending: async () => null,
       },
     });
     await expect(

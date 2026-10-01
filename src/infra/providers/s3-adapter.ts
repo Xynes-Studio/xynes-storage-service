@@ -19,6 +19,7 @@
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
+  CopyObjectCommand,
   CreateMultipartUploadCommand,
   DeleteObjectCommand,
   GetObjectCommand,
@@ -35,6 +36,7 @@ import {
   type AbortMultipartUploadOptions,
   type CompleteMultipartUploadOptions,
   type CompleteMultipartUploadResult,
+  type CopyObjectOptions,
   type CreateDownloadUrlOptions,
   type CreateMultipartUploadOptions,
   type CreateSingleUploadUrlOptions,
@@ -193,6 +195,7 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
 
   async createSingleUploadUrl(opts: CreateSingleUploadUrlOptions): Promise<SingleUploadUrl> {
     validateObjectKey(opts.objectKey);
+    refuseFinalizedUpload(opts.objectKey);
     const expiresIn = opts.expiresInSeconds ?? DEFAULT_PRESIGN_EXPIRY_SECONDS;
     validateExpiry(expiresIn);
 
@@ -230,6 +233,7 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
 
   async createMultipartUpload(opts: CreateMultipartUploadOptions): Promise<MultipartUploadHandle> {
     validateObjectKey(opts.objectKey);
+    refuseFinalizedUpload(opts.objectKey);
 
     const command = new CreateMultipartUploadCommand({
       Bucket: this.bucket,
@@ -407,6 +411,25 @@ export class S3StorageProviderAdapter implements StorageProviderAdapter {
 
   // ── STORAGE-FU-5: server-side I/O for processing runners ─────────────────
 
+  async copyObject(opts: CopyObjectOptions): Promise<void> {
+    validateObjectKey(opts.sourceObjectKey);
+    validateObjectKey(opts.destinationObjectKey);
+    if (opts.sourceObjectKey === opts.destinationObjectKey) {
+      throw new ProviderAdapterError('PROVIDER_CONFIG_INVALID', 'Invalid snapshot destination');
+    }
+    const command = new CopyObjectCommand({
+      Bucket: this.bucket,
+      Key: opts.destinationObjectKey,
+      CopySource: `${encodeURIComponent(this.bucket)}/${opts.sourceObjectKey.split('/').map(encodeURIComponent).join('/')}`,
+      MetadataDirective: 'COPY',
+      // No tagging, ACL or KMS dependency. The upload API cannot sign this key.
+    });
+    await runWithRedactedError(async () => {
+      const result = await this.client.send(command);
+      if (!result.CopyObjectResult?.ETag) throw new Error('Snapshot copy incomplete');
+    });
+  }
+
   async getObjectBytes(opts: GetObjectBytesOptions): Promise<Uint8Array> {
     validateObjectKey(opts.objectKey);
     const command = new GetObjectCommand({
@@ -489,4 +512,10 @@ async function readSdkStreamAsBytes(body: unknown): Promise<Uint8Array> {
     'PROVIDER_OPERATION_FAILED',
     'Storage provider returned an unsupported response body shape',
   );
+}
+
+function refuseFinalizedUpload(key: string): void {
+  if (/^workspaces\/[^/]+\/finalized\//.test(key)) {
+    throw new ProviderAdapterError('PROVIDER_CONFIG_INVALID', 'Invalid upload destination');
+  }
 }

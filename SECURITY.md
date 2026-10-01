@@ -22,6 +22,14 @@ When reporting, please include:
 - Affected versions, commits, or branches if known.
 - Whether the vulnerability has been disclosed elsewhere.
 
+## Active remediation status
+
+SEC-001 native-runtime and immutable scan/content binding implementation is
+recorded in [`docs/SECURITY-REMEDIATION-STATUS.md`](docs/SECURITY-REMEDIATION-STATUS.md).
+SEC-001-FU-1 is implemented and validated in the same PR. Production rollout still
+requires legacy URL revocation/expiry and target-environment acceptance. Follow
+the private reporting rules above when registering security work externally.
+
 ## Scope
 
 This policy covers `xynes-storage-service` specifically. Issues in

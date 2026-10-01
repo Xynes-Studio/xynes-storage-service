@@ -69,7 +69,8 @@
  * MVP only emit lossy formats. We keep the PNG branch in the
  * content-type lookup for future-proofing.
  */
-import sharp from 'sharp';
+import sharp, { type Metadata, type OutputInfo, type Sharp } from 'sharp';
+import { assertSafeNativeImageRuntime } from './native-image-runtime';
 import {
   RunnerExecutionError,
   RunnerInputError,
@@ -87,6 +88,9 @@ import {
 // Module-load side effect: disable libvips' process-wide pixel cache.
 // See security invariant 3 above. This MUST happen exactly once at
 // module load; sharp.cache() is global state.
+// Checked before any metadata/pixel decode. The lazy loader catches failure
+// and selects the existing safe-fail stub; stub mode never imports this module.
+assertSafeNativeImageRuntime(sharp.versions);
 sharp.cache(false);
 
 const CONTENT_TYPE_BY_FORMAT: Readonly<Record<ImageVariantRender['format'], string>> =
@@ -124,7 +128,7 @@ function resolveOutputFormat(spec: ImageVariantSpec): ImageVariantRender['format
  */
 export class SharpImageProcessor implements ImageProcessor {
   async probe(input: { bytes: Uint8Array }): Promise<ImageProbeResult> {
-    let metadata: sharp.Metadata;
+    let metadata: Metadata;
     try {
       metadata = await sharp(Buffer.from(input.bytes)).metadata();
     } catch {
@@ -158,7 +162,7 @@ export class SharpImageProcessor implements ImageProcessor {
   }): Promise<ImageVariantRender> {
     // Pre-decode metadata so we can re-validate the dimension cap
     // BEFORE the (potentially expensive) re-encode.
-    let metadata: sharp.Metadata;
+    let metadata: Metadata;
     try {
       metadata = await sharp(Buffer.from(input.bytes)).metadata();
     } catch {
@@ -179,7 +183,7 @@ export class SharpImageProcessor implements ImageProcessor {
     const outputFormat = resolveOutputFormat(input.spec);
 
     let outBuf: Buffer;
-    let outInfo: sharp.OutputInfo;
+    let outInfo: OutputInfo;
     try {
       // Use a fresh sharp pipeline per call. `.rotate()` normalises
       // EXIF orientation BEFORE we strip metadata so a portrait photo
@@ -229,7 +233,7 @@ export class SharpImageProcessor implements ImageProcessor {
  * the GPS tag IDs and the magic header `Exif\0\0`. A best-effort signal
  * is enough; the contract only promises a `hasGpsExif?: boolean`.
  */
-function detectGpsExif(metadata: sharp.Metadata): boolean {
+function detectGpsExif(metadata: Metadata): boolean {
   if (!metadata.exif || metadata.exif.length === 0) return false;
   // Heuristic: the EXIF buffer usually contains "GPSInfo" or the
   // GPS tag bytes (0x88, 0x25 — IFD pointer to GPS sub-IFD: 0x8825).
@@ -251,10 +255,10 @@ function detectGpsExif(metadata: sharp.Metadata): boolean {
  * malformed downstream caller could still pass an out-of-range value).
  */
 async function encodeForFormat(
-  pipeline: sharp.Sharp,
+  pipeline: Sharp,
   format: ImageVariantRender['format'],
   rawQuality: number,
-): Promise<{ data: Buffer; info: sharp.OutputInfo }> {
+): Promise<{ data: Buffer; info: OutputInfo }> {
   const quality = Math.max(1, Math.min(100, Math.round(rawQuality)));
   switch (format) {
     case 'avif':

@@ -34,6 +34,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { __forTesting__ } from '../../../src/infra/processors/runner-dependencies';
 import { ProductionImageProcessorStub } from '../../../src/infra/processors/production-processors';
 import { SharpImageProcessor } from '../../../src/infra/processors/sharp-image-processor';
+import { assertSafeNativeImageRuntime } from '../../../src/infra/processors/native-image-runtime';
 
 // Capture WARN output for assertion.
 let warnSpy: ReturnType<typeof spyOn>;
@@ -47,6 +48,16 @@ afterEach(() => {
 });
 
 describe('STORAGE-FU-5-FU-A — sharp unavailable fallback (PR #15 Codex P1)', () => {
+  test('XYN-SEC-001: a vulnerable native runtime selects the non-decoding fallback', async () => {
+    const result = __forTesting__.buildLiveImageProcessor(() => {
+      assertSafeNativeImageRuntime({ sharp: '0.34.5', heif: '1.20.2', vips: '8.17.3' });
+      return SharpImageProcessor;
+    });
+    expect(result).toBeInstanceOf(ProductionImageProcessorStub);
+    await expect(result.probe({ bytes: new Uint8Array([1, 2, 3]) })).rejects.toThrow(
+      'UNSUPPORTED_FORMAT',
+    );
+  });
   test('default loader returns the real SharpImageProcessor (live mode happy path)', () => {
     const result = __forTesting__.buildLiveImageProcessor();
     expect(result).toBeInstanceOf(SharpImageProcessor);
@@ -120,7 +131,8 @@ describe('STORAGE-FU-5-FU-A — sharp unavailable fallback (PR #15 Codex P1)', (
       threw = true;
       // The closed-set code reaches us — the inner library text does
       // not.
-      expect((err as Error).message).toBe('UNSUPPORTED_FORMAT');
+      if (!(err instanceof Error)) throw err;
+      expect(err.message).toBe('UNSUPPORTED_FORMAT');
     }
     expect(threw).toBe(true);
   });

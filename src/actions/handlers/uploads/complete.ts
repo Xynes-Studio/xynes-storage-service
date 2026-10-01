@@ -14,10 +14,11 @@
  *   3. Lookup associated object — defensive (the FK guarantees it exists).
  *   4. For multipart sessions: call provider `completeMultipartUpload(parts)`.
  *      For single sessions: HEAD the object to validate the upload landed.
- *   5. Atomically mark the session `completed` and the object `uploaded`.
+ *   5. Copy staging to a fresh, server-only source key.
+ *   6. Atomically bind that key and mark session `completed` / object `uploaded`.
  *      If the conditional update misses (concurrent abort), surface a
  *      state conflict.
- *   6. STORAGE-7 will queue async processing jobs here. For STORAGE-5 we
+ *   7. STORAGE-7 will queue async processing jobs here. For STORAGE-5 we
  *      return an empty `processingJobs` array.
  */
 import { ProviderAdapterError } from '../../../infra/providers/errors';
@@ -27,6 +28,7 @@ import { toPublicObject, toPublicSession } from './responses';
 import type { CompleteUploadSessionResponse } from './responses';
 import { completeUploadPayloadSchema, type CompleteUploadPayload } from './schemas';
 import type { UploadHandlerDependencies } from './types';
+import { createFinalizedSourceKey, isFinalizedSource } from './finalized-source';
 
 export function createCompleteUploadHandler(deps: UploadHandlerDependencies) {
   const now = deps.now ?? (() => new Date());
@@ -55,7 +57,7 @@ export function createCompleteUploadHandler(deps: UploadHandlerDependencies) {
         objectId: session.objectId,
         workspaceId: ctx.workspaceId,
       });
-      if (!object) {
+      if (!object || !isFinalizedSource(object)) {
         // FK invariant violated — surface as a state conflict.
         throw new ValidationError('Upload session is in an inconsistent state');
       }
@@ -86,6 +88,9 @@ export function createCompleteUploadHandler(deps: UploadHandlerDependencies) {
     if (!object) {
       throw new ValidationError('Upload session is in an inconsistent state');
     }
+    if (object.status !== 'pending_upload' || isFinalizedSource(object)) {
+      throw new ValidationError('Upload session is in an inconsistent state');
+    }
 
     const provider = await deps.providers.resolveDefaultForWorkspace(ctx.workspaceId);
     if (!provider) {
@@ -93,40 +98,93 @@ export function createCompleteUploadHandler(deps: UploadHandlerDependencies) {
         'Workspace has no storage provider configured. Contact a workspace admin.',
       );
     }
-
-    // Multipart: complete on the provider with the supplied part list.
-    if (session.uploadMethod === 'multipart') {
-      if (!session.providerUploadId) {
-        throw new ValidationError('Upload session is in an inconsistent state');
-      }
-      if (!input.parts || input.parts.length === 0) {
-        throw new ValidationError('Multipart complete requires `parts`');
-      }
-      await provider.adapter.completeMultipartUpload({
-        objectKey: object.providerObjectKey,
-        providerUploadId: session.providerUploadId,
-        parts: input.parts,
-      });
-    } else {
-      // Single upload: validate landing via HEAD. We DO NOT trust the
-      // caller's claim that they uploaded; HEAD is the strongest evidence
-      // we can collect without scanning content.
-      const head = await provider.adapter.headObject({
-        objectKey: object.providerObjectKey,
-      });
-      if (head.contentLength === 0) {
-        // Most providers return 404 (not 0-byte). Defensive guard.
-        throw new ValidationError('Uploaded object is empty');
-      }
+    if (provider.providerId !== object.providerId) {
+      throw new ValidationError('Upload session is in an inconsistent state');
     }
 
-    // Atomic state transition: pending -> completed, AND object pending_upload -> uploaded.
-    const updatedSession = await deps.sessions.markCompletedIfPending({
+    const finalizedObjectKey = createFinalizedSourceKey(object);
+    try {
+      // Multipart: complete on the provider with the supplied part list.
+      if (session.uploadMethod === 'multipart') {
+        if (!session.providerUploadId) {
+          throw new ValidationError('Upload session is in an inconsistent state');
+        }
+        if (!input.parts || input.parts.length === 0) {
+          throw new ValidationError('Multipart complete requires `parts`');
+        }
+        try {
+          await provider.adapter.completeMultipartUpload({
+            objectKey: object.providerObjectKey,
+            providerUploadId: session.providerUploadId,
+            parts: input.parts,
+          });
+        } catch {
+          // Another complete may already have consumed the provider upload ID,
+          // or an earlier attempt copied successfully but lost its DB commit.
+          // Only a landed staging object can recover; no part URL writes it.
+          const head = await provider.adapter.headObject({ objectKey: object.providerObjectKey });
+          if (head.contentLength === 0) throw new ValidationError('Uploaded object is empty');
+        }
+      } else {
+        // Single upload: validate landing via HEAD. We DO NOT trust the
+        // caller's claim that they uploaded; HEAD is the strongest evidence
+        // we can collect without scanning content.
+        const head = await provider.adapter.headObject({
+          objectKey: object.providerObjectKey,
+        });
+        if (head.contentLength === 0) {
+          // Most providers return 404 (not 0-byte). Defensive guard.
+          throw new ValidationError('Uploaded object is empty');
+        }
+      }
+
+      // Snapshot bytes before the atomic session/object transition below.
+      await provider.adapter.copyObject({
+        sourceObjectKey: object.providerObjectKey,
+        destinationObjectKey: finalizedObjectKey,
+      });
+    } catch (err) {
+      // A concurrent winner may have already deleted staging. Return only a
+      // completed, finalized winner; an ordinary provider failure stays failed.
+      const re = await deps.sessions.findByIdForWorkspace({
+        sessionId: session.id,
+        workspaceId: ctx.workspaceId,
+      });
+      const accepted =
+        re?.status === 'completed'
+          ? await deps.objects.findByIdForWorkspace({
+              objectId: object.id,
+              workspaceId: ctx.workspaceId,
+            })
+          : null;
+      if (accepted && isFinalizedSource(accepted) && re)
+        return {
+          object: toPublicObject(accepted),
+          session: toPublicSession(re),
+          processingJobs: [],
+        };
+      throw err;
+    }
+    // No client capability can write this fresh key. It is never reused, even
+    // by a concurrent completion that loses the DB compare-and-set below.
+    const finalized = await deps.sessions.finalizeIfPending({
       sessionId: session.id,
+      objectId: object.id,
       workspaceId: ctx.workspaceId,
-      now: issuedAt,
+      stagingObjectKey: object.providerObjectKey,
+      finalizedObjectKey,
+      sha256: input.sha256 ?? object.sha256,
+      now: now(),
     });
-    if (!updatedSession) {
+    if (!finalized) {
+      // This unique candidate lost the DB CAS; it is not referenced by any
+      // object. A DB exception has an uncertain commit outcome and is never
+      // cleaned here. Orphan expiry is an operator lifecycle responsibility.
+      try {
+        await provider.adapter.deleteObject({ objectKey: finalizedObjectKey });
+      } catch {
+        /* best effort */
+      }
       // Lost a race with another request. Re-check current state for a
       // helpful error.
       const re = await deps.sessions.findByIdForWorkspace({
@@ -139,7 +197,7 @@ export function createCompleteUploadHandler(deps: UploadHandlerDependencies) {
           objectId: re.objectId,
           workspaceId: ctx.workspaceId,
         });
-        if (o) {
+        if (o && isFinalizedSource(o)) {
           return {
             object: toPublicObject(o),
             session: toPublicSession(re),
@@ -150,15 +208,11 @@ export function createCompleteUploadHandler(deps: UploadHandlerDependencies) {
       throw new ValidationError('Upload session is no longer pending');
     }
 
-    const updatedObject = await deps.objects.markUploaded({
-      objectId: object.id,
-      workspaceId: ctx.workspaceId,
-      sha256: input.sha256 ?? object.sha256,
-    });
-    if (!updatedObject) {
-      // Should not happen given the FK and the workspace scope, but treat
-      // it as a state conflict rather than a 500.
-      throw new ValidationError('Upload session is in an inconsistent state');
+    const { object: updatedObject, session: updatedSession } = finalized;
+    try {
+      await provider.adapter.deleteObject({ objectKey: object.providerObjectKey });
+    } catch {
+      /* staging expiry also covers URL replay */
     }
 
     // STORAGE-7: enqueue async processing jobs. The callback is optional

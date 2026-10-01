@@ -56,6 +56,39 @@ jobs:
       - name: Coverage gate (>= 80% per ADR-001)
         run: bun run scripts/test-coverage-gate.ts
 
+  # Check the production dependency graph and Linux decoders, not host modules.
+  release-image-security:
+    name: release-image-security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Verify patched decoders and container isolation
+        run: bash scripts/verify-release-image.sh local/xynes-storage:security-ci linux/amd64
+
+  # XYN-SEC-001-FU-1: actual signed provider flows and atomic DB persistence.
+  immutable-source-security:
+    name: immutable-source-security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.18
+      - name: Set up isolated provider compiler
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.6
+          cache: false
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Verify immutable content on isolated provider and Postgres
+        run: bash scripts/verify-immutable-source.sh
+
   # ─── STORAGE-FU-5-FU-F — fixture-based integration suite ────────────────
   # Runs the per-processor integration suites under
   # `tests/integration/processors/*.integration.test.ts` against real
@@ -173,4 +206,3 @@ jobs:
       # the hard-fail suite above with the sidecar wired in.
       - name: Run soft-skip suite (libreoffice)
         run: bun test tests/integration/processors/libreoffice.integration.test.ts
-

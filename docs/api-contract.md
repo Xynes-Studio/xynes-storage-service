@@ -80,6 +80,12 @@ endpoint with the matched `actionKey` and the resolved actor headers.
 | `object`          | object  | Object metadata. Typically `status = "processing"` immediately after completion.       |
 | `processingJobs`  | array   | Queued validation/scan/compression/preview/transcode jobs with their initial statuses. |
 
+Completion uses a same-bucket server-side copy into a fresh server-only key before
+one transaction completes the session and binds the object's source. A provider
+must support atomic independent copies; unsupported/error responses fail closed.
+The caller checksum remains dedup metadata, not scan proof. Already-completed
+finalized sessions are idempotent; legacy completed sessions require recovery.
+
 ## Abort upload session
 
 **Route:** `POST /workspaces/:workspaceId/storage/uploads/:uploadId/abort`
@@ -120,9 +126,32 @@ different workspace.
 **Route:** `POST /workspaces/:workspaceId/storage/objects/:objectId/download-url`
 **Action key:** `platform.storage.objects.read`
 
-Returns `{ objectId, url, expiresAt }`. **Short-lived signed read URL.** The
-service refuses to mint a URL for `pending_upload` / `processing` / `failed`
-/ `deleted` objects.
+Returns `{ objectId, url, expiresAt }`. **Short-lived signed read URL.** Before
+resolving provider credentials or signing, the service requires successful
+required `scan_validation` jobs for this object in the requested workspace.
+Missing, queued, running, failed, cancelled, optional or conflicting scan evidence
+denies delivery with `400 VALIDATION_ERROR` and the generic message
+`Object is not yet available for download`. Scan lookup failure also denies
+delivery. A `ready` object status alone cannot bypass this gate.
+
+`uploaded`, `processing`, `ready` and `failed` objects are eligible only after a
+clean scan; another processing job's failure does not hide a clean original.
+`pending_upload` is unavailable. Deleted, unknown and other-workspace objects
+retain the existing not-found validation behavior. Response shape, workspace
+ownership and gateway action-key checks are unchanged.
+
+Scan proof must match the object's finalized source key and provider. Upload URLs
+address staging only. Completion creates a fresh server-controlled snapshot;
+scans, processors and downloads all reference that snapshot. Replaying staging
+PUT/part URLs or replacing same-length content cannot change bytes behind a signed
+GET. Provider copy failures leave the session pending; competing completions
+publish one source atomically. Public response shapes are unchanged.
+
+Legacy keys or successful scan records without bound proof are unavailable.
+Re-upload through the finalized flow and scan again; processing retry cannot
+upgrade legacy proof. Existing issued legacy URLs must be revoked or expire
+before rollout claims quarantine. See [SEC-001-FU-1](plans/2026-09-30-XYN-SEC-001-FU-1-immutable-scan-content.md)
+and [rollout policy](native-image-security.md#legacy-rollout-and-retention).
 
 ## Delete storage object
 

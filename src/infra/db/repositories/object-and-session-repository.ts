@@ -30,7 +30,7 @@
  *     before the wire DTO. We document this rule below at the mapper
  *     boundary.
  */
-import { and, asc, desc, eq, gte, inArray, lte, lt, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, lte, lt, or, sql } from 'drizzle-orm';
 import type { StorageDb } from '../client';
 import { storageObjects, storageUploadSessions } from '../schema';
 import type {
@@ -484,6 +484,57 @@ export class PostgresUploadSessionRepository implements UploadSessionRepository 
       )
       .returning();
     return updated.length === 0 ? null : mapUploadSessionRow(updated[0]);
+  }
+
+  async finalizeIfPending(
+    input: Parameters<UploadSessionRepository['finalizeIfPending']>[0],
+  ): Promise<CreateObjectWithSessionResult | null> {
+    return this.db.transaction(async (tx) => {
+      // Lock the session before touching the object, serializing completes,
+      // aborts and expiry. A failed object CAS leaves the session pending.
+      const [session] = await tx
+        .select()
+        .from(storageUploadSessions)
+        .where(
+          and(
+            eq(storageUploadSessions.id, input.sessionId),
+            eq(storageUploadSessions.workspaceId, input.workspaceId),
+            eq(storageUploadSessions.objectId, input.objectId),
+            eq(storageUploadSessions.status, 'pending'),
+            gt(storageUploadSessions.expiresAt, input.now),
+          ),
+        )
+        .for('update');
+      if (!session) return null;
+      const [object] = await tx
+        .update(storageObjects)
+        .set({
+          providerObjectKey: input.finalizedObjectKey,
+          status: 'uploaded',
+          sha256: input.sha256,
+          uploadedAt: input.now,
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(storageObjects.id, input.objectId),
+            eq(storageObjects.workspaceId, input.workspaceId),
+            eq(storageObjects.status, 'pending_upload'),
+            eq(storageObjects.providerObjectKey, input.stagingObjectKey),
+          ),
+        )
+        .returning();
+      if (!object) return null;
+      const [completed] = await tx
+        .update(storageUploadSessions)
+        .set({
+          status: 'completed',
+          completedAt: input.now,
+        })
+        .where(eq(storageUploadSessions.id, session.id))
+        .returning();
+      return { object: mapStorageObjectRow(object), session: mapUploadSessionRow(completed) };
+    });
   }
 
   async markAbortedIfPending(input: {

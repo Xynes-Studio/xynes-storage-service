@@ -346,7 +346,7 @@ describe('createUploadHandler — response shape redaction', () => {
     const singleCalls = providers.adapter.calls.filter((c) => c.method === 'createSingleUploadUrl');
     expect(singleCalls.length).toBe(1);
     const opts = singleCalls[0].opts as { objectKey: string };
-    expect(opts.objectKey.startsWith(`workspaces/${TEST_WORKSPACE_ID}/objects/`)).toBe(true);
+    expect(opts.objectKey.startsWith(`workspaces/${TEST_WORKSPACE_ID}/uploads/v1/`)).toBe(true);
     expect(opts.objectKey).toContain(idGen.ids[0]); // objectId is in the key.
   });
 });
