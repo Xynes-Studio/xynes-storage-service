@@ -147,10 +147,10 @@ The processor implementations in FU-A..D read these env vars (set by the operato
 
 The two sidecars below are **opt-in for live mode**. The dev stack defaults to `STORAGE_PROCESSOR_MODE=stub` (per `.env.example`), so neither sidecar is mandatory for laptop development.
 
-When an operator flips `STORAGE_PROCESSOR_MODE=live` in `.env.dev.local`, they MUST also start the sidecars by passing the live processors profile:
+When an operator flips `STORAGE_PROCESSOR_MODE=live` in `.env.dev`, they MUST also start the sidecars by passing the live processors profile:
 
 ```bash
-docker compose --env-file .env.dev.local \
+docker compose --env-file .env.dev \
   -f docker-compose.dev.yml \
   -f infra/compose/storage-live-processors.yml \
   up -d
@@ -283,6 +283,62 @@ A sidecar OOM kill that leaves a residual `tmpfs` mount loses the bytes when the
 
 After FU-A + FU-E land:
 
+### 9.0 STORAGE-FU-AB-FIX-1: refresh development dependencies
+
+Both Docker targets verify that Sharp loads and `ffmpeg-static` supplies a binary
+that successfully executes `-version`. Permission checks alone did not reject a
+non-executable file in the tested Bun/container runtime. The final prod check
+runs as `bun`, while the existing production-dependencies stage still enforces
+the patched native decoder gate.
+
+The dev stack mounts `storage-node_modules` over the image dependencies. A build
+cannot update an existing volume. When refreshing that development volume, resolve
+its actual name before removing the stopped storage container: a stopped container
+still holds its volume reference. These commands affect only storage-service and
+its dependency cache; database and provider volumes remain intact.
+
+```bash
+set -e
+cd xynes/xynes-infra
+storage_container=$(docker compose --env-file .env.dev -f docker-compose.dev.yml \
+  ps -a -q storage-service)
+test -n "$storage_container"
+storage_deps_volume=$(docker inspect --format \
+  '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "/app/node_modules")}}{{.Name}}{{end}}{{end}}' \
+  "$storage_container")
+test -n "$storage_deps_volume"
+docker compose --env-file .env.dev -f docker-compose.dev.yml stop storage-service
+docker compose --env-file .env.dev -f docker-compose.dev.yml rm -f storage-service
+docker volume rm "$storage_deps_volume"
+docker compose --env-file .env.dev -f docker-compose.dev.yml \
+  build --no-cache storage-service
+docker compose --env-file .env.dev -f docker-compose.dev.yml \
+  up -d --force-recreate storage-service
+```
+
+For the default project, the resolved deletion is
+`docker volume rm xynes-infra_storage-node_modules`; custom project names have a
+different prefix. Do not use `docker compose down -v` for this refresh. If no
+storage container exists, build and start it first, then inspect its dependency
+volume only if runtime verification fails. Volume removal errors stop this
+procedure; verify which containers reference the volume before proceeding.
+
+Verify the running container after mounts are applied, because a successful image
+build cannot prove a mounted dependency cache is current:
+
+```bash
+docker compose --env-file .env.dev -f docker-compose.dev.yml exec -T storage-service \
+  bun -e 'require("sharp"); const p = require("ffmpeg-static"); require("fs").accessSync(p, require("fs").constants.X_OK); if (Bun.spawnSync([p, "-version"]).exitCode !== 0) throw new Error("FFMPEG_UNAVAILABLE"); console.log("Processor binaries available");'
+```
+
+Missing live binaries fail processing closed; they do not provide working image
+or video variants. This procedure is for the local dev stack. Hosted deployment
+uses the hardened `prod` target and [storage security overlay](../compose.security.yml)
+with no development dependency volume; follow the release/security rollout gates.
+An image rebuild alone does not certify scanner availability or end-to-end uploads.
+
+Historical analysis: `xynes/xynes-infra/docs/plans/archive/2026-06-02-storage-fu-ab-fix-1.md`.
+
 > **STORAGE-FU-E-FIX-1 (2026-06-02):** the original FU-E rollout
 > command was overlay-validated only and never end-to-end tested.
 > When run against a clean laptop it failed three independent
@@ -294,15 +350,20 @@ After FU-A + FU-E land:
 > `xynes/xynes-infra/docs/plans/archive/2026-06-02-storage-fu-e-fix-1.md`
 > for the full bug analysis.
 
-The rollout below is the post-FU-E-FIX-1 sequence; it boots cleanly
-on a clean laptop with no pre-existing clamav images or named volumes.
+The local sequence below incorporates the dependency refresh and supervisor
+probe. SEC-001/002 hosted rollout requirements remain the release authority.
 
-1. Operator flips `STORAGE_PROCESSOR_MODE=live` in `xynes-infra/.env.dev.local`.
-2. Operator brings up the **clamav-only** subset of the live-processors
+1. **(STORAGE-FU-AB-FIX-1)** Operator first runs the §9.0 prerequisite
+   block above to drop the stale `storage-node_modules` named volume,
+   rebuild the storage-service image with `--no-cache`, and verify
+   `sharp` + `ffmpeg-static` resolve inside the running container.
+   Verify binaries after mounts are applied before enabling live processing.
+2. Operator flips `STORAGE_PROCESSOR_MODE=live` in `xynes-infra/.env.dev`.
+3. Operator brings up the **clamav-only** subset of the live-processors
    overlay (the default, sufficient for malware scanning):
    ```bash
    cd xynes/xynes-infra
-   docker compose --env-file .env.dev.local \
+   docker compose --env-file .env.dev \
      -f docker-compose.dev.yml \
      -f infra/compose/storage-live-processors.yml \
      up -d storage-service clamav-clamd clamav-freshclam
@@ -316,13 +377,13 @@ on a clean laptop with no pre-existing clamav images or named volumes.
    `xynes/xynes-storage-service/sidecars/libreoffice/Dockerfile` or
    pulled it from a private registry:
    ```bash
-   docker compose --env-file .env.dev.local \
+   docker compose --env-file .env.dev \
      -f docker-compose.dev.yml \
      -f infra/compose/storage-live-processors.yml \
      --profile libreoffice \
      up -d
    ```
-3. **Wait for the first-run freshclam definition download.** A brand-new
+4. **Wait for the first-run freshclam definition download.** A brand-new
    `clamav-defs` named volume is empty, so freshclam downloads ~250 MB
    of signatures on first boot. Expect this to take **5–10 minutes**
    on a residential connection. Subsequent restarts reuse the volume
@@ -333,33 +394,29 @@ on a clean laptop with no pre-existing clamav images or named volumes.
    ```
    `clamav-clamd` will keep failing its healthcheck until the first
    definition set lands; that is expected and not an error.
-4. Verify `storage.service.ready` log emits `"processorMode": "live"`.
-5. Verify clamd PING from inside the storage-service container.
-   The storage-service base image (`oven/bun:1`) does not ship `nc`,
-   `netcat`, or `curl` — use Bun's TCP API for a credentialless probe:
+5. Verify `storage.service.ready` log emits `"processorMode": "live"`.
+6. Verify a harmless scan through the archive supervisor from Storage. Public
+   port 3310 is the supervisor; raw clamd PING on that port is unsupported.
+   See [SEC-002 archive policy](XYN-SEC-002-archive-policy.md) for limits and
+   coordinated rollout requirements.
    ```bash
-   docker compose exec storage-service bun -e '
-     const s = await Bun.connect({
-       hostname: "clamav-clamd",
-       port: 3310,
-       socket: {
-         data(_, data) { console.log("RECV:", JSON.stringify(data.toString())); },
-         open(sock) { sock.write("PING\n"); },
-       },
+   docker compose --env-file .env.dev -f docker-compose.dev.yml exec -T storage-service bun -e '
+     const { ClamavMalwareScanner } = await import("./src/infra/processors/clamav-scanner.ts");
+     const scanner = new ClamavMalwareScanner({
+       host: process.env.CLAMD_HOST,
+       port: Number(process.env.CLAMD_PORT ?? 3310),
+       socketPath: process.env.CLAMD_SOCKET,
      });
-     await new Promise(r => setTimeout(r, 1500));
-     s.end();
+     const result = await scanner.scan({
+       bytes: new TextEncoder().encode("harmless readiness probe"),
+       contentType: "text/plain",
+     });
+     console.log(result);
+     if (result.verdict !== "clean") process.exit(1);
    '
-   # expected: RECV: "PONG\n"
+   # expected: { verdict: "clean" }
    ```
-   Alternative (from the clamav-clamd container itself, which does ship
-   `nc` and `clamdscan`):
-   ```bash
-   docker compose exec clamav-clamd sh -c \
-     'printf "PING\n" | nc -w 5 127.0.0.1 3310'
-   # expected: PONG
-   ```
-6. (LibreOffice profile only) Verify the sidecar's HTTP health
+7. (LibreOffice profile only) Verify the sidecar's HTTP health
    endpoint reachability. The storage-service container has no
    `curl` binary, so probe via Bun's `fetch` instead:
    ```bash
@@ -377,13 +434,13 @@ on a clean laptop with no pre-existing clamav images or named volumes.
    #  publish; production K8s manifests keep it ClusterIP-only per
    #  FU-E §5 security invariants.)
    ```
-7. Re-run the smoke harness against R2:
+8. Re-run the smoke harness against R2:
    ```bash
    bash scripts/smoke-universal-storage.sh --full --provider r2
    ```
    Every variant landed on R2 MUST be `> 1024` bytes (Bug 1
    regression guard).
-8. (Optional, validates FU-D end-to-end) Upload the EICAR antivirus
+9. (Optional, validates FU-D end-to-end) Upload the EICAR antivirus
    test vector and confirm the malware scanner blocks it.
    `scripts/smoke-universal-storage.sh` does not currently support a
    custom-file flag, so do the EICAR upload by hand using the same

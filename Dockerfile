@@ -1,9 +1,11 @@
+# STORAGE-FU-AB-FIX-1: verify installed live processor binaries in both targets.
 FROM oven/bun:1 AS base
 WORKDIR /app
 
 FROM base AS dev
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
+RUN bun -e 'require("sharp"); const p = require("ffmpeg-static"); require("fs").accessSync(p, require("fs").constants.X_OK); if (Bun.spawnSync([p, "-version"]).exitCode !== 0) throw new Error("FFMPEG_UNAVAILABLE");'
 COPY . .
 CMD ["bun", "run", "dev"]
 
@@ -22,4 +24,6 @@ COPY --from=production-dependencies /app/node_modules ./node_modules
 COPY --from=production-dependencies /app/src ./src
 COPY --from=production-dependencies /app/scripts ./scripts
 USER bun
+# Verify binaries in the final runtime as its non-root user.
+RUN bun -e 'require("sharp"); const p = require("ffmpeg-static"); require("fs").accessSync(p, require("fs").constants.X_OK); if (Bun.spawnSync([p, "-version"]).exitCode !== 0) throw new Error("FFMPEG_UNAVAILABLE");'
 CMD ["bun", "run", "src/index.ts"]
