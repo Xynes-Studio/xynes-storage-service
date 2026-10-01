@@ -125,7 +125,7 @@ export function mapVariantRow(row: StorageObjectVariantRow): StorageObjectVarian
 // ── platform.storage_processing_jobs → StorageProcessingJobRecord ──────────
 
 export function mapProcessingJobRow(row: StorageProcessingJobRow): StorageProcessingJobRecord {
-  const payload = row.payload as Record<string, unknown> | null;
+  const payload = row.payload;
   return {
     scanSourceKey: typeof payload?.scanSourceKey === 'string' ? payload.scanSourceKey : null,
     scanProviderId: typeof payload?.scanProviderId === 'string' ? payload.scanProviderId : null,

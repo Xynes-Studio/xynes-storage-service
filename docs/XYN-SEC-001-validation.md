@@ -1,6 +1,7 @@
 # XYN-SEC-001 and FU-1 implementation/validation — 2026-09-30
 
-**READY FOR PR against `develop`: SEC-001-FU-1 is implemented and locally closed.**
+**Local validation passed; published PR #32 requires the 2026-10-01 review fixes
+and a successful CI run before approval. SEC-001-FU-1 is implemented locally.**
 The user requires a combined fix and replacement history without the earlier
 incomplete commit. The earlier public branch was deleted. No merge/deployment
 is authorized. The original audit remains unchanged.
@@ -32,7 +33,7 @@ Changed production coverage from the isolated full gate:
 | File                                                                         | Functions | Lines  |
 | ---------------------------------------------------------------------------- | --------- | ------ |
 | `uploads/complete.ts`                                                        | 100%      | 92.55% |
-| `uploads/create.ts`                                                          | 100%      | 100%   |
+| `uploads/create.ts`                                                          | 87.50%    | 100%   |
 | `uploads/finalized-source.ts`                                                | 100%      | 100%   |
 | `processing/scan-gate.ts`, `processing/worker.ts`, `objects/download-url.ts` | 100%      | 100%   |
 | DB `mappers.ts`                                                              | 100%      | 100%   |
@@ -47,7 +48,18 @@ The existing type-only contracts have no executable coverage obligation.
 
 ## Artifact/provenance
 
-Final production image: `sha256:eacb43b7c2a7c121fd377b8b626c8e47fbb7bc888a284731987acb43eac56cf2`.
+2026-10-01 revalidation reproduced 1609 passing isolated tests and 96.47% / 98.57%
+coverage after removing the fixture script's undeclared ripgrep dependency,
+waiting for the final Postgres TCP listener, and removing redundant JSONB casts.
+Lint, typecheck, schema drift check and the Linux image gate passed. The current
+published head's immutable-source CI check failed before tests (`rg: command not
+found`); local fixes remain uncommitted/unpushed during this review. See the
+[current review](XYN-SEC-001-pre-pr-review.md) for the full verdict.
+
+Revalidated local image: `sha256:2c68d8fc981b91f959ed707369ee00ccc875a7d398d487fb12f71bfbb9d8d090`
+(`local/xynes-storage:sec001-revalidation`, linux/amd64, user `bun`).
+
+Original 2026-09-30 production image: `sha256:eacb43b7c2a7c121fd377b8b626c8e47fbb7bc888a284731987acb43eac56cf2`.
 Linux amd64, Bun 1.4.2, default user `bun`/UID1000. Native assertions loaded
 Sharp 0.35.5, libheif 1.23.5 and libvips 8.18.7. The verifier ran networkless,
 read-only, non-root, capability-free with no privilege escalation and bounded

@@ -391,8 +391,7 @@ describe('completeUploadHandler — defensive branches', () => {
   test('finalization CAS miss surfaces state-conflict envelope', async () => {
     const repositories = new FakeRepositories();
     const { session } = seedPending(repositories);
-    // After session is marked completed, delete the object so markUploaded fails.
-    // Wrap markUploaded with a stub that always returns null.
+    // Simulate losing the atomic session/object finalization compare-and-set.
     const handler = createCompleteUploadHandler({
       ...makeDeps({ repositories }),
       sessions: {

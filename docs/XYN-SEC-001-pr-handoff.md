@@ -1,5 +1,12 @@
 # SEC-001 + FU-1 PR and release handoff
 
+2026-10-01 revalidation: [PR #32](https://github.com/Xynes-Studio/xynes-storage-service/pull/32)
+is already open. Its original immutable-source check failed before tests because
+`rg` was unavailable. The portable version check, final TCP readiness check and
+redundant JSONB assertion cleanup pass locally and are included after the user's
+publication authorization. CI on the updated PR head is still required. See the
+[review](XYN-SEC-001-pre-pr-review.md); the earlier readiness verdict is superseded.
+
 Title: **fix: patch native image runtime and bind scan proof to finalized content**
 Base: `develop`. The user authorized the combined PR after completing FU-1 and
 requires replacement history excluding the earlier incomplete commit. The earlier

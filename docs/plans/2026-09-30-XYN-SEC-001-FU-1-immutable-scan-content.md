@@ -39,6 +39,11 @@ required. See [the design](2026-09-30-XYN-SEC-001-FU-1-design.md).
 
 ## Evidence
 
+2026-10-01: local full isolated coverage and production-image gates pass again.
+Published PR #32 still needs local fixture portability/readiness corrections and
+successful CI before approval; implementation closure does not waive that gate.
+See the [current review](../XYN-SEC-001-pre-pr-review.md).
+
 `bash scripts/verify-immutable-source.sh`: **1609 passed, 0 failed**, with disposable
 loopback MinIO/Postgres and no hosted credentials. Coverage **96.47% functions /
 98.57% lines**. The script cleans its own fixtures and runs independently in CI.
