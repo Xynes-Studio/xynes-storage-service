@@ -12,6 +12,9 @@ describe('ProviderAdapterError', () => {
 
   test('every error code has a safe default message', () => {
     const codes: Array<ProviderAdapterError['code']> = [
+      'PROVIDER_MULTIPART_NOT_FOUND',
+      'PROVIDER_OBJECT_TOO_LARGE',
+      'PROVIDER_OBJECT_SIZE_MISMATCH',
       'PROVIDER_CONFIG_INVALID',
       'PROVIDER_OPERATION_FAILED',
       'PROVIDER_OPERATION_REFUSED',

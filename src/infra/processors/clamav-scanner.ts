@@ -1,7 +1,7 @@
 /**
  * STORAGE-FU-5-FU-D — ClamAV-backed MalwareScanner.
  *
- * This scanner speaks the clamd INSTREAM protocol over either:
+ * This client sends bounded metadata plus INSTREAM to the archive supervisor over:
  *   - TCP (`host` + `port`), or
  *   - a unix socket path (`socketPath`, takes precedence).
  *
@@ -9,10 +9,11 @@
  *   - Never writes bytes to disk.
  *   - Never logs raw payloads, signatures, or socket errors.
  *   - Never coerces unknown scanner outcomes to clean.
- *   - Uses one persistent socket per scanner instance (worker) and
- *     reconnects when the socket drops.
+ *   - Keeps at most one socket per scanner instance (worker) and
+ *     reconnects when the supervisor closes a completed request.
  */
 import net from 'node:net';
+import { MAX_SCANNER_INPUT_BYTES } from '../../actions/handlers/objects/byte-size-policy';
 import type {
   MalwareScanResult,
   MalwareScanner,
@@ -20,16 +21,18 @@ import type {
 
 export const DEFAULT_CLAMD_HOST = 'clamav-clamd';
 export const DEFAULT_CLAMD_PORT = 3310;
-export const DEFAULT_CLAMD_TIMEOUT_MS = 10_000;
+export const DEFAULT_CLAMD_TIMEOUT_MS = 25_000;
 const DEFAULT_CHUNK_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 16 * 1024;
 
 export interface ClamavMalwareScannerOptions {
   readonly host?: string;
   readonly port?: number;
+  /** Supervisor Unix socket (default sidecar path: /tmp/clamd.sock), not raw clamd. */
   readonly socketPath?: string;
   readonly timeoutMs?: number;
   readonly chunkBytes?: number;
+  readonly maxInputBytes?: number;
 }
 
 interface SocketLike {
@@ -72,7 +75,17 @@ function parseClamdResponse(raw: string): MalwareScanResult {
   const text = raw.replace(/\0/g, '').trim();
   if (text.length === 0) return { verdict: 'unknown' };
 
-  if (text.includes(' FOUND')) {
+  if (
+    /^stream: (?:Heuristics\.Limits\.Exceeded\.|Xynes\.Archive\.Limit\.)[A-Za-z]+ FOUND$/.test(
+      text,
+    ) ||
+    text === 'INSTREAM size limit exceeded. ERROR' ||
+    text === 'stream: INSTREAM size limit exceeded. ERROR'
+  ) {
+    return { verdict: 'limit_exceeded' };
+  }
+
+  if (/^stream: .+ FOUND$/.test(text)) {
     const beforeFound = text.slice(0, text.indexOf(' FOUND')).trim();
     const signature = beforeFound.includes(':')
       ? beforeFound.slice(beforeFound.indexOf(':') + 1).trim()
@@ -80,7 +93,7 @@ function parseClamdResponse(raw: string): MalwareScanResult {
     return signature.length > 0 ? { verdict: 'infected', signature } : { verdict: 'infected' };
   }
 
-  if (/\bOK\b/i.test(text)) return { verdict: 'clean' };
+  if (text === 'stream: OK') return { verdict: 'clean' };
   return { verdict: 'unknown' };
 }
 
@@ -106,11 +119,9 @@ function chunkBytes(input: Uint8Array, size: number): Uint8Array[] {
 }
 
 async function writeChunk(socket: SocketLike, chunk: Uint8Array | string): Promise<void> {
-  try {
-    socket.write(chunk);
-  } catch (err) {
-    return Promise.reject(err);
-  }
+  return new Promise<void>((resolve, reject) => {
+    socket.write(chunk, (err) => (err ? reject(err) : resolve()));
+  });
 }
 
 export class ClamavMalwareScanner implements MalwareScanner {
@@ -119,6 +130,7 @@ export class ClamavMalwareScanner implements MalwareScanner {
   private readonly socketPath?: string;
   private readonly timeoutMs: number;
   private readonly chunkBytes: number;
+  private readonly maxInputBytes: number;
   private readonly socketFactory: SocketFactory;
   private socket: SocketLike | null = null;
   private readonly socketDropHandler: () => void;
@@ -133,25 +145,40 @@ export class ClamavMalwareScanner implements MalwareScanner {
     this.socketPath = options.socketPath?.trim() || undefined;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_CLAMD_TIMEOUT_MS;
     this.chunkBytes = options.chunkBytes ?? DEFAULT_CHUNK_BYTES;
+    this.maxInputBytes = options.maxInputBytes ?? MAX_SCANNER_INPUT_BYTES;
+    if (
+      ![this.timeoutMs, this.chunkBytes, this.maxInputBytes].every(
+        (value) => Number.isSafeInteger(value) && value > 0,
+      ) ||
+      this.maxInputBytes > MAX_SCANNER_INPUT_BYTES
+    ) {
+      throw new Error('Invalid scanner limits');
+    }
     this.socketFactory = socketFactory;
     this.socketDropHandler = () => {
       this.clearSocket();
     };
   }
 
-  async scan(input: { bytes: Uint8Array }): Promise<MalwareScanResult> {
+  async scan(input: { bytes: Uint8Array; contentType?: string }): Promise<MalwareScanResult> {
+    if (
+      input.contentType !== undefined &&
+      (!/^[\x21-\x7e]{1,255}$/.test(input.contentType) || !input.contentType.includes('/'))
+    )
+      return { verdict: 'limit_exceeded' };
+    if (input.bytes.byteLength > this.maxInputBytes) return { verdict: 'limit_exceeded' };
     const run = this.scanQueue.then(
-      () => this.scanOnce(input.bytes),
-      () => this.scanOnce(input.bytes),
+      () => this.scanOnce(input.bytes, input.contentType),
+      () => this.scanOnce(input.bytes, input.contentType),
     );
     this.scanQueue = run;
     return run;
   }
 
-  private async scanOnce(bytes: Uint8Array): Promise<MalwareScanResult> {
+  private async scanOnce(bytes: Uint8Array, contentType?: string): Promise<MalwareScanResult> {
     try {
       const socket = await this.getSocket();
-      const response = await this.sendInstream(socket, bytes);
+      const response = await this.sendInstream(socket, bytes, contentType);
       // STORAGE-FU-5-FU-D Codex P2 (line 164): plain `zINSTREAM` is a
       // one-shot command — clamd closes the connection after sending
       // the reply. Pooling without `IDSESSION` framing creates a race
@@ -160,8 +187,14 @@ export class ClamavMalwareScanner implements MalwareScanner {
       // connection.
       this.resetSocket();
       return parseClamdResponse(response);
-    } catch {
+    } catch (err) {
       this.resetSocket();
+      if (
+        err instanceof Error &&
+        (err.message === 'clamd response timeout' || err.message === 'clamd connect timeout')
+      ) {
+        return { verdict: 'unknown', retryable: false };
+      }
       return { verdict: 'unknown' };
     }
   }
@@ -220,27 +253,29 @@ export class ClamavMalwareScanner implements MalwareScanner {
     });
   }
 
-  private async sendInstream(socket: SocketLike, bytes: Uint8Array): Promise<string> {
+  private async sendInstream(
+    socket: SocketLike,
+    bytes: Uint8Array,
+    contentType?: string,
+  ): Promise<string> {
     const responsePromise = this.readResponse(socket);
-    try {
+    const sending = (async () => {
+      if (contentType !== undefined) await writeChunk(socket, `zXYNES ${contentType}\0`);
       await writeChunk(socket, 'zINSTREAM\0');
-
       for (const chunk of chunkBytes(bytes, this.chunkBytes)) {
         const len = Buffer.allocUnsafe(4);
         len.writeUInt32BE(chunk.byteLength, 0);
         await writeChunk(socket, len);
         await writeChunk(socket, chunk);
       }
-
       const end = Buffer.allocUnsafe(4);
       end.writeUInt32BE(0, 0);
       await writeChunk(socket, end);
-
-      return await responsePromise;
-    } catch (err) {
-      void responsePromise.catch(() => {});
-      throw err;
-    }
+      return responsePromise;
+    })();
+    // A daemon may reject before consuming all input. Its verdict/deadline wins;
+    // resetting the socket then stops outstanding writes. Both promises are handled.
+    return Promise.race([responsePromise, sending]);
   }
 
   private readResponse(socket: SocketLike): Promise<string> {

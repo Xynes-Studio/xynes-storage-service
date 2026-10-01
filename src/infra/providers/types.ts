@@ -184,6 +184,10 @@ export interface CopyObjectOptions {
 /** STORAGE-FU-5: server-side read of object bytes. Used by runners. */
 export interface GetObjectBytesOptions {
   readonly objectKey: string;
+  /** Count actual streamed bytes before retaining them; defaults to the global cap. */
+  readonly maxBytes?: number;
+  /** When supplied, reject both truncated and larger-than-declared objects. */
+  readonly expectedByteSize?: number;
 }
 
 /** STORAGE-FU-5: server-side write of object bytes. Used by runners. */

@@ -13,14 +13,16 @@
  *        if it supports expiry, otherwise treat as state conflict.
  *   3. Lookup associated object — defensive (the FK guarantees it exists).
  *   4. For multipart sessions: call provider `completeMultipartUpload(parts)`.
- *      For single sessions: HEAD the object to validate the upload landed.
+ *      HEAD staging for both methods and reconcile actual length with policy.
  *   5. Copy staging to a fresh, server-only source key.
+ *      HEAD the copied source before accepting its immutable bytes.
  *   6. Atomically bind that key and mark session `completed` / object `uploaded`.
  *      If the conditional update misses (concurrent abort), surface a
  *      state conflict.
  *   7. STORAGE-7 will queue async processing jobs here. For STORAGE-5 we
  *      return an empty `processingJobs` array.
  */
+import { isValidObjectByteSize, maxBytesForContentType } from '../objects/byte-size-policy';
 import { ProviderAdapterError } from '../../../infra/providers/errors';
 import { ValidationError, ForbiddenError } from '../../errors';
 import type { ActionContext } from '../../types';
@@ -118,31 +120,46 @@ export function createCompleteUploadHandler(deps: UploadHandlerDependencies) {
             providerUploadId: session.providerUploadId,
             parts: input.parts,
           });
-        } catch {
-          // Another complete may already have consumed the provider upload ID,
-          // or an earlier attempt copied successfully but lost its DB commit.
-          // Only a landed staging object can recover; no part URL writes it.
-          const head = await provider.adapter.headObject({ objectKey: object.providerObjectKey });
-          if (head.contentLength === 0) throw new ValidationError('Uploaded object is empty');
-        }
-      } else {
-        // Single upload: validate landing via HEAD. We DO NOT trust the
-        // caller's claim that they uploaded; HEAD is the strongest evidence
-        // we can collect without scanning content.
-        const head = await provider.adapter.headObject({
-          objectKey: object.providerObjectKey,
-        });
-        if (head.contentLength === 0) {
-          // Most providers return 404 (not 0-byte). Defensive guard.
-          throw new ValidationError('Uploaded object is empty');
+        } catch (err) {
+          // Recover only a consumed multipart handle; provider failures must
+          // not be converted into success by a landed staging object.
+          if (
+            !(err instanceof ProviderAdapterError) ||
+            err.code !== 'PROVIDER_MULTIPART_NOT_FOUND'
+          ) {
+            throw err;
+          }
         }
       }
+
+      const validateLength = async (objectKey: string) => {
+        const head = await provider.adapter.headObject({ objectKey });
+        if (
+          !isValidObjectByteSize(head.contentLength) ||
+          !isValidObjectByteSize(object.byteSize) ||
+          head.contentLength !== object.byteSize ||
+          head.contentLength > maxBytesForContentType(object.contentType)
+        ) {
+          await deps.sessions.markAbortedIfPending({
+            sessionId: session.id,
+            workspaceId: ctx.workspaceId,
+            now: now(),
+          });
+          // Retain bytes for operator cleanup; a concurrent completion may
+          // own a source, and an uncertain DB outcome must never be deleted.
+          throw new ValidationError('Uploaded object size is invalid');
+        }
+      };
+      await validateLength(object.providerObjectKey);
 
       // Snapshot bytes before the atomic session/object transition below.
       await provider.adapter.copyObject({
         sourceObjectKey: object.providerObjectKey,
         destinationObjectKey: finalizedObjectKey,
       });
+      // Staging may be overwritten through a still-live PUT URL during copy.
+      // Only this fresh server-only key is evidence for the accepted bytes.
+      await validateLength(finalizedObjectKey);
     } catch (err) {
       // A concurrent winner may have already deleted staging. Return only a
       // completed, finalized winner; an ordinary provider failure stays failed.

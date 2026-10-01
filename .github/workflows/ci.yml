@@ -109,10 +109,10 @@ jobs:
     timeout-minutes: 15
     services:
       clamd:
-        # Pin to the current LTS family (1.4). The 1.3 family is no
-        # longer published by Cisco-Talos on Docker Hub; only the
-        # last two minor families ship as plain tags.
-        image: clamav/clamav:1.4
+        image: clamav/clamav:1.5.2-debian@sha256:12a74204d5723b39de2dcb20ab679752ca5d30b1a1539646b2cd9f58a873e8c6
+        env:
+          CLAMD_CONF_TCPAddr: "0.0.0.0"
+          CLAMD_CONF_TCPSocket: "3310"
         ports:
           - 3310:3310
         options: >-
@@ -206,3 +206,28 @@ jobs:
       # the hard-fail suite above with the sidecar wired in.
       - name: Run soft-skip suite (libreoffice)
         run: bun test tests/integration/processors/libreoffice.integration.test.ts
+
+
+  archive-safety:
+    name: archive-safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.18
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.27.1
+          cache: false
+      - run: bun install --frozen-lockfile
+      - name: Race tests and per-file coverage (>=80%)
+        working-directory: sidecars/archive-scanner
+        run: |
+          go test -race -coverprofile=coverage.out ./...
+          python3 coverage-gate.py coverage.out
+      - name: Pinned scanner and harmless archive fixtures
+        env:
+          XYNES_SEC001_GATES_REQUIRED: "1"
+        run: python3 scripts/test-archive-scanner.py

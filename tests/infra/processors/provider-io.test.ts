@@ -197,6 +197,29 @@ describe('createS3ProviderObjectIO — adapter delegation', () => {
     expect(adapter.calls).toEqual([{ method: 'getObjectBytes', opts: { objectKey: 'foobar' } }]);
   });
 
+  test('readObject forwards actual byte bounds to the resolved adapter', async () => {
+    const resolver = new FakeResolver();
+    const adapter = new FakeStorageAdapter('r2');
+    resolver.defaultImpl = async () => makeResolvedProvider({ adapter });
+    const io = createS3ProviderObjectIO({ providers: resolver });
+    await io.readObject({
+      objectKey: 'original',
+      workspaceId: 'ws-A',
+      maxBytes: 4,
+      expectedByteSize: 4,
+    });
+    expect(adapter.calls).toEqual([
+      {
+        method: 'getObjectBytes',
+        opts: {
+          objectKey: 'original',
+          maxBytes: 4,
+          expectedByteSize: 4,
+        },
+      },
+    ]);
+  });
+
   test('writeObject delegates to adapter.putObjectBytes including ifAbsent=true forwarding', async () => {
     const resolver = new FakeResolver();
     const adapter = new FakeStorageAdapter('r2');

@@ -41,7 +41,7 @@ function build() {
 describe('image-optimize runner — happy path', () => {
   test('writes one variant per spec for the balanced profile', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 64 };
     providerIO.preload(object.providerObjectKey, makeBytes(64), 'image/jpeg');
     const out = await runner({ object, job: seedClaimedJob() });
     expect(out).toEqual({});
@@ -51,9 +51,12 @@ describe('image-optimize runner — happy path', () => {
 
   test('records each variant under <parent-dir>/variants/<role>.<ext>', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedImageObject({
-      providerObjectKey: 'workspaces/ws/objects/obj/photo.jpg',
-    });
+    const object = {
+      ...seedImageObject({
+        providerObjectKey: 'workspaces/ws/objects/obj/photo.jpg',
+      }),
+      byteSize: 64,
+    };
     providerIO.preload(object.providerObjectKey, makeBytes(64), 'image/jpeg');
     await runner({ object, job: seedClaimedJob() });
     for (const rec of variants.records) {
@@ -64,7 +67,7 @@ describe('image-optimize runner — happy path', () => {
 
   test('never overwrites the original (writes use ifAbsent=true)', async () => {
     const { providerIO, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 64 };
     providerIO.preload(object.providerObjectKey, makeBytes(64), 'image/jpeg');
     await runner({ object, job: seedClaimedJob() });
     for (const w of providerIO.writes) {
@@ -75,7 +78,7 @@ describe('image-optimize runner — happy path', () => {
 
   test('records workspaceId + objectId on every variant for repo-side scoping', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 64 };
     providerIO.preload(object.providerObjectKey, makeBytes(64));
     await runner({ object, job: seedClaimedJob() });
     for (const rec of variants.records) {
@@ -88,7 +91,7 @@ describe('image-optimize runner — happy path', () => {
 describe('image-optimize runner — profile selection', () => {
   test('uses DEFAULT_QUALITY_PROFILE when payload.qualityProfile is missing', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 64 };
     providerIO.preload(object.providerObjectKey, makeBytes(64));
     await runner({ object, job: seedClaimedJob({ payload: {} }) });
     expect(variants.records).toHaveLength(getImageProfile(DEFAULT_QUALITY_PROFILE).variants.length);
@@ -96,7 +99,7 @@ describe('image-optimize runner — profile selection', () => {
 
   test('respects payload.qualityProfile = high_quality (adds original_fallback)', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 64 };
     providerIO.preload(object.providerObjectKey, makeBytes(64));
     await runner({ object, job: seedClaimedJob({ payload: { qualityProfile: 'high_quality' } }) });
     const roles = variants.records.map((r) => r.role);
@@ -105,7 +108,7 @@ describe('image-optimize runner — profile selection', () => {
 
   test('falls back to default when payload.qualityProfile is bogus', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 64 };
     providerIO.preload(object.providerObjectKey, makeBytes(64));
     await runner({ object, job: seedClaimedJob({ payload: { qualityProfile: 'ultra' } }) });
     expect(variants.records).toHaveLength(getImageProfile(DEFAULT_QUALITY_PROFILE).variants.length);
@@ -136,7 +139,7 @@ describe('image-optimize runner — guard rails', () => {
       height: 100,
       format: 'jpeg',
     };
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const out = await runner({ object, job: seedClaimedJob() });
     expect(out).toEqual({ errorCode: 'OVER_MAX_DIMENSIONS', retryable: false });
@@ -151,7 +154,7 @@ describe('image-optimize runner — guard rails', () => {
       height: MAX_IMAGE_DIMENSION + 1,
       format: 'jpeg',
     };
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const out = await runner({ object, job: seedClaimedJob() });
     expect(out).toEqual({ errorCode: 'OVER_MAX_DIMENSIONS', retryable: false });
@@ -169,7 +172,7 @@ describe('image-optimize runner — error mapping', () => {
 
   test('returns retryable PROCESSOR_FAILED when processor probe throws', async () => {
     const { providerIO, processor, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     processor.throwOnProbeOnce = new Error('libvips: malformed jpeg');
     const out = await runner({ object, job: seedClaimedJob() });
@@ -178,7 +181,7 @@ describe('image-optimize runner — error mapping', () => {
 
   test('returns retryable PROCESSOR_FAILED when processor render throws', async () => {
     const { providerIO, processor, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     processor.throwOnRenderOnce = new Error('libvips: out of memory');
     const out = await runner({ object, job: seedClaimedJob() });
@@ -187,7 +190,7 @@ describe('image-optimize runner — error mapping', () => {
 
   test('returns retryable PROCESSOR_FAILED when variant write throws', async () => {
     const { providerIO, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     providerIO.throwOnWriteOnce = new Error('s3 NoSuchBucket');
     const out = await runner({ object, job: seedClaimedJob() });
@@ -196,7 +199,7 @@ describe('image-optimize runner — error mapping', () => {
 
   test('never embeds provider / library error text into the errorCode', async () => {
     const { providerIO, processor, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     processor.throwOnProbeOnce = new Error('libvips: malformed jpeg at offset 0xDEADBEEF');
     const out = (await runner({ object, job: seedClaimedJob() })) as {
@@ -211,9 +214,12 @@ describe('image-optimize runner — error mapping', () => {
 describe('image-optimize runner — variant content (security)', () => {
   test('never writes a variant to the original provider key (defense in depth)', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedImageObject({
-      providerObjectKey: 'workspaces/ws/objects/obj/photo.jpg',
-    });
+    const object = {
+      ...seedImageObject({
+        providerObjectKey: 'workspaces/ws/objects/obj/photo.jpg',
+      }),
+      byteSize: 8,
+    };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({ object, job: seedClaimedJob() });
     for (const w of providerIO.writes) {
@@ -226,7 +232,7 @@ describe('image-optimize runner — variant content (security)', () => {
 
   test('variant content types are AVIF/WebP/JPEG only (no original-format passthrough by default)', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({ object, job: seedClaimedJob() });
     const allowed = new Set(['image/avif', 'image/webp', 'image/jpeg']);

@@ -34,7 +34,7 @@ function build() {
 describe('document-preview runner — happy path', () => {
   test('renders a single preview variant for a PDF', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedDocumentObject();
+    const object = { ...seedDocumentObject(), byteSize: 64 };
     providerIO.preload(object.providerObjectKey, makeBytes(64), 'application/pdf');
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'document_preview' }) });
     expect(out).toEqual({});
@@ -44,7 +44,7 @@ describe('document-preview runner — happy path', () => {
 
   test('preview is an image (PNG or JPEG) — NOT the original document format', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedDocumentObject();
+    const object = { ...seedDocumentObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({ object, job: seedClaimedJob({ jobType: 'document_preview' }) });
     const ct = variants.records[0]?.contentType;
@@ -53,9 +53,12 @@ describe('document-preview runner — happy path', () => {
 
   test('preview key uses the variants/ prefix', async () => {
     const { providerIO, variants, runner } = build();
-    const object = seedDocumentObject({
-      providerObjectKey: 'workspaces/ws/objects/obj/file.pdf',
-    });
+    const object = {
+      ...seedDocumentObject({
+        providerObjectKey: 'workspaces/ws/objects/obj/file.pdf',
+      }),
+      byteSize: 8,
+    };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({ object, job: seedClaimedJob({ jobType: 'document_preview' }) });
     expect(
@@ -66,7 +69,7 @@ describe('document-preview runner — happy path', () => {
 
   test('writes use ifAbsent=true (never overwrite the original)', async () => {
     const { providerIO, runner } = build();
-    const object = seedDocumentObject();
+    const object = { ...seedDocumentObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     await runner({ object, job: seedClaimedJob({ jobType: 'document_preview' }) });
     for (const w of providerIO.writes) {
@@ -107,7 +110,7 @@ describe('document-preview runner — allowlist enforcement', () => {
     ];
     for (const mime of allowlist) {
       const { providerIO, runner } = build();
-      const object = seedDocumentObject({ contentType: mime });
+      const object = { ...seedDocumentObject({ contentType: mime }), byteSize: 8 };
       providerIO.preload(object.providerObjectKey, makeBytes(8));
       const out = await runner({ object, job: seedClaimedJob({ jobType: 'document_preview' }) });
       expect(out).toEqual({});
@@ -135,7 +138,7 @@ describe('document-preview runner — guard rails', () => {
 
   test('returns retryable PROCESSOR_FAILED on processor render throw', async () => {
     const { providerIO, processor, runner } = build();
-    const object = seedDocumentObject();
+    const object = { ...seedDocumentObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     processor.throwOnceOnce = new Error('libreoffice: corrupt document');
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'document_preview' }) });
@@ -144,7 +147,7 @@ describe('document-preview runner — guard rails', () => {
 
   test('returns retryable PROCESSOR_FAILED when variant write throws', async () => {
     const { providerIO, runner } = build();
-    const object = seedDocumentObject();
+    const object = { ...seedDocumentObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     providerIO.throwOnWriteOnce = new Error('AccessDenied');
     const out = await runner({ object, job: seedClaimedJob({ jobType: 'document_preview' }) });
@@ -155,7 +158,7 @@ describe('document-preview runner — guard rails', () => {
 describe('document-preview runner — security', () => {
   test('never embeds raw processor error text into the errorCode', async () => {
     const { providerIO, processor, runner } = build();
-    const object = seedDocumentObject();
+    const object = { ...seedDocumentObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     processor.throwOnceOnce = new Error('libreoffice exit 139 SIGSEGV /tmp/abc');
     const out = (await runner({

@@ -16,6 +16,7 @@ import { describe, expect, test } from 'bun:test';
 import { createCompleteUploadHandler } from '../../../../src/actions/handlers/uploads/complete';
 import { createFinalizedSourceKey } from '../../../../src/actions/handlers/uploads/finalized-source';
 import { ValidationError } from '../../../../src/actions/errors';
+import { ProviderAdapterError } from '../../../../src/infra/providers/errors';
 import type {
   StorageObjectRecord,
   UploadSessionRecord,
@@ -100,7 +101,7 @@ describe('completeUploadHandler — single happy path', () => {
     const handler = createCompleteUploadHandler(deps);
     await handler({ operation: 'complete', uploadId: session.id }, makeUserCtx());
     const heads = providers.adapter.calls.filter((c) => c.method === 'headObject');
-    expect(heads.length).toBe(1);
+    expect(heads.length).toBe(2);
   });
 
   test('rejects empty single uploads (HEAD returns 0 bytes)', async () => {
@@ -403,4 +404,278 @@ describe('completeUploadHandler — defensive branches', () => {
       handler({ operation: 'complete', uploadId: session.id }, makeUserCtx()),
     ).rejects.toBeInstanceOf(ValidationError);
   });
+});
+
+describe('XYN-SEC-002 — provider length reconciliation', () => {
+  for (const uploadMethod of ['single', 'multipart'] as const) {
+    for (const actual of [0, 4095, 4097, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      test(`${uploadMethod}: rejects invalid/mismatched actual length ${actual} without enqueue`, async () => {
+        const repositories = new FakeRepositories();
+        const { session, object } = seedPending(repositories, {
+          uploadMethod,
+          providerUploadId: uploadMethod === 'multipart' ? 'mp-1' : null,
+        });
+        const providers = new FakeProviderResolver();
+        providers.adapter.headObjectImpl = async () => ({
+          objectKey: object.providerObjectKey,
+          contentLength: actual,
+          contentType: null,
+          etag: null,
+          lastModified: null,
+        });
+        let enqueued = false;
+        const handler = createCompleteUploadHandler({
+          ...makeDeps({ repositories, providers }),
+          enqueueProcessing: async () => {
+            enqueued = true;
+            return [];
+          },
+        });
+        await expect(
+          handler(
+            {
+              operation: 'complete',
+              uploadId: session.id,
+              parts: [{ partNumber: 1, etag: 'etag' }],
+            },
+            makeUserCtx(),
+          ),
+        ).rejects.toBeInstanceOf(ValidationError);
+        expect(enqueued).toBe(false);
+        expect(
+          (
+            await repositories.sessions.findByIdForWorkspace({
+              sessionId: session.id,
+              workspaceId: session.workspaceId,
+            })
+          )?.status,
+        ).toBe('aborted');
+        expect(
+          (
+            await repositories.objects.findByIdForWorkspace({
+              objectId: object.id,
+              workspaceId: object.workspaceId,
+            })
+          )?.status,
+        ).toBe('pending_upload');
+      });
+    }
+    test(`${uploadMethod}: HEAD follows multipart finalization and precedes success`, async () => {
+      const repositories = new FakeRepositories();
+      const { session } = seedPending(repositories, {
+        uploadMethod,
+        providerUploadId: uploadMethod === 'multipart' ? 'mp-1' : null,
+      });
+      const providers = new FakeProviderResolver();
+      const handler = createCompleteUploadHandler(makeDeps({ repositories, providers }));
+      const result = await handler(
+        { operation: 'complete', uploadId: session.id, parts: [{ partNumber: 1, etag: 'etag' }] },
+        makeUserCtx(),
+      );
+      expect(result.object.status).toBe('uploaded');
+      expect(providers.adapter.calls.map((c) => c.method)).toEqual(
+        uploadMethod === 'multipart'
+          ? ['completeMultipartUpload', 'headObject', 'copyObject', 'headObject', 'deleteObject']
+          : ['headObject', 'copyObject', 'headObject', 'deleteObject'],
+      );
+    });
+  }
+  for (const [contentType, cap] of [
+    ['image/jpeg', 50 * 1024 * 1024],
+    ['video/mp4', 2 * 1024 * 1024 * 1024],
+    ['application/pdf', 100 * 1024 * 1024],
+    ['audio/mpeg', 5 * 1024 * 1024 * 1024],
+  ] as const) {
+    for (const delta of [0, 1]) {
+      test(`${contentType}: exact cap ${delta === 0 ? 'accepted' : 'exceeded and rejected'}`, async () => {
+        const repositories = new FakeRepositories();
+        const seeded = seedPending(repositories);
+        const object = { ...seeded.object, contentType, byteSize: cap + delta };
+        repositories.seedSession(seeded.session, object);
+        const providers = new FakeProviderResolver();
+        providers.adapter.headObjectImpl = async () => ({
+          objectKey: object.providerObjectKey,
+          contentLength: object.byteSize,
+          contentType,
+          etag: null,
+          lastModified: null,
+        });
+        const result = createCompleteUploadHandler(makeDeps({ repositories, providers }))(
+          { operation: 'complete', uploadId: seeded.session.id },
+          makeUserCtx(),
+        );
+        if (delta === 0) expect((await result).object.status).toBe('uploaded');
+        else await expect(result).rejects.toBeInstanceOf(ValidationError);
+      });
+    }
+  }
+  test('HEAD failure keeps the session pending and never enqueues', async () => {
+    const repositories = new FakeRepositories();
+    const { session } = seedPending(repositories, {
+      uploadMethod: 'multipart',
+      providerUploadId: 'mp-1',
+    });
+    const providers = new FakeProviderResolver();
+    providers.adapter.headObjectImpl = async () => {
+      throw new Error('fixture provider unavailable');
+    };
+    let enqueued = false;
+    const handler = createCompleteUploadHandler({
+      ...makeDeps({ repositories, providers }),
+      enqueueProcessing: async () => {
+        enqueued = true;
+        return [];
+      },
+    });
+    await expect(
+      handler(
+        { operation: 'complete', uploadId: session.id, parts: [{ partNumber: 1, etag: 'etag' }] },
+        makeUserCtx(),
+      ),
+    ).rejects.toThrow();
+    expect(enqueued).toBe(false);
+    expect(
+      (
+        await repositories.sessions.findByIdForWorkspace({
+          sessionId: session.id,
+          workspaceId: session.workspaceId,
+        })
+      )?.status,
+    ).toBe('pending');
+  });
+});
+
+describe('XYN-SEC-002 — multipart completion recovery', () => {
+  test('retries HEAD validation when multipart was finalized before a transient HEAD failure', async () => {
+    const repositories = new FakeRepositories();
+    const { session, object } = seedPending(repositories, {
+      uploadMethod: 'multipart',
+      providerUploadId: 'mp-1',
+    });
+    const providers = new FakeProviderResolver();
+    let finalized = false;
+    let headFailed = false;
+    providers.adapter.completeMultipartUploadImpl = async () => {
+      if (finalized) throw new ProviderAdapterError('PROVIDER_MULTIPART_NOT_FOUND');
+      finalized = true;
+      return { objectKey: object.providerObjectKey, etag: 'etag' };
+    };
+    providers.adapter.headObjectImpl = async () => {
+      if (!headFailed) {
+        headFailed = true;
+        throw new ProviderAdapterError('PROVIDER_OPERATION_FAILED');
+      }
+      return {
+        objectKey: object.providerObjectKey,
+        contentLength: 4096,
+        contentType: null,
+        etag: null,
+        lastModified: null,
+      };
+    };
+    const handler = createCompleteUploadHandler(makeDeps({ repositories, providers }));
+    const payload = {
+      operation: 'complete',
+      uploadId: session.id,
+      parts: [{ partNumber: 1, etag: 'etag' }],
+    };
+    await expect(handler(payload, makeUserCtx())).rejects.toBeInstanceOf(ProviderAdapterError);
+    expect((await handler(payload, makeUserCtx())).object.status).toBe('uploaded');
+  });
+  test('missing multipart handle never bypasses the actual length check', async () => {
+    const repositories = new FakeRepositories();
+    const { session, object } = seedPending(repositories, {
+      uploadMethod: 'multipart',
+      providerUploadId: 'mp-1',
+    });
+    const providers = new FakeProviderResolver();
+    providers.adapter.completeMultipartUploadImpl = async () => {
+      throw new ProviderAdapterError('PROVIDER_MULTIPART_NOT_FOUND');
+    };
+    providers.adapter.headObjectImpl = async () => ({
+      objectKey: object.providerObjectKey,
+      contentLength: 4097,
+      contentType: null,
+      etag: null,
+      lastModified: null,
+    });
+    await expect(
+      createCompleteUploadHandler(makeDeps({ repositories, providers }))(
+        {
+          operation: 'complete',
+          uploadId: session.id,
+          parts: [{ partNumber: 1, etag: 'etag' }],
+        },
+        makeUserCtx(),
+      ),
+    ).rejects.toBeInstanceOf(ValidationError);
+  });
+  test('other multipart provider failures propagate without marking completion', async () => {
+    const repositories = new FakeRepositories();
+    const { session } = seedPending(repositories, {
+      uploadMethod: 'multipart',
+      providerUploadId: 'mp-1',
+    });
+    const providers = new FakeProviderResolver();
+    providers.adapter.completeMultipartUploadImpl = async () => {
+      throw new ProviderAdapterError('PROVIDER_OPERATION_FAILED');
+    };
+    await expect(
+      createCompleteUploadHandler(makeDeps({ repositories, providers }))(
+        {
+          operation: 'complete',
+          uploadId: session.id,
+          parts: [{ partNumber: 1, etag: 'etag' }],
+        },
+        makeUserCtx(),
+      ),
+    ).rejects.toBeInstanceOf(ProviderAdapterError);
+    expect(providers.adapter.calls.map((c) => c.method)).toEqual(['completeMultipartUpload']);
+  });
+});
+
+describe('SEC-001 + SEC-002 finalized source length', () => {
+  for (const actual of [4096, 4097]) {
+    test(`validates copied source length ${actual} before finalization`, async () => {
+      const repositories = new FakeRepositories();
+      const { session, object } = seedPending(repositories);
+      const providers = new FakeProviderResolver();
+      let candidate: string | undefined;
+      let enqueued = false;
+      providers.adapter.copyObjectImpl = async ({ destinationObjectKey }) => {
+        candidate = destinationObjectKey;
+      };
+      providers.adapter.headObjectImpl = async ({ objectKey }) => ({
+        objectKey,
+        contentLength: objectKey === candidate ? actual : 4096,
+        contentType: object.contentType,
+        etag: '"fixture"',
+        lastModified: new Date(),
+      });
+      const deps = {
+        ...makeDeps({ repositories, providers }),
+        enqueueProcessing: async () => {
+          enqueued = true;
+          return [];
+        },
+      };
+      const completed = createCompleteUploadHandler(deps)(
+        { operation: 'complete', uploadId: session.id },
+        makeUserCtx(),
+      );
+      if (actual === 4096) {
+        await expect(completed).resolves.toMatchObject({ object: { status: 'uploaded' } });
+        expect(repositories.getObject(object.id)?.providerObjectKey).toBe(candidate);
+      } else {
+        await expect(completed).rejects.toBeInstanceOf(ValidationError);
+        expect(repositories.getSession(session.id)?.status).toBe('aborted');
+        expect(repositories.getObject(object.id)?.status).toBe('pending_upload');
+        expect(providers.adapter.calls.filter((c) => c.method === 'deleteObject')).toEqual([]);
+      }
+      expect(enqueued).toBe(actual === 4096);
+      expect(
+        providers.adapter.calls.filter((c) => c.method === 'headObject').map((c) => c.opts),
+      ).toContainEqual({ objectKey: candidate });
+    });
+  }
 });

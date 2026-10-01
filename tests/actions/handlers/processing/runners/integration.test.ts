@@ -55,7 +55,8 @@ describe('end-to-end: planner + worker + registry (STORAGE-7 ∘ STORAGE-8)', ()
   test('image upload runs scan + image_optimize end-to-end, parent ends ready', async () => {
     const { queue, status, providerIO, variants, runners } = buildWiring();
     const source = seedImageObject();
-    const object = { ...source, providerObjectKey: createFinalizedSourceKey(source) };
+    const object = { ...source, byteSize: 64, providerObjectKey: createFinalizedSourceKey(source) };
+
     providerIO.preload(object.providerObjectKey, makeBytes(64), 'image/jpeg');
 
     await enqueueProcessingForObject(
@@ -97,7 +98,8 @@ describe('end-to-end: planner + worker + registry (STORAGE-7 ∘ STORAGE-8)', ()
   test('video upload runs scan + probe + thumbnail + transcode and ends ready', async () => {
     const { queue, status, providerIO, variants, runners } = buildWiring();
     const source = seedVideoObject();
-    const object = { ...source, providerObjectKey: createFinalizedSourceKey(source) };
+    const object = { ...source, byteSize: 64, providerObjectKey: createFinalizedSourceKey(source) };
+
     providerIO.preload(object.providerObjectKey, makeBytes(64), 'video/mp4');
 
     await enqueueProcessingForObject(

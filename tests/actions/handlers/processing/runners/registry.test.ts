@@ -62,7 +62,7 @@ describe('createRunnerRegistry', () => {
 
   test('scan_validation runner returns {} for a clean image', async () => {
     const { providerIO, registry } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const fn = registry.scan_validation;
     if (!fn) throw new Error('scan_validation runner missing');
@@ -72,7 +72,7 @@ describe('createRunnerRegistry', () => {
 
   test('image_optimize runner produces variants', async () => {
     const { providerIO, variants, registry } = build();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const fn = registry.image_optimize;
     if (!fn) throw new Error('image_optimize runner missing');
@@ -82,7 +82,7 @@ describe('createRunnerRegistry', () => {
 
   test('video_probe runner returns {} for a normal-sized clip', async () => {
     const { providerIO, registry } = build();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const fn = registry.video_probe;
     if (!fn) throw new Error('video_probe runner missing');
@@ -92,7 +92,7 @@ describe('createRunnerRegistry', () => {
 
   test('video_thumbnail runner produces a poster variant', async () => {
     const { providerIO, variants, registry } = build();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const fn = registry.video_thumbnail;
     if (!fn) throw new Error('video_thumbnail runner missing');
@@ -102,7 +102,7 @@ describe('createRunnerRegistry', () => {
 
   test('video_transcode runner produces a transcode_h264 variant', async () => {
     const { providerIO, variants, registry } = build();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const fn = registry.video_transcode;
     if (!fn) throw new Error('video_transcode runner missing');
@@ -112,7 +112,7 @@ describe('createRunnerRegistry', () => {
 
   test('document_preview runner produces a preview_first_page variant', async () => {
     const { providerIO, variants, registry } = build();
-    const object = seedDocumentObject();
+    const object = { ...seedDocumentObject(), byteSize: 8 };
     providerIO.preload(object.providerObjectKey, makeBytes(8));
     const fn = registry.document_preview;
     if (!fn) throw new Error('document_preview runner missing');

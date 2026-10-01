@@ -19,6 +19,7 @@ describe('RUNNER_ERROR_CODES', () => {
         'OVER_MAX_DURATION',
         'UNSUPPORTED_FORMAT',
         'MALWARE_DETECTED',
+        'ARCHIVE_INSPECTION_REJECTED',
         'SCANNER_INCONCLUSIVE',
         'PROCESSOR_FAILED',
       ]),

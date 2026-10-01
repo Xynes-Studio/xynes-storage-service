@@ -42,7 +42,7 @@ import type {
 
 const FAKE_IO: ProviderObjectIO = {
   async readObject() {
-    return new Uint8Array();
+    return new Uint8Array(4);
   },
   async writeObject() {
     return { byteSize: 0 };
@@ -187,7 +187,7 @@ describe('createRunnerDependencies — mode selection', () => {
         providerObjectKey: 'k/orig.jpg',
         filename: 'orig.jpg',
         contentType: 'image/jpeg',
-        byteSize: 1024,
+        byteSize: 4,
         sha256: null,
         purpose: 'cms_media',
         visibility: 'private',
@@ -199,8 +199,8 @@ describe('createRunnerDependencies — mode selection', () => {
         uploadedAt: new Date(),
       },
     });
-    // FAKE_IO returns zero bytes — SharpImageProcessor.metadata()
-    // throws on empty input → RunnerInputError('UNSUPPORTED_FORMAT')
+    // FAKE_IO returns four invalid image bytes — SharpImageProcessor.metadata()
+    // throws on corrupt input → RunnerInputError('UNSUPPORTED_FORMAT')
     // inside the processor → the image runner's defensive try/catch
     // wraps that as PROCESSOR_FAILED (retryable). This proves the
     // wiring works end-to-end without exercising real image bytes —
@@ -381,12 +381,12 @@ describe('runner-dependencies __forTesting__ — clamd env helpers', () => {
   });
 
   test('resolveClamdTimeoutMs defaults on invalid values', () => {
-    expect(__forTesting__.resolveClamdTimeoutMs({})).toBe(10_000);
+    expect(__forTesting__.resolveClamdTimeoutMs({})).toBe(25_000);
     expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '2500' })).toBe(2500);
-    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '-5' })).toBe(10_000);
-    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '0' })).toBe(10_000);
-    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '5.5' })).toBe(10_000);
-    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: 'abc' })).toBe(10_000);
+    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '-5' })).toBe(25_000);
+    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '0' })).toBe(25_000);
+    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: '5.5' })).toBe(25_000);
+    expect(__forTesting__.resolveClamdTimeoutMs({ CLAMD_TIMEOUT_MS: 'abc' })).toBe(25_000);
   });
 
   test('buildLiveMalwareScanner falls back to unknown scanner when ctor throws', async () => {

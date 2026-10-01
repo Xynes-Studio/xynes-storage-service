@@ -138,14 +138,14 @@ function buildAdapter(
   const adapter = new S3StorageProviderAdapter(config, {
     createClient: () => fakeClient as never,
     presign: async (_client, command, opts) => {
-      const cmd = command as { constructor: { name: string }; input: Record<string, unknown> };
-      capture.commands.push({ name: `presign:${cmd.constructor.name}`, input: cmd.input });
+      const input: Record<string, unknown> = { ...command.input };
+      capture.commands.push({ name: `presign:${command.constructor.name}`, input });
       capture.expiries.push(opts.expiresIn);
       // Return a URL pointing at the S3 endpoint host (not a CDN) so the
       // host-check test below can assert the adapter signed against the
       // S3 host, not a custom domain.
       const host = new URL(config.endpoint).host;
-      return `https://${host}/${config.bucket}/${cmd.input.Key}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=REDACTED-IN-TESTS`;
+      return `https://${host}/${config.bucket}/${input.Key}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=REDACTED-IN-TESTS`;
     },
   });
   return { adapter };

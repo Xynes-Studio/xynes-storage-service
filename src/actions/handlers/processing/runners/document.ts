@@ -19,9 +19,10 @@
  * Non-required job. The preview's content type is always PNG or JPEG
  * — never the original document format.
  */
+import { readObjectForProcessing } from './read-object';
 import type { JobRunner, JobRunResult } from '../types';
 import { RunnerExecutionError, RunnerInputError } from './errors';
-import { isSafeDocumentPreviewMime, MAX_DOCUMENT_BYTES } from './profiles';
+import { isSafeDocumentPreviewMime } from './profiles';
 import type { DocumentProcessor, ProviderObjectIO, StorageVariantWriter } from './ports';
 import { runRunnerWithErrorMapping } from './runner-utils';
 import { deriveVariantObjectKey } from './variant-keys';
@@ -38,20 +39,8 @@ export function createDocumentPreviewRunner(deps: DocumentPreviewRunnerDependenc
       if (!isSafeDocumentPreviewMime(object.contentType)) {
         throw new RunnerInputError('UNSUPPORTED_FORMAT');
       }
-      if (object.byteSize > MAX_DOCUMENT_BYTES) {
-        throw new RunnerInputError('OVER_MAX_BYTES');
-      }
 
-      let bytes: Uint8Array;
-      try {
-        bytes = await deps.providerIO.readObject({
-          objectKey: object.providerObjectKey,
-          workspaceId: object.workspaceId,
-          providerId: object.providerId,
-        });
-      } catch {
-        throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });
-      }
+      const bytes = await readObjectForProcessing(deps.providerIO, object);
 
       let render;
       try {

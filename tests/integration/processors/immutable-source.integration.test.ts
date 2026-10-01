@@ -69,7 +69,9 @@ describe('SEC-001-FU-1 immutable scan source', () => {
 
   test('expiry during copying cannot finalize or enqueue', async () => {
     const flow = await buildUpload();
-    flow.provider.adapter.copyObjectImpl = async () => {
+    const copy = flow.provider.adapter.copyObjectImpl!;
+    flow.provider.adapter.copyObjectImpl = async (opts) => {
+      await copy(opts);
       flow.repos.setSessionStatus(flow.upload.uploadId, 'expired');
     };
     await expect(

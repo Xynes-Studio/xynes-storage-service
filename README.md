@@ -44,6 +44,15 @@ first consumer, but the contract is universal — any Xynes app may use it.
 - Source plan with full story breakdown:
   [`xynes-infra/docs/plans/2026-05-10-universal-object-storage-file-upload-api.md`](https://github.com/Xynes-Studio/xynes-infra/blob/main/docs/plans/2026-05-10-universal-object-storage-file-upload-api.md)
 
+## Upload size validation
+
+Single and multipart completion verify actual provider length against declared
+`byteSize` and the existing content-family limits before accepting an upload.
+Workers also bound downloaded bytes before scanning or native processing.
+See [the API contract](docs/api-contract.md#complete-upload-session),
+[developer guidance](DEVELOPER.md#xyn-sec-002--actual-upload-and-processing-length-enforcement-2026-09-30),
+and [verification evidence](docs/XYN-SEC-002-verification.md).
+
 ## Branch model
 
 - `main` — release branch. Protected. Status checks and admin enforcement
@@ -65,3 +74,5 @@ no `bun install` step and no service to run locally.
 MIT — see [`LICENSE`](./LICENSE).
 
 Copyright © 2025 Xynes Studio.
+
+[SEC-002 bounded archive policy and integration prerequisites](docs/XYN-SEC-002-archive-policy.md)
