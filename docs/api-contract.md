@@ -66,18 +66,35 @@ endpoint with the matched `actionKey` and the resolved actor headers.
 **Route:** `POST /workspaces/:workspaceId/storage/uploads/:uploadId/complete`
 **Action key:** `platform.storage.objects.upload`
 
+Both single and multipart uploads are verified with a provider HEAD before the
+session becomes `completed`, the object becomes `uploaded`, or jobs are queued.
+The actual length must be a positive integer exactly equal to the declared
+`byteSize` and within the existing policy: images **50 MiB**, videos **2 GiB**,
+documents **100 MiB**, all other families **5 GiB**. Boundaries are inclusive.
+
+A mismatch, empty object, invalid length, or exceeded cap returns
+`400 VALIDATION_ERROR` with `Uploaded object size is invalid` and aborts the
+pending session. For example, declared `4096` bytes with actual `4097` bytes
+cannot complete. Create a new session for a corrected upload. Provider bytes
+are retained for operator cleanup; completion does not delete data.
+
+Transient provider errors keep the session pending. If a prior attempt finalized
+a multipart upload before HEAD/local state failed, a missing multipart handle
+can recover only through successful HEAD and the same size checks. Already
+completed sessions retain their existing idempotent response.
+
 ### Request body
 
 | Field    | Required        | Type   | Notes                                                          |
 | -------- | --------------- | ------ | -------------------------------------------------------------- |
 | `sha256` | no              | string | Optional final checksum if not supplied at create time.        |
-| `parts`  | multipart only  | array  | `{ partNumber, etag, checksum? }` values returned by provider. |
+| `parts`  | multipart only  | array  | `{ partNumber, etag }` values returned by provider. |
 
 ### Response body
 
 | Field             | Type    | Notes                                                                                  |
 | ----------------- | ------- | -------------------------------------------------------------------------------------- |
-| `object`          | object  | Object metadata. Typically `status = "processing"` immediately after completion.       |
+| `object`          | object  | Object metadata with `status = "uploaded"` after size validation.       |
 | `processingJobs`  | array   | Queued validation/scan/compression/preview/transcode jobs with their initial statuses. |
 
 ## Abort upload session
@@ -207,3 +224,10 @@ Known error codes (subset; full list in STORAGE-5/6 schemas):
   appropriate.
 - Raw API keys (`xynes_live_*`) never appear in any request handled by
   storage-service — the gateway has already resolved them.
+
+SEC-002 archive policy: recognized archive MIME types have a 64 MiB completion
+cap, including MIME parameters. All scan inputs have a 64 MiB ceiling, so larger
+video/document/other uploads cannot pass validation despite their historical
+upload caps. Limit/incomplete/unsupported archive inspection terminally fails the
+required job with `ARCHIVE_INSPECTION_REJECTED`. See
+[budgets and recovery](XYN-SEC-002-archive-policy.md).

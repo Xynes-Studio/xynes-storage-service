@@ -101,7 +101,7 @@ describe('clamav-scanner __forTesting__ helpers', () => {
   test('exports stable defaults', () => {
     expect(DEFAULT_CLAMD_HOST).toBe('clamav-clamd');
     expect(DEFAULT_CLAMD_PORT).toBe(3310);
-    expect(DEFAULT_CLAMD_TIMEOUT_MS).toBe(10_000);
+    expect(DEFAULT_CLAMD_TIMEOUT_MS).toBe(25_000);
   });
 
   test('parseClamdResponse maps clean response', () => {
@@ -194,7 +194,7 @@ describe('ClamavMalwareScanner', () => {
     );
 
     const result = await scanner.scan({ bytes: new Uint8Array([1]) });
-    expect(result).toEqual({ verdict: 'unknown' });
+    expect(result).toEqual({ verdict: 'unknown', retryable: false });
   });
 
   test('returns unknown when the connect step exceeds the configured timeout', async () => {
@@ -215,7 +215,7 @@ describe('ClamavMalwareScanner', () => {
     );
 
     const result = await scanner.scan({ bytes: new Uint8Array([1]) });
-    expect(result).toEqual({ verdict: 'unknown' });
+    expect(result).toEqual({ verdict: 'unknown', retryable: false });
   });
 
   test('discards a late socket if connect resolves after the timeout fired', async () => {
@@ -237,7 +237,7 @@ describe('ClamavMalwareScanner', () => {
     );
 
     const verdict = await scanner.scan({ bytes: new Uint8Array([1]) });
-    expect(verdict).toEqual({ verdict: 'unknown' });
+    expect(verdict).toEqual({ verdict: 'unknown', retryable: false });
 
     resolveConnect?.(lateSocket);
     // Let microtasks settle so the discard-and-destroy path runs.
@@ -260,5 +260,90 @@ describe('ClamavMalwareScanner', () => {
     const result = await scanner.scan({ bytes: new Uint8Array([1]) });
     expect(result).toEqual({ verdict: 'clean' });
     expect(state.calls[0]).toEqual({ path: '/tmp/clamd.sock' });
+  });
+});
+
+describe('SEC-002 archive inspection outcomes', () => {
+  test.each(['MaxFileSize', 'MaxScanSize', 'MaxRecursion', 'MaxFiles', 'MaxScanTime'])(
+    'maps %s to a deterministic limit verdict',
+    (reason) => {
+      expect(
+        __forTesting__.parseClamdResponse(`stream: Heuristics.Limits.Exceeded.${reason} FOUND`),
+      ).toEqual({ verdict: 'limit_exceeded' });
+    },
+  );
+  test.each(['StreamMaxLength', 'ArchiveIncomplete', 'ArchiveEncrypted', 'ArchiveUnsupported'])(
+    'maps supervised %s to deterministic rejection',
+    (reason) => {
+      expect(
+        __forTesting__.parseClamdResponse(`stream: Xynes.Archive.Limit.${reason} FOUND`),
+      ).toEqual({ verdict: 'limit_exceeded' });
+    },
+  );
+  test.each([
+    'stream: ERROR OK',
+    'stream: skipped OK',
+    'stream: OK extra',
+    'some OK',
+    'stream: INSTREAM size limit exceeded. ERROR',
+  ])('never treats ambiguous reply as clean: %s', (reply) => {
+    expect(__forTesting__.parseClamdResponse(reply).verdict).not.toBe('clean');
+  });
+});
+
+describe('SEC-002 scanner client bounds', () => {
+  test('rejects oversized input without opening a connection', async () => {
+    const state: FactoryState = { calls: [], sockets: [] };
+    const scanner = new ClamavMalwareScanner(
+      { maxInputBytes: 4 },
+      makeFactory({ responseText: 'stream: OK' }, state),
+    );
+    expect(await scanner.scan({ bytes: new Uint8Array(5) })).toEqual({ verdict: 'limit_exceeded' });
+    expect(state.calls).toHaveLength(0);
+  });
+  test.each([0, -1, NaN, Infinity, 1.5])('rejects unsafe chunk/timeout limits %s', (value) => {
+    expect(() => new ClamavMalwareScanner({ chunkBytes: value })).toThrow();
+    expect(() => new ClamavMalwareScanner({ timeoutMs: value })).toThrow();
+  });
+});
+
+describe('SEC-002 early scanner replies and stalled writes', () => {
+  test('preserves a deterministic rejection even when the scanner stops reading input', async () => {
+    const socket = new FakeSocket({ responseText: '', noResponse: true });
+    let writes = 0;
+    socket.write = (_chunk, cb) => {
+      writes++;
+      if (writes === 1)
+        socket.emit('data', Buffer.from('stream: Xynes.Archive.Limit.StreamMaxLength FOUND\0'));
+      else throw new Error('broken pipe');
+      cb?.();
+      return true;
+    };
+    const scanner = new ClamavMalwareScanner(
+      {},
+      {
+        async connect() {
+          return socket;
+        },
+      },
+    );
+    expect(await scanner.scan({ bytes: new Uint8Array(8) })).toEqual({ verdict: 'limit_exceeded' });
+  });
+  test('bounds a write whose completion callback never arrives', async () => {
+    const socket = new FakeSocket({ responseText: '', noResponse: true });
+    socket.write = () => true;
+    const scanner = new ClamavMalwareScanner(
+      { timeoutMs: 15 },
+      {
+        async connect() {
+          return socket;
+        },
+      },
+    );
+    expect(await scanner.scan({ bytes: new Uint8Array(8) })).toEqual({
+      verdict: 'unknown',
+      retryable: false,
+    });
+    expect(socket.destroyed).toBe(true);
   });
 });

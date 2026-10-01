@@ -552,7 +552,9 @@ describe('S3StorageProviderAdapter — STORAGE-FU-5 getObjectBytes', () => {
     const { adapter, sentCommands } = makeAdapter(R2_CONFIG, {
       sendResult: {
         Body: {
-          transformToByteArray: async () => sample,
+          async *[Symbol.asyncIterator]() {
+            yield sample;
+          },
         },
       },
     });
@@ -565,11 +567,17 @@ describe('S3StorageProviderAdapter — STORAGE-FU-5 getObjectBytes', () => {
     });
   });
 
-  test('falls back to arrayBuffer() when transformToByteArray is unavailable', async () => {
+  test('consumes the SDK Web stream when async iteration is unavailable', async () => {
     const { adapter } = makeAdapter(R2_CONFIG, {
       sendResult: {
         Body: {
-          arrayBuffer: async () => new Uint8Array([9, 9]).buffer,
+          transformToWebStream: () =>
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new Uint8Array([9, 9]));
+                controller.close();
+              },
+            }),
         },
       },
     });
@@ -617,13 +625,14 @@ describe('S3StorageProviderAdapter — STORAGE-FU-5 getObjectBytes', () => {
   });
 
   test('PR #13 Codex P2: stream-read failure is wrapped + redacted via runWithRedactedError', async () => {
-    // The SDK `send()` succeeds but the body consumer (transformToByteArray)
+    // The SDK `send()` succeeds but the incremental body consumer
     // throws. Pre-fix this raw error would have escaped the
     // ProviderAdapterError redaction surface; post-fix it gets wrapped.
     const { adapter } = makeAdapter(R2_CONFIG, {
       sendResult: {
         Body: {
-          transformToByteArray: async () => {
+          async *[Symbol.asyncIterator]() {
+            yield new Uint8Array([1]);
             throw Object.assign(
               new Error(
                 'TLS read failure: AKIA-STREAM-LEAK 0xDEADBEEF X-Amz-Signature=leakedsig123',
@@ -650,11 +659,11 @@ describe('S3StorageProviderAdapter — STORAGE-FU-5 getObjectBytes', () => {
     }
   });
 
-  test('PR #13 Codex P2: arrayBuffer() failure is also wrapped + redacted', async () => {
+  test('PR #13 Codex P2: Web stream conversion failure is also wrapped + redacted', async () => {
     const { adapter } = makeAdapter(R2_CONFIG, {
       sendResult: {
         Body: {
-          arrayBuffer: async () => {
+          transformToWebStream: () => {
             throw new Error('socket reset by peer s3.fake.example/secret-bucket-name');
           },
         },
@@ -699,7 +708,7 @@ describe('S3StorageProviderAdapter — STORAGE-FU-5 putObjectBytes', () => {
       contentType: 'image/jpeg',
       ifAbsent: true,
     });
-    expect((sentCommands[0]?.input as Record<string, unknown>).IfNoneMatch).toBe('*');
+    expect(sentCommands[0]?.input.IfNoneMatch).toBe('*');
   });
 
   test('omits IfNoneMatch when ifAbsent is unset (default behaviour)', async () => {
@@ -710,7 +719,7 @@ describe('S3StorageProviderAdapter — STORAGE-FU-5 putObjectBytes', () => {
       body,
       contentType: 'image/jpeg',
     });
-    expect((sentCommands[0]?.input as Record<string, unknown>).IfNoneMatch).toBeUndefined();
+    expect(sentCommands[0]?.input.IfNoneMatch).toBeUndefined();
   });
 
   test('NEVER sets Tagging — STORAGE-4 portability invariant', async () => {
@@ -722,7 +731,7 @@ describe('S3StorageProviderAdapter — STORAGE-FU-5 putObjectBytes', () => {
       contentType: 'image/jpeg',
       ifAbsent: true,
     });
-    expect((sentCommands[0]?.input as Record<string, unknown>).Tagging).toBeUndefined();
+    expect(sentCommands[0]?.input.Tagging).toBeUndefined();
   });
 
   test('rejects non-Uint8Array body with PROVIDER_CONFIG_INVALID', async () => {
@@ -770,5 +779,249 @@ describe('S3StorageProviderAdapter — STORAGE-FU-5 putObjectBytes', () => {
     } catch (err) {
       expect((err as Error).message).not.toContain('v3rys3cretValueWasHere-LEAKED');
     }
+  });
+});
+
+describe('XYN-SEC-002 — bounded provider downloads', () => {
+  function streamingBody(chunks: Uint8Array[], state = { closed: false, buffered: false }) {
+    return {
+      async *[Symbol.asyncIterator]() {
+        try {
+          for (const chunk of chunks) yield chunk;
+        } finally {
+          state.closed = true;
+        }
+      },
+      async transformToByteArray() {
+        state.buffered = true;
+        return new Uint8Array(chunks.flatMap((chunk) => Array.from(chunk)));
+      },
+    };
+  }
+  for (const contentLength of [undefined, 4]) {
+    test(`stops on actual overflow with ContentLength=${contentLength}`, async () => {
+      const state = { closed: false, buffered: false };
+      const { adapter } = makeAdapter(R2_CONFIG, {
+        sendResult: {
+          ContentLength: contentLength,
+          Body: streamingBody([new Uint8Array(4), new Uint8Array(1)], state),
+        },
+      });
+      await expect(
+        adapter.getObjectBytes({ objectKey: 'a.bin', maxBytes: 4, expectedByteSize: 4 }),
+      ).rejects.toMatchObject({ code: 'PROVIDER_OBJECT_TOO_LARGE' });
+      expect(state.closed).toBe(true);
+      expect(state.buffered).toBe(false);
+    });
+  }
+  test('accepts chunks totaling the exact limit without whole-body conversion', async () => {
+    const state = { closed: false, buffered: false };
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        ContentLength: 4,
+        Body: streamingBody([new Uint8Array([1, 2]), new Uint8Array([3, 4])], state),
+      },
+    });
+    expect(
+      await adapter.getObjectBytes({ objectKey: 'a.bin', maxBytes: 4, expectedByteSize: 4 }),
+    ).toEqual(new Uint8Array([1, 2, 3, 4]));
+    expect(state.buffered).toBe(false);
+  });
+  test('rejects a truncated response instead of passing it to a processor', async () => {
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        Body: streamingBody([new Uint8Array(3)]),
+      },
+    });
+    await expect(
+      adapter.getObjectBytes({ objectKey: 'a.bin', maxBytes: 4, expectedByteSize: 4 }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_OBJECT_SIZE_MISMATCH' });
+  });
+  test('rejects over-limit GET metadata without reading the body and destroys it', async () => {
+    let destroyed = false;
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        ContentLength: 5,
+        Body: {
+          destroy() {
+            destroyed = true;
+          },
+          async transformToByteArray() {
+            throw new Error('must not read');
+          },
+        },
+      },
+    });
+    await expect(adapter.getObjectBytes({ objectKey: 'a.bin', maxBytes: 4 })).rejects.toMatchObject(
+      { code: 'PROVIDER_OBJECT_TOO_LARGE' },
+    );
+    expect(destroyed).toBe(true);
+  });
+  test('rejects mismatched GET metadata before consuming bytes', async () => {
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        ContentLength: 3,
+        Body: streamingBody([new Uint8Array(3)]),
+      },
+    });
+    await expect(
+      adapter.getObjectBytes({ objectKey: 'a.bin', maxBytes: 4, expectedByteSize: 4 }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_OBJECT_SIZE_MISMATCH' });
+  });
+  test('cancels a Web stream on overflow', async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(5));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const { adapter } = makeAdapter(R2_CONFIG, { sendResult: { Body: body } });
+    await expect(adapter.getObjectBytes({ objectKey: 'a.bin', maxBytes: 4 })).rejects.toMatchObject(
+      { code: 'PROVIDER_OBJECT_TOO_LARGE' },
+    );
+    expect(cancelled).toBe(true);
+  });
+  for (const maxBytes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    test(`rejects invalid byte limit ${maxBytes} before SDK I/O`, async () => {
+      const { adapter, sentCommands } = makeAdapter(R2_CONFIG);
+      await expect(adapter.getObjectBytes({ objectKey: 'a.bin', maxBytes })).rejects.toMatchObject({
+        code: 'PROVIDER_CONFIG_INVALID',
+      });
+      expect(sentCommands).toHaveLength(0);
+    });
+  }
+});
+
+describe('XYN-SEC-002 — stream edge cases', () => {
+  test('stream conversion failure disposes the response and redacts its detail', async () => {
+    let destroyed = false;
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        Body: {
+          transformToWebStream() {
+            throw new Error('fixture-private-provider-detail');
+          },
+          destroy() {
+            destroyed = true;
+          },
+        },
+      },
+    });
+    await expect(
+      adapter.getObjectBytes({ objectKey: 'original', maxBytes: 4 }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_OPERATION_FAILED' });
+    expect(destroyed).toBe(true);
+  });
+  test('rejects fully-buffered conversion-only bodies rather than trusting ContentLength', async () => {
+    let buffered = false;
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        ContentLength: 4,
+        Body: {
+          async transformToByteArray() {
+            buffered = true;
+            return new Uint8Array(5);
+          },
+        },
+      },
+    });
+    await expect(
+      adapter.getObjectBytes({ objectKey: 'original', maxBytes: 4 }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_OPERATION_FAILED' });
+    expect(buffered).toBe(false);
+  });
+  test('growth stays within the read budget over many tiny and empty chunks', async () => {
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        Body: {
+          async *[Symbol.asyncIterator]() {
+            for (let i = 0; i < 70_000; i++) {
+              yield new Uint8Array();
+              yield new Uint8Array([i % 256]);
+            }
+          },
+        },
+      },
+    });
+    const bytes = await adapter.getObjectBytes({
+      objectKey: 'original',
+      maxBytes: 70_000,
+      expectedByteSize: 70_000,
+    });
+    expect(bytes.byteLength).toBe(70_000);
+    expect(bytes.buffer.byteLength).toBeLessThanOrEqual(70_000);
+    expect(bytes[69_999]).toBe(69_999 % 256);
+  });
+  test('rejects non-byte chunks and closes the stream', async () => {
+    let closed = false;
+    const { adapter } = makeAdapter(R2_CONFIG, {
+      sendResult: {
+        Body: {
+          async *[Symbol.asyncIterator]() {
+            try {
+              yield 'fixture-private-stream-detail';
+            } finally {
+              closed = true;
+            }
+          },
+        },
+      },
+    });
+    await expect(
+      adapter.getObjectBytes({ objectKey: 'original', maxBytes: 4 }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_OPERATION_FAILED' });
+    expect(closed).toBe(true);
+  });
+  for (const contentLength of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    test(`rejects invalid GET content length ${contentLength}`, async () => {
+      const { adapter } = makeAdapter(R2_CONFIG, { sendResult: { ContentLength: contentLength } });
+      await expect(
+        adapter.getObjectBytes({ objectKey: 'original', maxBytes: 4 }),
+      ).rejects.toMatchObject({ code: 'PROVIDER_OBJECT_SIZE_MISMATCH' });
+    });
+  }
+  for (const expectedByteSize of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    test(`rejects invalid expected size ${expectedByteSize} before SDK I/O`, async () => {
+      const { adapter, sentCommands } = makeAdapter(R2_CONFIG);
+      await expect(
+        adapter.getObjectBytes({ objectKey: 'original', maxBytes: 4, expectedByteSize }),
+      ).rejects.toMatchObject({ code: 'PROVIDER_CONFIG_INVALID' });
+      expect(sentCommands).toHaveLength(0);
+    });
+  }
+});
+
+test('XYN-SEC-002 — unsafe SDK error names do not leak through read errors', async () => {
+  const { adapter } = makeAdapter(R2_CONFIG, {
+    sendError: Object.assign(new Error('fixture-private'), {
+      name: 'X-Amz-Signature=fixture-private',
+    }),
+  });
+  await expect(
+    adapter.getObjectBytes({ objectKey: 'original', maxBytes: 4 }),
+  ).rejects.toMatchObject({
+    code: 'PROVIDER_OPERATION_FAILED',
+    message: 'Storage provider operation failed',
+  });
+});
+
+test('XYN-SEC-002 — missing multipart handle has a stable redacted code for HEAD recovery', async () => {
+  const { adapter } = makeAdapter(R2_CONFIG, {
+    sendError: Object.assign(new Error('fixture-private-upload-id'), {
+      name: 'NoSuchUpload',
+    }),
+  });
+  await expect(
+    adapter.completeMultipartUpload({
+      objectKey: 'original',
+      providerUploadId: 'fixture',
+      parts: [{ partNumber: 1, etag: 'etag' }],
+    }),
+  ).rejects.toMatchObject({
+    code: 'PROVIDER_MULTIPART_NOT_FOUND',
+    message: 'Multipart upload handle no longer exists',
   });
 });

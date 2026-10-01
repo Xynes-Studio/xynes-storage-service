@@ -27,6 +27,7 @@
  * sharp-backed `ImageProcessor`; tests inject a fake that returns
  * deterministic bytes.
  */
+import { readObjectForProcessing } from './read-object';
 import { classifyContentType } from '../../objects/schemas';
 import type { JobRunner, JobRunResult } from '../types';
 import { RunnerExecutionError, RunnerInputError } from './errors';
@@ -34,7 +35,6 @@ import {
   DEFAULT_QUALITY_PROFILE,
   getImageProfile,
   isQualityProfile,
-  MAX_IMAGE_BYTES,
   MAX_IMAGE_DIMENSION,
   type ImageVariantSpec,
   type QualityProfile,
@@ -65,22 +65,10 @@ export function createImageOptimizeRunner(deps: ImageOptimizeRunnerDependencies)
       if (classifyContentType(object.contentType) !== 'image') {
         throw new RunnerInputError('UNSUPPORTED_FORMAT');
       }
-      if (object.byteSize > MAX_IMAGE_BYTES) {
-        throw new RunnerInputError('OVER_MAX_BYTES');
-      }
 
       const profile = getImageProfile(resolveProfile(job.payload));
 
-      let bytes: Uint8Array;
-      try {
-        bytes = await deps.providerIO.readObject({
-          objectKey: object.providerObjectKey,
-          workspaceId: object.workspaceId,
-          providerId: object.providerId,
-        });
-      } catch {
-        throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });
-      }
+      const bytes = await readObjectForProcessing(deps.providerIO, object);
 
       let probe;
       try {

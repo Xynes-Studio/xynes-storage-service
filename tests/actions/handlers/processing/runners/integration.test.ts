@@ -53,7 +53,7 @@ function buildWiring() {
 describe('end-to-end: planner + worker + registry (STORAGE-7 ∘ STORAGE-8)', () => {
   test('image upload runs scan + image_optimize end-to-end, parent ends ready', async () => {
     const { queue, status, providerIO, variants, runners } = buildWiring();
-    const object = seedImageObject();
+    const object = { ...seedImageObject(), byteSize: 64 };
     providerIO.preload(object.providerObjectKey, makeBytes(64), 'image/jpeg');
 
     await enqueueProcessingForObject(
@@ -94,7 +94,7 @@ describe('end-to-end: planner + worker + registry (STORAGE-7 ∘ STORAGE-8)', ()
 
   test('video upload runs scan + probe + thumbnail + transcode and ends ready', async () => {
     const { queue, status, providerIO, variants, runners } = buildWiring();
-    const object = seedVideoObject();
+    const object = { ...seedVideoObject(), byteSize: 64 };
     providerIO.preload(object.providerObjectKey, makeBytes(64), 'video/mp4');
 
     await enqueueProcessingForObject(

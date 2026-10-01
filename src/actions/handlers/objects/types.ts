@@ -105,7 +105,13 @@ export interface ListObjectsRepoFilters {
   readonly purpose?: string;
   readonly status?: ObjectStatus;
   readonly contentTypeFamily?:
-    'image' | 'video' | 'audio' | 'document' | 'archive' | 'text' | 'other';
+    | 'image'
+    | 'video'
+    | 'audio'
+    | 'document'
+    | 'archive'
+    | 'text'
+    | 'other';
   readonly createdBy?: string;
   readonly createdAfter?: Date;
   readonly createdBefore?: Date;

@@ -13,13 +13,14 @@
  *        if it supports expiry, otherwise treat as state conflict.
  *   3. Lookup associated object — defensive (the FK guarantees it exists).
  *   4. For multipart sessions: call provider `completeMultipartUpload(parts)`.
- *      For single sessions: HEAD the object to validate the upload landed.
+ *      Then HEAD both methods and reconcile actual length with declared size and policy.
  *   5. Atomically mark the session `completed` and the object `uploaded`.
  *      If the conditional update misses (concurrent abort), surface a
  *      state conflict.
  *   6. STORAGE-7 will queue async processing jobs here. For STORAGE-5 we
  *      return an empty `processingJobs` array.
  */
+import { isValidObjectByteSize, maxBytesForContentType } from '../objects/byte-size-policy';
 import { ProviderAdapterError } from '../../../infra/providers/errors';
 import { ValidationError, ForbiddenError } from '../../errors';
 import type { ActionContext } from '../../types';
@@ -102,22 +103,39 @@ export function createCompleteUploadHandler(deps: UploadHandlerDependencies) {
       if (!input.parts || input.parts.length === 0) {
         throw new ValidationError('Multipart complete requires `parts`');
       }
-      await provider.adapter.completeMultipartUpload({
-        objectKey: object.providerObjectKey,
-        providerUploadId: session.providerUploadId,
-        parts: input.parts,
-      });
-    } else {
-      // Single upload: validate landing via HEAD. We DO NOT trust the
-      // caller's claim that they uploaded; HEAD is the strongest evidence
-      // we can collect without scanning content.
-      const head = await provider.adapter.headObject({
-        objectKey: object.providerObjectKey,
-      });
-      if (head.contentLength === 0) {
-        // Most providers return 404 (not 0-byte). Defensive guard.
-        throw new ValidationError('Uploaded object is empty');
+      try {
+        await provider.adapter.completeMultipartUpload({
+          objectKey: object.providerObjectKey,
+          providerUploadId: session.providerUploadId,
+          parts: input.parts,
+        });
+      } catch (err) {
+        // A previous attempt may have finalized the provider upload, then
+        // failed HEAD or the local transition. Recover ONLY a missing handle;
+        // the HEAD + size check below remains mandatory.
+        if (!(err instanceof ProviderAdapterError) || err.code !== 'PROVIDER_MULTIPART_NOT_FOUND') {
+          throw err;
+        }
       }
+    }
+
+    // Completion is never evidence of size. HEAD both methods before
+    // transitioning state or scheduling any processing.
+    const head = await provider.adapter.headObject({ objectKey: object.providerObjectKey });
+    if (
+      !isValidObjectByteSize(head.contentLength) ||
+      !isValidObjectByteSize(object.byteSize) ||
+      head.contentLength !== object.byteSize ||
+      head.contentLength > maxBytesForContentType(object.contentType)
+    ) {
+      await deps.sessions.markAbortedIfPending({
+        sessionId: session.id,
+        workspaceId: ctx.workspaceId,
+        now: issuedAt,
+      });
+      // Do not delete provider bytes here: a concurrent completion may
+      // own the object. Retain it for operator cleanup.
+      throw new ValidationError('Uploaded object size is invalid');
     }
 
     // Atomic state transition: pending -> completed, AND object pending_upload -> uploaded.

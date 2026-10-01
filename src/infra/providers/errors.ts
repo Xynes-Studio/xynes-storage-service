@@ -9,6 +9,9 @@
  */
 
 export type ProviderAdapterErrorCode =
+  | 'PROVIDER_OBJECT_TOO_LARGE'
+  | 'PROVIDER_OBJECT_SIZE_MISMATCH'
+  | 'PROVIDER_MULTIPART_NOT_FOUND'
   /** Configuration is missing required fields or contains invalid values. */
   | 'PROVIDER_CONFIG_INVALID'
   /** Provider operation failed (network / auth / provider-side error). */
@@ -23,6 +26,9 @@ export type ProviderAdapterErrorCode =
   | 'PROVIDER_PRESIGN_EXPIRY_INVALID';
 
 const SAFE_MESSAGES: Record<ProviderAdapterErrorCode, string> = {
+  PROVIDER_OBJECT_TOO_LARGE: 'Storage object exceeds the read byte limit',
+  PROVIDER_OBJECT_SIZE_MISMATCH: 'Storage object size does not match the declared size',
+  PROVIDER_MULTIPART_NOT_FOUND: 'Multipart upload handle no longer exists',
   PROVIDER_CONFIG_INVALID: 'Storage provider configuration is invalid',
   PROVIDER_OPERATION_FAILED: 'Storage provider operation failed',
   PROVIDER_OPERATION_REFUSED: 'Storage provider operation refused by adapter',

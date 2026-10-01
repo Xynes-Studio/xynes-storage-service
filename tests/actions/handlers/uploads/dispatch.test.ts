@@ -68,7 +68,7 @@ describe('buildUploadActionHandler — payload routing', () => {
         operation: 'create',
         filename: 'a.bin',
         contentType: 'application/octet-stream',
-        byteSize: 1,
+        byteSize: 4096,
       },
       makeUserCtx(),
     )) as { uploadId: string };

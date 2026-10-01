@@ -13,6 +13,7 @@
  * provider config / credentials back to the caller (see `responses.ts`).
  */
 import { z } from 'zod';
+import { DEFAULT_MAX_BYTE_SIZE } from '../objects/byte-size-policy';
 
 /** Plan §7 default purpose for non-CMS callers. */
 export const DEFAULT_UPLOAD_PURPOSE = 'platform_generic';
@@ -82,7 +83,7 @@ const purposeSchema = z
  * provider config; the storage-service MUST always enforce a server-side
  * limit even when the caller forgets one.
  */
-export const DEFAULT_MAX_BYTE_SIZE = 5 * 1024 * 1024 * 1024; // 5 GiB.
+export { DEFAULT_MAX_BYTE_SIZE } from '../objects/byte-size-policy';
 
 /**
  * STORAGE-5 — request schema for upload session lifecycle actions.

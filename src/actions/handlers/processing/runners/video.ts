@@ -18,6 +18,7 @@
  * error codes (`OVER_MAX_BYTES`, `OVER_MAX_DURATION`,
  * `OVER_MAX_DIMENSIONS`, `UNSUPPORTED_FORMAT`, `PROCESSOR_FAILED`).
  */
+import { readObjectForProcessing } from './read-object';
 import { classifyContentType } from '../../objects/schemas';
 import type { JobRunner, JobRunResult } from '../types';
 import { RunnerExecutionError, RunnerInputError } from './errors';
@@ -25,7 +26,6 @@ import {
   DEFAULT_QUALITY_PROFILE,
   getVideoProfile,
   isQualityProfile,
-  MAX_VIDEO_BYTES,
   MAX_VIDEO_DIMENSION,
   MAX_VIDEO_DURATION_SECONDS,
   type QualityProfile,
@@ -58,18 +58,7 @@ async function ensureVideoAndReadBytes(input: {
   if (classifyContentType(object.contentType) !== 'video') {
     throw new RunnerInputError('UNSUPPORTED_FORMAT');
   }
-  if (object.byteSize > MAX_VIDEO_BYTES) {
-    throw new RunnerInputError('OVER_MAX_BYTES');
-  }
-  try {
-    return await providerIO.readObject({
-      objectKey: object.providerObjectKey,
-      workspaceId: object.workspaceId,
-      providerId: object.providerId,
-    });
-  } catch {
-    throw new RunnerExecutionError('PROCESSOR_FAILED', { retryable: true });
-  }
+  return readObjectForProcessing(providerIO, object);
 }
 
 // ── video_probe (REQUIRED) ───────────────────────────────────────────────

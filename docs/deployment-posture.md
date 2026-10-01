@@ -97,9 +97,9 @@ A long-lived `soffice` process in headless mode behind a thin Bun HTTP shim that
 
 Two sidecars because their lifecycles are independent:
 
-1. **`clamav-clamd`** — long-lived `clamd` daemon listening on TCP `3310` (or Unix socket). Scanning uses the `INSTREAM` protocol (bytes streamed in over the socket; no temp file ever touches disk).
+1. **`clamav-clamd`** — SEC-002 archive supervisor on TCP `3310`, owning a private ClamAV daemon on loopback `3311`. Storage streams metadata and original bytes; a bounded original tempfile lives in tmpfs. Members are never extracted to disk.
 2. **`clamav-freshclam`** — long-lived `freshclam` updater that fetches definitions on a configurable schedule (default every 24 h). Writes to a **shared named volume** that `clamav-clamd` reads. A `freshclam` failure restarts ONLY the `freshclam` container; `clamd` keeps scanning against the last good definitions.
-- **`unknown` is never coerced to `clean`** (STORAGE-9 §3.6 invariant). A clamd disconnect or read timeout surfaces as `SCANNER_INCONCLUSIVE` → STORAGE-7 worker retries with backoff and dead-letters at `maxAttempts`.
+- **`unknown` is never coerced to `clean`** (STORAGE-9 §3.6 invariant). Availability errors surface as `SCANNER_INCONCLUSIVE` with bounded retries. Client timeout is terminal; archive-limit or incomplete inspection fails without retries.
 - **discovery** — storage-service reaches the clamd sidecar via `CLAMD_HOST=clamav-clamd` + `CLAMD_PORT=3310`.
 
 ---
@@ -145,10 +145,10 @@ services:
     image: lscr.io/linuxserver/libreoffice:7.6.7
     # ...
   clamav-clamd:
-    image: clamav/clamav:1.3
+    image: xynes/archive-scanner:0.1.0
     # ...
   clamav-freshclam:
-    image: clamav/clamav:1.3
+    image: clamav/clamav:1.5.2-debian
     command: ["freshclam", "--daemon", "--foreground"]
     # ...
   storage-service:
@@ -164,7 +164,7 @@ services:
 
 The full file enforces:
 - Pinned image tags (no `:latest`).
-- Read-only root filesystem on both sidecars.
+- Read-only scanner root filesystem; freshclam retains its upstream writable entrypoint exception.
 - `cap_drop: [ALL]` (no Linux capabilities granted).
 - `security_opt: [no-new-privileges:true]`.
 - Resource limits matching `xynes/xynes-infra/infra/release/ENVIRONMENTS.md` (sidecars are NOT counted against the storage-service RAM budget; they are documented as separate line items in the live-mode footnote).
@@ -254,7 +254,7 @@ Macros are disabled **globally** at the container env level, not per-request. A 
 - **sharp:** in-memory buffer → in-memory buffer (FU-A).
 - **ffmpeg:** stdin → stdout pipes (FU-B planned).
 - **LibreOffice:** input bytes written to a `tmpfs`-mounted per-request directory; deleted in a `finally` block on the storage-service side. The directory is **not host-mounted** — it lives only inside the sidecar's filesystem.
-- **clamav:** `INSTREAM` protocol streams bytes through the TCP socket; no temp file.
+- **clamav:** metadata plus INSTREAM sends bytes to the supervisor; a bounded original tempfile is removed after inspection. No member files are extracted.
 
 A sidecar OOM kill that leaves a residual `tmpfs` mount loses the bytes when the sidecar restarts (tmpfs is RAM-backed).
 
@@ -423,3 +423,11 @@ rollout gate.
 - `xynes/xynes-infra/infra/release/deployment-posture/k8s/README.md` — K8s draft manifests.
 - `xynes/xynes-infra/infra/release/K8S-READINESS-CHECKLIST.md` — broader K8s migration audit.
 - `xynes/xynes-infra/infra/release/ENVIRONMENTS.md` §4 — port table + live-mode RAM footnote.
+
+## SEC-002 bounded archive scanner (2026-10-01)
+
+The live overlay replaces raw clamd with the custom non-root scanner supervisor.
+ClamAV is pinned by image digest; explicit expansion/count/recursion/time limits
+are supplemented by strict preflight and process kill/reap. See
+[the canonical archive policy](XYN-SEC-002-archive-policy.md) for resource budgets,
+image build, private probes, signature-volume checks and pending SEC-001 merge gate.
