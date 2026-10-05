@@ -33,6 +33,8 @@ first consumer, but the contract is universal — any Xynes app may use it.
 
 ## Documentation
 
+- [`docs/XYN-SEC-005-verification.md`](docs/XYN-SEC-005-verification.md) — pinned release image, build-context and non-root processor verification.
+
 - [`docs/native-image-security.md`](./docs/native-image-security.md) — XYN-SEC-001 remediation and Linux release-image verification.
 - [`docs/SECURITY-REMEDIATION-STATUS.md`](./docs/SECURITY-REMEDIATION-STATUS.md) — SEC-001 and SEC-001-FU-1 closure evidence and rollout requirements.
 
