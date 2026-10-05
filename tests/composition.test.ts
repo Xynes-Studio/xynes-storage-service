@@ -1,3 +1,4 @@
+import { signedInit } from './support/internal-request';
 /**
  * STORAGE-FU-4 — composition root tests.
  *
@@ -419,11 +420,14 @@ describe('STORAGE-FU-4 composition — HTTP envelope integration', () => {
     };
 
     for (const actionKey of REGISTERED_ACTION_KEYS) {
-      const res = await app.request('/internal/storage-actions', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ actionKey, payload: {} }),
-      });
+      const res = await app.request(
+        '/internal/storage-actions',
+        signedInit('/internal/storage-actions', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ actionKey, payload: {} }),
+        }),
+      );
       const body = (await res.json()) as { ok: boolean; error?: { code?: string } };
       // The handler may legitimately fail with VALIDATION_ERROR / NOT_FOUND
       // / etc. — what we are asserting is that the action key was ROUTED
