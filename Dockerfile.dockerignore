@@ -2,10 +2,14 @@
 **
 !package.json
 !bun.lock
+# Needed by the development test suite; never copied into the prod stage.
+!Dockerfile
 !src/
-!src/**
+src/**
+!src/**/*.ts
 !scripts/
-!scripts/**
+scripts/**
+!scripts/**/*.ts
 !tests/
 !tests/**
 !tsconfig.json
@@ -13,8 +17,22 @@
 !.prettier*
 # Never admit host dependencies, env files, credentials or generated evidence.
 **/node_modules
+**/node_modules/**
 **/.env
 **/.env.*
 **/.git
+**/.git/**
 **/coverage
+**/coverage/**
 **/*.log
+# Private material is excluded even under otherwise admitted runtime/test paths.
+**/.aws
+**/.aws/**
+**/.ssh
+**/.ssh/**
+**/.npmrc
+**/.netrc
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx

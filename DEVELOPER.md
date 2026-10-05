@@ -3254,3 +3254,20 @@ preflight, ClamAV limits and kill/reap watchdog. Deterministic rejection is term
 The separately developed SEC-001 download/native scan-success gates are a merge
 integration prerequisite. Run the isolated archive harness and enable its combined
 SEC-001 gate after those changes become available.
+
+
+## XYN-SEC-005 — pinned and restricted release image (2026-10-02)
+
+The Bun base is version/digest pinned. The committed Dockerfile-specific build
+allowlist admits TypeScript source/scripts and development test/config inputs,
+then excludes private material at every depth. Final production copying remains
+restricted to manifests, production dependencies, source and the native assertion.
+The pre-existing local `.dockerignore` is unchanged.
+
+Run `bash scripts/verify-release-image.sh <local-image-tag> <linux-platform>`.
+It checks real Docker context filtering with inert canaries, exact runtime files,
+dev-only dependency absence, UID/GID 1000 and Linux isolation, then exercises
+Sharp and ffmpeg using the image's own binaries. The existing CI image job runs
+this harness. Apply `compose.security.yml` last for deployment; isolation flags
+are runtime settings, not automatically enforced by the image. No new runtime
+env, API, dependency or migration. See [verification and rollback](docs/XYN-SEC-005-verification.md).
