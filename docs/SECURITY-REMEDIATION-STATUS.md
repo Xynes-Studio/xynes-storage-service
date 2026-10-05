@@ -1,4 +1,4 @@
-# Storage security remediation status — updated 2026-10-02
+# Storage security remediation status — updated 2026-10-05
 
 | Work                                                                   | Status                                             | Evidence                                                                                                                    |
 | ---------------------------------------------------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
@@ -6,12 +6,12 @@
 | SEC-001-FU-1 immutable scan/content binding                            | **CLOSED — implemented and validated in SEC-001**  | [Story](plans/2026-09-30-XYN-SEC-001-FU-1-immutable-scan-content.md), [design](plans/2026-09-30-XYN-SEC-001-FU-1-design.md) |
 | Production deployment / broader audit release                          | **Not authorized or performed**                    | [Rollout requirements](native-image-security.md#legacy-rollout-and-retention) and other audit findings remain applicable    |
 | SEC-002 actual-length/archive limits | **Merged — storage #33 / infra #121 on 2026-10-01; target rollout pending** | [Review](XYN-SEC-002-pre-pr-review.md) |
-| SEC-005 release image hardening | **Pre-PR re-validation passed 2026-10-02; merge pending** | [Verification](XYN-SEC-005-verification.md), [review](XYN-SEC-005-pre-pr-review.md) |
+| SEC-005 release image hardening | **[PR #34 open](https://github.com/Xynes-Studio/xynes-storage-service/pull/34); validated 2026-10-02; merge pending** | [Verification](XYN-SEC-005-verification.md), [review](XYN-SEC-005-pre-pr-review.md) |
 
 This supersedes the earlier scope split: the user required FU-1 to be completed
 before the combined PR. Upload completion finalizes server-only content, and scan
 proof is checked against that key/provider on both processing and signed delivery.
-The original audit findings remain historical; its October 2 progress register
+The original audit findings remain historical; its October 5 progress register
 records current merged and pending work. No external
 tracker or production state is changed by this record.
 

@@ -131,3 +131,7 @@ no incoming code changes from the validated baseline. See the
 [review publication addendum](XYN-SEC-005-pre-pr-review.md#publication-preparation--2026-10-05)
 for identity, scope and preservation checks. Validation dates above remain
 October 2; publication does not authorize merge or deployment.
+
+Published PRs against `develop`: [storage #34](https://github.com/Xynes-Studio/xynes-storage-service/pull/34) and
+[infra #125](https://github.com/Xynes-Studio/xynes-infra/pull/125).
+Both remain open for review and merge.

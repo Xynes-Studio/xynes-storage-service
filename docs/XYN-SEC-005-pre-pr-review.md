@@ -238,3 +238,13 @@ Effective author/committer identity was verified in both repositories as
 scope uses the explicit file lists above. The preserved local `.dockerignore`
 and infra `supabase/config.toml` remain excluded. Merge, deployment and release
 signoff remain separate actions.
+
+Publication check on October 5: infra lint, audit link checks and follow-up JSON
+validation pass. A fresh infra test-suite run stopped at the live feature-flags
+check because the local gateway was unavailable; the local Supabase reset smoke
+test also skipped. The October 2 full-suite result above remains historical
+evidence; no runtime code changed during publication.
+
+Published PRs against `develop`: [storage #34](https://github.com/Xynes-Studio/xynes-storage-service/pull/34) and
+[infra #125](https://github.com/Xynes-Studio/xynes-infra/pull/125).
+Both remain open for review and merge.
