@@ -59,7 +59,10 @@ export function checkWorkflow(value: unknown, pins: ReadonlySet<string>): string
         }
         if (typeof step.uses === 'string' && /(?:setup-node|setup-bun|setup-go|pnpm\/action-setup)@/.test(step.uses)) {
           const key = step.uses.includes('setup-node@') ? 'node-version' : step.uses.includes('setup-bun@') ? 'bun-version' : step.uses.includes('setup-go@') ? 'go-version' : 'version';
-          if (!object(step.with) || !/^\d+\.\d+\.\d+$/.test(String(step.with[key]))) report('runtime/package-manager version must be exact');
+          const exactVersion = step.uses.startsWith('pnpm/action-setup@')
+            ? /^\d+\.\d+\.\d+(?:\+sha512\.[a-f0-9]{128})?$/
+            : /^\d+\.\d+\.\d+$/;
+          if (!object(step.with) || !exactVersion.test(String(step.with[key]))) report('runtime/package-manager version must be exact');
         }
       }
       if (typeof step.run === 'string') {
