@@ -1,0 +1,12 @@
+[
+  "lint",
+  "test",
+  "coverage",
+  "build",
+  "typecheck",
+  "security",
+  "release-image-security",
+  "immutable-source-security",
+  "integration-processors",
+  "archive-safety"
+]
