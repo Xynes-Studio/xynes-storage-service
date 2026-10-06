@@ -1,3 +1,4 @@
+import { signedInit } from './support/internal-request';
 /**
  * Error handler integration tests.
  *
@@ -57,11 +58,14 @@ describe('error handler — ProviderAdapterError mapping', () => {
       throw new ProviderAdapterError('PROVIDER_OPERATION_FAILED');
     };
     const app = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({ actionKey: ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ actionKey: ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(502);
     const body = (await res.json()) as { ok: boolean; error: { code: string; message: string } };
     expect(body.ok).toBe(false);
@@ -81,11 +85,14 @@ describe('error handler — ProviderAdapterError mapping', () => {
       );
     };
     const app = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({ actionKey: ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ actionKey: ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { ok: boolean; error: { code: string } };
     expect(body.error.code).toBe('PROVIDER_OBJECT_KEY_INVALID');
@@ -104,11 +111,14 @@ describe('error handler — ZodError mapping', () => {
       throw realZodError as Error;
     };
     const app = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({ actionKey: ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ actionKey: ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
     const body = (await res.json()) as {
       ok: boolean;
@@ -125,11 +135,14 @@ describe('error handler — unknown error mapping', () => {
       throw new Error('Sensitive raw provider message AKIA-LEAK-1234');
     };
     const app = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({ actionKey: ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ actionKey: ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(500);
     const body = (await res.json()) as { ok: boolean; error: { code: string; message: string } };
     expect(body.error.code).toBe('INTERNAL_ERROR');

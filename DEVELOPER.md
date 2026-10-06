@@ -3271,3 +3271,14 @@ Sharp and ffmpeg using the image's own binaries. The existing CI image job runs
 this harness. Apply `compose.security.yml` last for deployment; isolation flags
 are runtime settings, not automatically enforced by the image. No new runtime
 env, API, dependency or migration. See [verification and rollback](docs/XYN-SEC-005-verification.md).
+
+## SEC-003-FU-1 current internal authentication
+
+Internal actions now require Ed25519 requests bound to receiver, operation, exact
+body, actor, workspace and request id. Historical shared-token/hybrid instructions
+in this document no longer apply to authentication. Receivers fail closed without
+public trust; callers load only their own signing file. Shared static/HS256 tokens
+are rejected, including authz read checks. Follow the backend infra identity
+runbook for coordinated seven-service rollout and rotation. Protocol mirrors are
+generated from platform-contracts and must be changed/exported there; validate
+`corepack pnpm internal-request:check` with the backend workspace present.

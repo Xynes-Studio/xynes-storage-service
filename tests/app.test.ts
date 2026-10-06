@@ -1,3 +1,4 @@
+import { signedInit } from './support/internal-request';
 /**
  * App + middleware tests.
  *
@@ -102,8 +103,10 @@ describe('POST /internal/storage-actions — auth', () => {
     expect(res.status).toBe(403);
   });
 
-  test('returns 500 when INTERNAL_SERVICE_TOKEN env is missing', async () => {
-    const config = loadConfig({ ...process.env, INTERNAL_SERVICE_TOKEN: '' });
+  test('returns 500 when receiver trust is missing', async () => {
+    const trust = process.env.INTERNAL_REQUEST_TRUST_FILE;
+    delete process.env.INTERNAL_REQUEST_TRUST_FILE;
+    const config = loadConfig(process.env);
     const app = buildApp(config);
     const res = await app.request('/internal/storage-actions', {
       method: 'POST',
@@ -113,6 +116,7 @@ describe('POST /internal/storage-actions — auth', () => {
       },
       body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
     });
+    process.env.INTERNAL_REQUEST_TRUST_FILE = trust;
     expect(res.status).toBe(500);
   });
 });
@@ -133,11 +137,14 @@ describe('POST /internal/storage-actions — envelope + actor parsing', () => {
     const { app } = buildTestApp();
     capture.ctx = null;
     capture.payload = null;
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: { q: 'list' } }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: { q: 'list' } }),
+      }),
+    );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { ok: boolean; data: unknown };
     expect(body.ok).toBe(true);
@@ -157,16 +164,19 @@ describe('POST /internal/storage-actions — envelope + actor parsing', () => {
     const { app } = buildTestApp();
     capture.ctx = null;
     capture.payload = null;
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: authHeaders({
-        'X-XS-Actor-Type': 'api_key',
-        'X-XS-API-Key-Id': TEST_API_KEY_ID,
-        'X-XS-API-Key-Prefix': TEST_API_KEY_PREFIX,
-        'X-XS-User-Id': '',
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: authHeaders({
+          'X-XS-Actor-Type': 'api_key',
+          'X-XS-API-Key-Id': TEST_API_KEY_ID,
+          'X-XS-API-Key-Prefix': TEST_API_KEY_PREFIX,
+          'X-XS-User-Id': '',
+        }),
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
       }),
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    );
     expect(res.status).toBe(200);
     const ctx = readCapturedCtx();
     expect(ctx?.actor.kind).toBe('api_key');
@@ -179,11 +189,14 @@ describe('POST /internal/storage-actions — envelope + actor parsing', () => {
 
   test('rejects unknown X-XS-Actor-Type with 400 INVALID_HEADER', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: authHeaders({ 'X-XS-Actor-Type': 'service' }),
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: authHeaders({ 'X-XS-Actor-Type': 'service' }),
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { ok: boolean; error: { code: string } };
     expect(body.error.code).toBe('INVALID_HEADER');
@@ -191,105 +204,126 @@ describe('POST /internal/storage-actions — envelope + actor parsing', () => {
 
   test('api_key actor without X-XS-API-Key-Id returns 400', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'X-Internal-Service-Token': INTERNAL_TOKEN,
-        'X-Workspace-Id': TEST_WORKSPACE,
-        'X-XS-Actor-Type': 'api_key',
-        'X-XS-API-Key-Prefix': TEST_API_KEY_PREFIX,
-      },
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'X-Internal-Service-Token': INTERNAL_TOKEN,
+          'X-Workspace-Id': TEST_WORKSPACE,
+          'X-XS-Actor-Type': 'api_key',
+          'X-XS-API-Key-Prefix': TEST_API_KEY_PREFIX,
+        },
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
   });
 
   test('api_key actor with non-UUID X-XS-API-Key-Id returns 400', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'X-Internal-Service-Token': INTERNAL_TOKEN,
-        'X-Workspace-Id': TEST_WORKSPACE,
-        'X-XS-Actor-Type': 'api_key',
-        'X-XS-API-Key-Id': 'not-a-uuid',
-        'X-XS-API-Key-Prefix': TEST_API_KEY_PREFIX,
-      },
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'X-Internal-Service-Token': INTERNAL_TOKEN,
+          'X-Workspace-Id': TEST_WORKSPACE,
+          'X-XS-Actor-Type': 'api_key',
+          'X-XS-API-Key-Id': 'not-a-uuid',
+          'X-XS-API-Key-Prefix': TEST_API_KEY_PREFIX,
+        },
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
   });
 
   test('api_key actor without X-XS-API-Key-Prefix returns 400', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'X-Internal-Service-Token': INTERNAL_TOKEN,
-        'X-Workspace-Id': TEST_WORKSPACE,
-        'X-XS-Actor-Type': 'api_key',
-        'X-XS-API-Key-Id': TEST_API_KEY_ID,
-      },
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'X-Internal-Service-Token': INTERNAL_TOKEN,
+          'X-Workspace-Id': TEST_WORKSPACE,
+          'X-XS-Actor-Type': 'api_key',
+          'X-XS-API-Key-Id': TEST_API_KEY_ID,
+        },
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
   });
 
   test('api_key actor with wrong-length prefix returns 400', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'X-Internal-Service-Token': INTERNAL_TOKEN,
-        'X-Workspace-Id': TEST_WORKSPACE,
-        'X-XS-Actor-Type': 'api_key',
-        'X-XS-API-Key-Id': TEST_API_KEY_ID,
-        'X-XS-API-Key-Prefix': 'TOOLONGHEX',
-      },
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'X-Internal-Service-Token': INTERNAL_TOKEN,
+          'X-Workspace-Id': TEST_WORKSPACE,
+          'X-XS-Actor-Type': 'api_key',
+          'X-XS-API-Key-Id': TEST_API_KEY_ID,
+          'X-XS-API-Key-Prefix': 'TOOLONGHEX',
+        },
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
   });
 
   test('user actor without X-XS-User-Id returns 401', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'X-Internal-Service-Token': INTERNAL_TOKEN,
-        'X-Workspace-Id': TEST_WORKSPACE,
-      },
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'X-Internal-Service-Token': INTERNAL_TOKEN,
+          'X-Workspace-Id': TEST_WORKSPACE,
+        },
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(401);
   });
 
   test('user actor with non-UUID X-XS-User-Id returns 400', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: authHeaders({ 'X-XS-User-Id': 'not-a-uuid' }),
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: authHeaders({ 'X-XS-User-Id': 'not-a-uuid' }),
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
   });
 
   test('missing X-Workspace-Id returns 400 MISSING_HEADER', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'X-Internal-Service-Token': INTERNAL_TOKEN,
-        'X-XS-User-Id': TEST_USER,
-      },
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'X-Internal-Service-Token': INTERNAL_TOKEN,
+          'X-XS-User-Id': TEST_USER,
+        },
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
     const body = (await res.json()) as { ok: boolean; error: { code: string } };
     expect(body.error.code).toBe('MISSING_HEADER');
@@ -297,57 +331,72 @@ describe('POST /internal/storage-actions — envelope + actor parsing', () => {
 
   test('non-UUID X-Workspace-Id returns 400 INVALID_HEADER', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: authHeaders({ 'X-Workspace-Id': 'nope' }),
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: authHeaders({ 'X-Workspace-Id': 'nope' }),
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.status).toBe(400);
   });
 
-  test('unknown actionKey returns 400 UNKNOWN_ACTION', async () => {
+  test('unknown actionKey is denied before dispatch', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ actionKey: 'unknown.action.key', payload: {} }),
-    });
-    expect(res.status).toBe(400);
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ actionKey: 'unknown.action.key', payload: {} }),
+      }),
+    );
+    expect(res.status).toBe(403);
     const body = (await res.json()) as { ok: boolean; error: { code: string } };
-    expect(body.error.code).toBe('UNKNOWN_ACTION');
+    expect(body.error.code).toBe('FORBIDDEN');
   });
 
-  test('malformed JSON body returns 400 INVALID_BODY', async () => {
+  test('malformed JSON body is denied before dispatch', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: 'not-json',
-    });
-    expect(res.status).toBe(400);
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: 'not-json',
+      }),
+    );
+    expect(res.status).toBe(403);
     const body = (await res.json()) as { ok: boolean; error: { code: string } };
-    expect(body.error.code).toBe('INVALID_BODY');
+    expect(body.error.code).toBe('FORBIDDEN');
   });
 
-  test('envelope missing actionKey returns 400 VALIDATION_ERROR', async () => {
+  test('envelope missing actionKey is denied before dispatch', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ payload: {} }),
-    });
-    expect(res.status).toBe(400);
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ payload: {} }),
+      }),
+    );
+    expect(res.status).toBe(403);
     const body = (await res.json()) as { ok: boolean; error: { code: string } };
-    expect(body.error.code).toBe('VALIDATION_ERROR');
+    expect(body.error.code).toBe('FORBIDDEN');
   });
 
   test('response carries X-Request-Id', async () => {
     const { app } = buildTestApp();
-    const res = await app.request('/internal/storage-actions', {
-      method: 'POST',
-      headers: authHeaders({ 'X-Request-Id': 'corr-id-fixture' }),
-      body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
-    });
+    const res = await app.request(
+      '/internal/storage-actions',
+      signedInit('/internal/storage-actions', {
+        method: 'POST',
+        headers: authHeaders({ 'X-Request-Id': 'corr-id-fixture' }),
+        body: JSON.stringify({ actionKey: TEST_ACTION_KEY, payload: {} }),
+      }),
+    );
     expect(res.headers.get('X-Request-Id')).toBe('corr-id-fixture');
   });
 });
