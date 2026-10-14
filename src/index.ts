@@ -1,7 +1,8 @@
 import { buildApp } from './app';
 import { buildComposition } from './composition';
 import { loadConfig } from './infra/config';
-import { startLifecycle } from './infra/lifecycle';
+import { startLifecycle, resolveLifecycleConfig } from './infra/lifecycle';
+import { Quiescence, startPrivateControl } from './infra/quiescence';
 import { logger } from './infra/logger';
 
 const config = loadConfig();
@@ -26,7 +27,23 @@ const composition = buildComposition();
 // `STORAGE_WORKER_MAX_PER_WORKSPACE`) are consumed inside
 // `buildComposition` when constructing the `ProcessingWorker` so they
 // take effect before `start()` is called here.
-const lifecycle = startLifecycle(composition);
+// Hosted admission/drain control is mandatory; unconfigured local dev keeps
+// its existing signal behavior. Tokens/sockets are fixed protected assets.
+const enabled = process.env.STORAGE_QUIESCENCE_ENABLED === '1';
+if (process.env.NODE_ENV === 'production' && !enabled) {
+  throw new Error('Storage hosted control required');
+}
+const intervals = resolveLifecycleConfig();
+const quiescence = enabled
+  ? new Quiescence({
+      worker: composition.worker,
+      cleanup: composition.cleanup,
+      workerIntervalMs: intervals.workerPollIntervalMs,
+      cleanupIntervalMs: intervals.cleanupPollIntervalMs,
+    })
+  : undefined;
+const control = quiescence ? await startPrivateControl(quiescence) : undefined;
+const lifecycle = startLifecycle(composition, { quiescence, closeControl: control?.close });
 
 const app = buildApp(config);
 
@@ -39,5 +56,5 @@ logger.info('Storage service starting', {
 export { composition, lifecycle };
 export default {
   port: config.port,
-  fetch: app.fetch,
+  fetch: quiescence ? quiescence.wrap((request) => app.fetch(request)) : app.fetch,
 };

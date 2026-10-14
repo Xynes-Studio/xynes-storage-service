@@ -100,6 +100,7 @@ export class AbandonedUploadCleanup {
   private readonly deps: AbandonedUploadCleanupDependencies;
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  private activePass: Promise<CleanupRunResult> | null = null;
 
   constructor(deps: AbandonedUploadCleanupDependencies) {
     this.deps = deps;
@@ -110,7 +111,21 @@ export class AbandonedUploadCleanup {
    * (tests, ops dashboards) can observe progress without trusting the
    * logs.
    */
-  async runOnce(): Promise<CleanupRunResult> {
+  runOnce(): Promise<CleanupRunResult> {
+    const wasRunning = this.running;
+    const pass = this.executeRunOnce();
+    if (!wasRunning) {
+      this.activePass = pass;
+      void pass
+        .finally(() => {
+          if (this.activePass === pass) this.activePass = null;
+        })
+        .catch(() => {});
+    }
+    return pass;
+  }
+
+  private async executeRunOnce(): Promise<CleanupRunResult> {
     if (this.running) {
       return { scanned: 0, expired: 0, deferred: 0, raced: 0 };
     }
@@ -158,6 +173,12 @@ export class AbandonedUploadCleanup {
       clearInterval(this.timer);
       this.timer = null;
     }
+  }
+
+  /** Stop future polling and await the admitted cleanup pass. */
+  async drain(): Promise<void> {
+    this.stop();
+    await this.activePass;
   }
 
   private now(): Date {
