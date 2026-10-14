@@ -147,6 +147,28 @@ sidecars. The resource limits are an initial safety budget; tune with a bounded
 fixture load test before release. A job exceeding memory may terminate the
 service process; resource limits do not promise graceful completion.
 
+The production overlay also enables mandatory private shutdown control. Before
+starting it, provision `STORAGE_CONTROL_DIRECTORY` as a **fresh**, empty directory
+owned by the image's Bun UID/GID (1000:1000), mode 0700. Set
+`STORAGE_CONTROL_TOKEN_FILE` to a single-link regular file containing exactly
+64 lowercase hexadecimal characters (32 cryptographically random bytes), owned
+by root or that UID, mode 0400 or 0600. Keep its host parent directories root-owned
+mode 0700. These operator path variables are absolute host paths, separate from
+the storage runtime env file. Do not store the token value in Compose, argv,
+environment variables or Git.
+
+The overlay replaces all inherited mounts with only that writable control
+directory and a read-only token bind. Missing paths fail instead of being
+created by Compose. The service validates their ownership, modes and shape
+before listening. If an operator overrides the runtime UID, provision ownership
+for that exact UID; Apex's infra controller uses 1001:1001 and manages these
+assets separately. Never reuse a control directory across replacement or
+rollback, and retain its old socket until the exact old container is gone.
+Authenticate and obtain a live drain proof before stopping an existing instance;
+an ordinary unqualified signal deliberately leaves it running. See
+`DEVELOPER.md`'s hosted deployment quiescence contract. This overlay does not
+itself authorize maintenance or qualify a drain proof.
+
 ## Remaining boundaries
 
 Sharp shares the API/worker address space and the storage credentials required

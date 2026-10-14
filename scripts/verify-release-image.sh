@@ -118,6 +118,8 @@ YAML
 printf '%s\n' 'SHARED_SECRET_FIXTURE=should-not-reach-storage' > "$fixture_dir/shared.env"
 printf '%s\n' 'DATABASE_URL=fixture-only' > "$fixture_dir/storage.env"
 STORAGE_RUNTIME_ENV_FILE="$fixture_dir/storage.env" \
+  STORAGE_CONTROL_DIRECTORY="$fixture_dir/private-control" \
+  STORAGE_CONTROL_TOKEN_FILE="$fixture_dir/private-token" \
   docker compose --env-file "$fixture_dir/storage.env" \
   -f "$fixture_dir/base.yml" -f "$repo_dir/compose.security.yml" \
   config --format json > "$fixture_dir/resolved.json"
@@ -127,10 +129,16 @@ docker run --rm --platform "$platform" --network none --read-only \
   --entrypoint bun "$image_tag" -e '
     const { services } = await Bun.file("/tmp/resolved.json").json();
     const s = services["storage-service"];
-    if (s.build.target !== "prod" || s.command || s.volumes?.length ||
+    const mounts = s.volumes ?? [];
+    const control = mounts.find(v => v.target === "/run/xynes/storage-control");
+    const token = mounts.find(v => v.target === "/run/secrets/storage-quiesce-token");
+    if (s.build.target !== "prod" || s.command || mounts.length !== 2 ||
+        !control || control.type !== "bind" || control.read_only || control.bind.create_host_path ||
+        !token || token.type !== "bind" || !token.read_only || token.bind.create_host_path ||
         s.environment.SIBLING_SECRET_FIXTURE || s.environment.SHARED_SECRET_FIXTURE ||
         s.environment.DATABASE_URL !== "fixture-only" ||
         s.environment.STORAGE_PROCESSOR_MODE !== "live" ||
+        s.environment.STORAGE_QUIESCENCE_ENABLED !== "1" ||
         !s.read_only || s.user !== "bun" || !s.cap_drop.includes("ALL") ||
         !s.security_opt.includes("no-new-privileges:true") ||
         s.mem_limit !== "1073741824" || s.cpus !== 2 || s.pids_limit !== 128 ||
