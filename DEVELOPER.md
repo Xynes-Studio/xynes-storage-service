@@ -2366,8 +2366,9 @@ const lifecycle = startLifecycle(composition, {
 });
 ```
 
-Production callers never need any of these — `startLifecycle(composition)`
-with no options is the canonical path.
+Local development may call `startLifecycle(composition)` without options.
+Hosted startup supplies the private quiescence coordinator and listener-close
+hook described below.
 
 ### Tests
 
@@ -2402,14 +2403,65 @@ with no options is the canonical path.
 - **Hard SIGKILL on graceful-shutdown timeout.** STORAGE-FU-6 enforces a
   30 s timeout via `Promise.race` and emits a `shutdown_timeout` log
   entry; it does NOT call `process.kill(process.pid, 'SIGKILL')`.
-  STORAGE-7's `ProcessingWorker.stop()` and `AbandonedUploadCleanup.stop()`
-  already await the current `runOnce` to complete. The orchestrator
-  (Docker / Kubernetes) is responsible for SIGKILL on its own deadline
-  (typically 30 s).
+  `stop()` closes polling admission; `drain()` separately awaits the current
+  pass. Hosted orchestration must obtain the private drain proof before stopping
+  Storage or its processors; Docker forced termination is not a drain proof.
 - **Distributed queue product migration** (pg-boss / SQS) — current
   Postgres-polling worker is sufficient per STORAGE-7 §"Out of scope".
 - **Live integration smoke against the running storage stack.** That's
   the successor plan (`xynes/xynes-infra/docs/plans/2026-05-14-storage-live-provider-rollout.md`).
+
+
+### Planned hosted deployment drain
+
+Production startup requires `STORAGE_QUIESCENCE_ENABLED=1`, a token at
+`/run/secrets/storage-quiesce-token`, and the private Unix socket directory
+`/run/xynes/storage-control`. The directory must be owned by the runtime service
+UID with mode `0700`; the socket is `0600`. The token contains 64 lowercase hex
+characters, optionally followed by one newline, and must be readable by the
+service with mode `0400` or `0600`. Provision it outside Git and mount it read-only.
+Local development without control enabled keeps its existing signal behavior.
+
+`src/infra/quiescence.ts` wraps the actual exported HTTP fetch, closes application
+admission, stops polling, and waits for every admitted handler and background
+pass. Current HTTP handlers return JSON after their awaited side effects; this
+contract does not cover future streaming response bodies. Worker batches retain
+every admitted sibling job even when one fails, so a failed database update cannot
+make another active runner disappear from the drain.
+
+The control channel accepts only authenticated Unix HTTP POSTs with canonical
+JSON bodies up to 1024 bytes. Send `Authorization: Bearer <protected token>`:
+
+| Endpoint | Exact fields | Behavior |
+|---|---|---|
+| `/quiesce` | `owner`, `timeout_ms`, `lease_ms` | Fence admission and wait; return a drain proof only after all admitted work settles successfully. |
+| `/status` | `owner` | Read the matching owner's state, expiry and active counts. |
+| `/resume` | `owner` | Reopen admission and polling for the matching owner. |
+
+Owners are 32 lowercase hex characters. The timeout is 1–120000 milliseconds;
+the lease is 1000–3600000 milliseconds and must exceed the timeout. Another owner
+cannot take over a held lease. Timeout or disconnect leaves the old process and
+database alive, with admission fenced until explicit resume or lease expiry.
+The `/health` response remains liveness-only during the fence.
+
+A hosted SIGTERM/SIGINT consumes an unexpired successful proof atomically,
+disarms lease expiry, keeps admission closed, closes only the owned Unix listener,
+and then tears down the database. An unqualified stop grants no database closure
+or successful exit. A controller must bind the proof to the exact container,
+image and owner; hold a sufficient lease before any Storage/processor replacement
+or affected migration; and reacquire it before a subsequent rollback stop.
+A failed drain must abort replacement and resume the existing service.
+
+This is planned deployment maintenance; Storage stays awake during ordinary idle
+periods. It does not add job reclaim, provider retry, database schema changes, or
+protection from SIGKILL/OOM/reboot. Remote processor work after a disconnected
+request requires separate controller evidence. Unknown existing socket paths are
+refused; handling a stale socket requires proving its exact prior container is gone.
+
+Regressions in `tests/infra/drain-proposal.test.ts` and
+`tests/infra/quiescence-proposal.test.ts` cover active HTTP/background work,
+fail-fast batch errors, resume races, cancellation/timeout/expiry, proof consumption,
+private token/socket boundaries and qualified listener teardown.
 
 
 ## Content-Hash Dedup Schema (DEDUP-1)

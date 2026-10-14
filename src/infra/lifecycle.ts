@@ -31,6 +31,7 @@
  */
 import type { CompositionRoot } from '../composition';
 import { logger } from './logger';
+import type { Quiescence } from './quiescence';
 
 // Default polling intervals — chosen to match STORAGE-FU-6 acceptance.
 const DEFAULT_WORKER_POLL_INTERVAL_MS = 5_000;
@@ -49,6 +50,10 @@ export interface ResolvedLifecycleConfig {
 }
 
 export interface StartLifecycleOptions {
+  /** Hosted stop requires an atomically consumed, unexpired pre-stop proof. */
+  readonly quiescence?: Quiescence;
+  /** Qualified teardown closes the exact owned Unix listener before DB close. */
+  readonly closeControl?: () => Promise<void>;
   /**
    * Env reader. Defaults to `process.env`. Tests pass a minimal env so
    * they can probe the configuration surface without leaking real
@@ -178,7 +183,7 @@ export function startLifecycle(
 
   // Track stop state so a second `SIGTERM` (or an explicit `stop()` call
   // racing the signal handler) collapses to one shutdown.
-  let stopping: Promise<void> | null = null;
+  let stopping: Promise<boolean> | null = null;
   const signalHandlers = new Map<LifecycleSignal, () => void>();
 
   // Defensive: if `worker.start` or `cleanup.start` were to throw (they
@@ -186,22 +191,26 @@ export function startLifecycle(
   // boot. We wrap with try/catch and log — the worker exposes `runOnce`
   // anyway, so a missing polling loop degrades to "no background work"
   // rather than "service down".
-  try {
-    composition.worker.start(config.workerPollIntervalMs);
-  } catch (err) {
-    logger.error('storage.worker.start_failed', {
-      event: 'storage.worker.start_failed',
-      errorName: err instanceof Error ? err.name : 'unknown',
-    });
-  }
+  if (options.quiescence) {
+    options.quiescence.startPolling();
+  } else {
+    try {
+      composition.worker.start(config.workerPollIntervalMs);
+    } catch (err) {
+      logger.error('storage.worker.start_failed', {
+        event: 'storage.worker.start_failed',
+        errorName: err instanceof Error ? err.name : 'unknown',
+      });
+    }
 
-  try {
-    composition.cleanup.start(config.cleanupPollIntervalMs);
-  } catch (err) {
-    logger.error('storage.cleanup.start_failed', {
-      event: 'storage.cleanup.start_failed',
-      errorName: err instanceof Error ? err.name : 'unknown',
-    });
+    try {
+      composition.cleanup.start(config.cleanupPollIntervalMs);
+    } catch (err) {
+      logger.error('storage.cleanup.start_failed', {
+        event: 'storage.cleanup.start_failed',
+        errorName: err instanceof Error ? err.name : 'unknown',
+      });
+    }
   }
 
   // Emit one structured `lifecycle.started` entry. Allowlisted fields
@@ -214,8 +223,14 @@ export function startLifecycle(
     gracefulShutdownTimeoutMs: config.gracefulShutdownTimeoutMs,
   });
 
-  const performShutdown = async (signal: LifecycleSignal | 'explicit'): Promise<void> => {
+  const performShutdown = async (signal: LifecycleSignal | 'explicit'): Promise<boolean> => {
     if (stopping) return stopping;
+    if (options.quiescence && !options.quiescence.consumeProof()) {
+      logger.error('storage.lifecycle.unqualified_stop', {
+        event: 'storage.lifecycle.unqualified_stop',
+      });
+      return false;
+    }
     stopping = (async () => {
       logger.info('storage.lifecycle.shutdown', {
         event: 'storage.lifecycle.shutdown',
@@ -250,7 +265,11 @@ export function startLifecycle(
       });
       try {
         const result = await Promise.race([
-          composition.shutdown().then(() => 'shutdown' as const),
+          (async () => {
+            await options.closeControl?.();
+            await composition.shutdown();
+            return 'shutdown' as const;
+          })(),
           timeout,
         ]);
         if (result === 'timeout') {
@@ -258,12 +277,14 @@ export function startLifecycle(
             event: 'storage.lifecycle.shutdown_timeout',
             gracefulShutdownTimeoutMs: config.gracefulShutdownTimeoutMs,
           });
+          if (options.quiescence) return false;
         }
       } catch (err) {
         logger.error('storage.lifecycle.shutdown_failed', {
           event: 'storage.lifecycle.shutdown_failed',
           errorName: err instanceof Error ? err.name : 'unknown',
         });
+        if (options.quiescence) return false;
       } finally {
         if (timeoutHandle) {
           stopTimeout(timeoutHandle);
@@ -280,6 +301,7 @@ export function startLifecycle(
         }
       }
       signalHandlers.clear();
+      return true;
     })();
     return stopping;
   };
@@ -288,7 +310,9 @@ export function startLifecycle(
     const handler = (): void => {
       // `onShutdownComplete` defaults to `process.exit(0)`. Tests
       // inject a spy so the test runner survives the call.
-      void performShutdown(signal).then(() => onShutdownComplete(0));
+      void performShutdown(signal).then((qualified) => {
+        if (qualified) onShutdownComplete(0);
+      });
     };
     signalHandlers.set(signal, handler);
     try {
@@ -304,7 +328,7 @@ export function startLifecycle(
   return {
     config,
     stop: async () => {
-      await performShutdown('explicit');
+      if (!(await performShutdown('explicit'))) throw new Error('Storage shutdown refused');
     },
   };
 }

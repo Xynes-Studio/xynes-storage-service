@@ -322,11 +322,12 @@ export function buildComposition(options: BuildCompositionOptions = {}): Composi
     worker,
     cleanup,
     shutdown: async () => {
-      worker.stop();
-      cleanup.stop();
+      const drained = await Promise.allSettled([worker.drain(), cleanup.drain()]);
       if (ownsDb) {
         await db.close();
       }
+      const failed = drained.find((result) => result.status === 'rejected');
+      if (failed?.status === 'rejected') throw failed.reason;
     },
   };
 }

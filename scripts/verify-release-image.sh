@@ -12,7 +12,41 @@ docker build --platform "$platform" --target prod -t "$image_tag" "$repo_dir"
 fixture_dir=$(mktemp -d)
 context_tag="local/xynes-storage:sec005-context-${fixture_dir##*/}"
 smoke_container=""
-trap 'if [[ -n "$smoke_container" ]]; then docker rm -f "$smoke_container" >/dev/null 2>&1 || true; fi; docker image rm "$context_tag" >/dev/null 2>&1 || true; rm -rf -- "$fixture_dir"' EXIT
+init_container=""
+control_volume=""
+secret_volume=""
+fixture_nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+[[ "$fixture_nonce" =~ ^[a-f0-9]{32}$ ]] || exit 1
+cleanup_owned_container() {
+  local target=$1
+  if docker container inspect "$target" >/dev/null 2>&1; then
+    [[ $(docker container inspect --format '{{index .Config.Labels "com.xynes.release-fixture"}}' "$target") == "$fixture_nonce" ]] || return 1
+    docker rm -f "$target" >/dev/null
+  fi
+}
+cleanup_fixture() {
+  local status=$? cleanup_failed=0 volume
+  trap - EXIT
+  for target in "$smoke_container" "$init_container"; do
+    if [[ -n "$target" ]]; then cleanup_owned_container "$target" || cleanup_failed=1; fi
+  done
+  for volume in "$control_volume" "$secret_volume"; do
+    if [[ -n "$volume" ]] && docker volume inspect "$volume" >/dev/null 2>&1; then
+      if [[ $(docker volume inspect --format '{{index .Labels "com.xynes.release-fixture"}}' "$volume") == "$fixture_nonce" ]]; then
+        docker volume rm "$volume" >/dev/null || cleanup_failed=1
+      else cleanup_failed=1; fi
+    fi
+  done
+  if docker image inspect "$context_tag" >/dev/null 2>&1; then
+    if [[ $(docker image inspect --format '{{index .Config.Labels "com.xynes.release-fixture"}}' "$context_tag") == "$fixture_nonce" ]]; then
+      docker image rm "$context_tag" >/dev/null || cleanup_failed=1
+    else cleanup_failed=1; fi
+  fi
+  rm -rf -- "$fixture_dir"
+  if [[ "$cleanup_failed" != 0 ]]; then echo "STORAGE_FIXTURE_OWNED_CLEANUP_FAILED" >&2; status=1; fi
+  exit "$status"
+}
+trap cleanup_fixture EXIT
 
 # Exercise Docker's actual context filtering using synthetic private files, not
 # regex approximations or a developer's local secrets. The appended test stage
@@ -40,10 +74,12 @@ done
 cat >> "$context_dir/Dockerfile" <<'DOCKERFILE'
 
 FROM base AS sec005-context-check
+ARG SEC005_FIXTURE_NONCE
+LABEL com.xynes.release-fixture=$SEC005_FIXTURE_NONCE
 COPY . /context
 USER bun
 DOCKERFILE
-docker build --platform "$platform" --target sec005-context-check \
+docker build --platform "$platform" --target sec005-context-check --build-arg "SEC005_FIXTURE_NONCE=$fixture_nonce" \
   -t "$context_tag" "$context_dir"
 docker run --rm --platform "$platform" --network none --read-only \
   --cap-drop ALL --security-opt no-new-privileges --entrypoint sh "$context_tag" -eu -c '
@@ -82,6 +118,8 @@ YAML
 printf '%s\n' 'SHARED_SECRET_FIXTURE=should-not-reach-storage' > "$fixture_dir/shared.env"
 printf '%s\n' 'DATABASE_URL=fixture-only' > "$fixture_dir/storage.env"
 STORAGE_RUNTIME_ENV_FILE="$fixture_dir/storage.env" \
+  STORAGE_CONTROL_DIRECTORY="$fixture_dir/private-control" \
+  STORAGE_CONTROL_TOKEN_FILE="$fixture_dir/private-token" \
   docker compose --env-file "$fixture_dir/storage.env" \
   -f "$fixture_dir/base.yml" -f "$repo_dir/compose.security.yml" \
   config --format json > "$fixture_dir/resolved.json"
@@ -91,10 +129,16 @@ docker run --rm --platform "$platform" --network none --read-only \
   --entrypoint bun "$image_tag" -e '
     const { services } = await Bun.file("/tmp/resolved.json").json();
     const s = services["storage-service"];
-    if (s.build.target !== "prod" || s.command || s.volumes?.length ||
+    const mounts = s.volumes ?? [];
+    const control = mounts.find(v => v.target === "/run/xynes/storage-control");
+    const token = mounts.find(v => v.target === "/run/secrets/storage-quiesce-token");
+    if (s.build.target !== "prod" || s.command || mounts.length !== 2 ||
+        !control || control.type !== "bind" || control.read_only || control.bind.create_host_path ||
+        !token || token.type !== "bind" || !token.read_only || token.bind.create_host_path ||
         s.environment.SIBLING_SECRET_FIXTURE || s.environment.SHARED_SECRET_FIXTURE ||
         s.environment.DATABASE_URL !== "fixture-only" ||
         s.environment.STORAGE_PROCESSOR_MODE !== "live" ||
+        s.environment.STORAGE_QUIESCENCE_ENABLED !== "1" ||
         !s.read_only || s.user !== "bun" || !s.cap_drop.includes("ALL") ||
         !s.security_opt.includes("no-new-privileges:true") ||
         s.mem_limit !== "1073741824" || s.cpus !== 2 || s.pids_limit !== 128 ||
@@ -126,7 +170,7 @@ docker run --rm --platform "$platform" --network none --read-only \
     export PATH="/app/node_modules/ffmpeg-static:$PATH"
     bun test tests/security/release-image.test.ts
     bun run scripts/assert-native-image-runtime.ts
-    bun test tests/infra/processors/native-image-runtime.test.ts \
+    bun test --timeout 30000 tests/infra/processors/native-image-runtime.test.ts \
       tests/actions/handlers/processing/scan-gate.test.ts \
       tests/actions/handlers/processing/worker-scan-gate.test.ts \
       tests/actions/handlers/objects/download-scan-gate.test.ts \
@@ -134,31 +178,56 @@ docker run --rm --platform "$platform" --network none --read-only \
       tests/integration/processors/sharp.integration.test.ts \
       tests/integration/processors/ffmpeg.integration.test.ts \
       tests/integration/processors/image-upload-security.integration.test.ts
-    bun test tests/integration/processors/immutable-source.integration.test.ts
+    bun test --timeout 30000 tests/integration/processors/immutable-source.integration.test.ts
     bun test tests/providers/s3-adapter.test.ts tests/infra/db/repositories/mappers.test.ts
   '
 
-# Exercise the image's real default entrypoint, with loopback-only health and an
-# unreachable fixture DB. This is liveness proof, not DB readiness/deployment.
-smoke_container=$(docker run --rm -d --platform "$platform" --network none --read-only \
+# Exercise the real production CMD as hosted UID1001. Earlier artifact gates
+# retain the Dockerfile's default bun UID1000. Only disposable labeled volumes
+# hold random inert credentials; no token appears in argv, env or logs.
+control_candidate="xynes-storage-control-$fixture_nonce"
+secret_candidate="xynes-storage-secret-$fixture_nonce"
+for volume in "$control_candidate" "$secret_candidate"; do
+  if docker volume inspect "$volume" >/dev/null 2>&1; then
+    echo "STORAGE_FIXTURE_VOLUME_ALREADY_EXISTS" >&2; exit 1
+  fi
+done
+# Record only names proven absent before our labeled create intent.
+control_volume=$control_candidate
+secret_volume=$secret_candidate
+for volume in "$control_volume" "$secret_volume"; do
+  docker volume create --label "com.xynes.release-fixture=$fixture_nonce" "$volume" >/dev/null
+done
+init_container="xynes-storage-assets-$fixture_nonce"
+docker run --rm --name "$init_container" --platform "$platform" --network none --read-only \
+  --user 0:0 --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges \
+  --memory 128m --pids-limit 32 --label "com.xynes.release-fixture=$fixture_nonce" \
+  --env "STORAGE_RELEASE_FIXTURE_NONCE=$fixture_nonce" \
+  --mount "type=volume,source=$control_volume,target=/run/xynes/storage-control,volume-nocopy" \
+  --mount "type=volume,source=$secret_volume,target=/run/secrets,volume-nocopy" \
+  --entrypoint bun "$image_tag" -e '
+    const fs = require("node:fs"); const crypto = require("node:crypto");
+    const control = "/run/xynes/storage-control"; const secrets = "/run/secrets";
+    fs.chmodSync(control, 0o700); fs.chownSync(control, 1001, 1001);
+    const token = secrets + "/storage-quiesce-token";
+    fs.writeFileSync(token, crypto.randomBytes(32).toString("hex"), { flag: "wx", mode: 0o400 });
+    fs.chownSync(token, 1001, 1001);
+    fs.writeFileSync(secrets + "/fixture-nonce", process.env.STORAGE_RELEASE_FIXTURE_NONCE, { flag: "wx", mode: 0o444 });
+    fs.chmodSync(secrets, 0o555);
+  '
+init_container=""
+smoke_container=$(docker create --platform "$platform" --network none --read-only \
+  --name "xynes-storage-entrypoint-$fixture_nonce" --user 1001:1001 \
   --cap-drop ALL --security-opt no-new-privileges --memory 1g --cpus 2 --pids-limit 128 \
+  --label "com.xynes.release-fixture=$fixture_nonce" \
   --tmpfs /tmp:rw,noexec,nosuid,size=256m,mode=1777 \
+  --mount "type=volume,source=$control_volume,target=/run/xynes/storage-control,volume-nocopy" \
+  --mount "type=volume,source=$secret_volume,target=/run/secrets,readonly,volume-nocopy" \
+  --mount "type=bind,source=$repo_dir/tests,target=/app/tests,readonly" \
   --env DATABASE_URL=postgres://fixture:fixture@127.0.0.1:1/sec005_fixture \
-  --env STORAGE_PROCESSOR_MODE=live "$image_tag")
-docker exec "$smoke_container" bun -e '
-  let passed = false;
-  for (let attempt = 0; attempt < 30; attempt++) {
-    try {
-      const response = await fetch("http://127.0.0.1:4204/health", { signal: AbortSignal.timeout(1000) });
-      const body = await response.json();
-      if (response.status === 200 && body.ok === true && body.service === "storage-service") {
-        passed = true; break;
-      }
-    } catch {}
-    await Bun.sleep(200);
-  }
-  if (!passed) throw new Error("STORAGE_RELEASE_ENTRYPOINT_HEALTH_FAILED");
-  console.log("Storage default entrypoint serves healthy loopback liveness response");
-'
-docker rm -f "$smoke_container" >/dev/null
+  --env STORAGE_PROCESSOR_MODE=live --env STORAGE_QUIESCENCE_ENABLED=1 \
+  --env STORAGE_RELEASE_ENTRYPOINT_TEST=1 --env "STORAGE_RELEASE_FIXTURE_NONCE=$fixture_nonce" "$image_tag")
+docker start "$smoke_container" >/dev/null
+docker exec "$smoke_container" bun test --timeout 10000 tests/security/release-image.test.ts
+cleanup_owned_container "$smoke_container"
 smoke_container=""

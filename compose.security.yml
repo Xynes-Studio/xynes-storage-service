@@ -4,7 +4,20 @@ services:
     build:
       target: prod
     command: !reset null
-    volumes: !reset []
+    # Replace inherited application mounts with these two protected assets only.
+    # Provision before startup; Compose must never create missing host paths.
+    volumes: !override
+      - type: bind
+        source: ${STORAGE_CONTROL_DIRECTORY:?Set a fresh private control directory}
+        target: /run/xynes/storage-control
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${STORAGE_CONTROL_TOKEN_FILE:?Set a protected control token file}
+        target: /run/secrets/storage-quiesce-token
+        read_only: true
+        bind:
+          create_host_path: false
     # Replace the shared backend env file and inherited environment map. Supply
     # only storage's DB/internal/provider credentials and processor settings.
     env_file: !override
@@ -12,6 +25,7 @@ services:
     environment: !override
       NODE_ENV: production
       STORAGE_PROCESSOR_MODE: live
+      STORAGE_QUIESCENCE_ENABLED: "1"
       PORT: ${STORAGE_SERVICE_PORT:-4204}
     user: bun
     read_only: true

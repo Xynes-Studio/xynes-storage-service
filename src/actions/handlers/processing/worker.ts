@@ -69,6 +69,8 @@ export class ProcessingWorker {
   private readonly backoffSeconds: number;
   private readonly now: () => Date;
   private running = false;
+  private epoch = 0;
+  private activePass: Promise<WorkerRunStats> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(deps: ProcessingWorkerDependencies) {
@@ -87,7 +89,19 @@ export class ProcessingWorker {
    * Returns when no more jobs can be claimed (either the queue is empty
    * or every workspace allowlist is full).
    */
-  async runOnce(): Promise<WorkerRunStats> {
+  runOnce(): Promise<WorkerRunStats> {
+    if (this.activePass) return this.activePass;
+    const pass = this.executeRunOnce();
+    this.activePass = pass;
+    void pass
+      .finally(() => {
+        if (this.activePass === pass) this.activePass = null;
+      })
+      .catch(() => {});
+    return pass;
+  }
+
+  private async executeRunOnce(): Promise<WorkerRunStats> {
     const claimed: ClaimedJob[] = [];
     const perWorkspaceCount = new Map<string, number>();
 
@@ -131,12 +145,8 @@ export class ProcessingWorker {
 
     // Persist scan results first, even if a native job was claimed ahead of
     // its scan. Other workers' running scans are handled by the gate below.
-    const scans = await Promise.all(
-      claimed.filter((job) => job.jobType === 'scan_validation').map((job) => this.runClaimed(job)),
-    );
-    const native = await Promise.all(
-      claimed.filter((job) => job.jobType !== 'scan_validation').map((job) => this.runClaimed(job)),
-    );
+    const scans = await this.runBatch(claimed.filter((job) => job.jobType === 'scan_validation'));
+    const native = await this.runBatch(claimed.filter((job) => job.jobType !== 'scan_validation'));
     const results = [...scans, ...native];
 
     for (const r of results) {
@@ -153,6 +163,21 @@ export class ProcessingWorker {
     return stats;
   }
 
+  /** Await every admitted sibling before reporting the first rejection. */
+  private async runBatch(jobs: readonly ClaimedJob[]) {
+    const failures: unknown[] = [];
+    const settled = await Promise.allSettled(
+      jobs.map((job) =>
+        this.runClaimed(job).catch((error: unknown) => {
+          failures.push(error);
+          throw error;
+        }),
+      ),
+    );
+    if (failures.length) throw failures[0];
+    return settled.flatMap((result) => (result.status === 'fulfilled' ? [result.value] : []));
+  }
+
   /**
    * Start a polling loop. The loop drains via `runOnce` then waits
    * `intervalMs` before the next drain.
@@ -163,14 +188,15 @@ export class ProcessingWorker {
   start(intervalMs = 1000): void {
     if (this.running) return;
     this.running = true;
+    const epoch = ++this.epoch;
     const tick = async (): Promise<void> => {
-      if (!this.running) return;
+      if (!this.running || epoch !== this.epoch) return;
       try {
         await this.runOnce();
       } catch {
         // Defensive: never break the polling loop.
       }
-      if (!this.running) return;
+      if (!this.running || epoch !== this.epoch) return;
       this.timer = setTimeout(tick, intervalMs);
     };
     void tick();
@@ -178,10 +204,17 @@ export class ProcessingWorker {
 
   stop(): void {
     this.running = false;
+    this.epoch++;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+  }
+
+  /** Stop future polling and await the admitted pass before DB teardown. */
+  async drain(): Promise<void> {
+    this.stop();
+    await this.activePass;
   }
 
   private async runClaimed(
