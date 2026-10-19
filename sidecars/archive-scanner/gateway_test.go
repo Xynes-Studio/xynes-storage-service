@@ -336,8 +336,11 @@ func TestSupervisorUnixSocket(t *testing.T) {
 		defer c.Close()
 		c.SetDeadline(time.Now().Add(3 * time.Second))
 		// Every required application scan includes the metadata preamble.
-		if _, err := c.Write(append([]byte("zXYNES application/zip\x00"), wire(b)...)); err != nil {
-			t.Fatal(err)
+		// A nil payload reads the busy verdict, which is sent before input is read.
+		if b != nil {
+			if _, err := c.Write(append([]byte("zXYNES application/zip\x00"), wire(b)...)); err != nil {
+				t.Fatal(err)
+			}
 		}
 		out, err := bufio.NewReader(c).ReadString(0)
 		if err != nil {
@@ -347,17 +350,30 @@ func TestSupervisorUnixSocket(t *testing.T) {
 	}
 	g.slot <- struct{}{}
 	for _, endpoint := range []struct{ network, address string }{{"unix", path}, {"tcp", tcpListener.Addr().String()}} {
-		if got := scan(endpoint.network, endpoint.address, []byte("hi")); !strings.Contains(got, "busy ERROR") {
+		if got := scan(endpoint.network, endpoint.address, nil); !strings.Contains(got, "busy ERROR") {
 			t.Fatal(got)
 		}
 	}
 	<-g.slot
+	// A response delimiter can arrive before handle releases its concurrency slot.
+	// Acquire and release that same slot before sending the next sequential scan.
+	waitForScanRelease := func() {
+		t.Helper()
+		select {
+		case g.slot <- struct{}{}:
+			<-g.slot
+		case <-time.After(time.Second):
+			t.Fatal("previous scan did not release its concurrency slot")
+		}
+	}
 	if got := scan("unix", path, []byte("hi")); got != "stream: OK\x00" {
 		t.Fatal(got)
 	}
+	waitForScanRelease()
 	if got := scan("unix", path, bytes.Repeat([]byte("A"), 4097)); !strings.Contains(got, "StreamMaxLength") {
 		t.Fatal(got)
 	}
+	waitForScanRelease()
 	if got := scan("tcp", tcpListener.Addr().String(), []byte("hi")); got != "stream: OK\x00" {
 		t.Fatal(got)
 	}
